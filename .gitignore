@@ -14,8 +14,12 @@ log/
 *.qor
 *.bid
 *.ts
+*.vvp
 
 # Local IDE state
 .recent_user_depot.ini
 *.bak
 *.tmp
+
+# Local brainstorming visualizations
+.superpowers/
