@@ -1,0 +1,21 @@
+# Tang Dynasty generated build products
+*_Runs/
+log/
+*.log
+*.logw
+*.dmp
+
+# Generated FPGA programming and implementation files
+*.bit
+*.bin
+*.db
+*.timing
+*.area
+*.qor
+*.bid
+*.ts
+
+# Local IDE state
+.recent_user_depot.ini
+*.bak
+*.tmp
