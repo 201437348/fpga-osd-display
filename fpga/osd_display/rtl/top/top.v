@@ -48,6 +48,7 @@ wire de;
 
 wire [23:0] vout_data_raw;
 wire [23:0] vout_data;
+wire [23:0] vout_data_osd;
 wire        display_valid;
 wire        display_valid_sd;
 wire        display_test_pattern_sd;
@@ -402,6 +403,18 @@ video_fallback_pattern video_fallback_pattern_m0(
 assign vout_data = display_valid ? vout_data_raw :
                    display_test_pattern ? fallback_rgb : 24'd0;
 
+video_osd_overlay video_osd_overlay_m0(
+    .video_clk            (video_clk),
+    .rst                  (rst_all),
+    .vs                   (vs),
+    .de                   (de),
+    .rgb_in               (vout_data),
+    .display_valid        (display_valid),
+    .display_test_pattern (display_test_pattern),
+    .display_buffer_index (disp_buf_idx),
+    .rgb_out              (vout_data_osd)
+);
+
 frame_read_write #(
     .WRITE_V_FLIP     (1),
     .FRAME_WIDTH      (640),
@@ -474,7 +487,7 @@ video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_rst         (rst_all),
     .I_vs          (vs),
     .I_de          (de),
-    .I_rgb         (vout_data),
+    .I_rgb         (vout_data_osd),
     .O_video_user  (axis_s_user),
     .O_video_valid (axis_s_valid),
     .O_video_last  (axis_s_last),

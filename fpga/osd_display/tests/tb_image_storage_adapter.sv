@@ -118,6 +118,27 @@ initial begin
     tick();
     expect_bit(storage_ready, 1'b1, "storage initialized");
 
+    // The ext_mem_clk acknowledgement must settle through two local clk stages
+    // before the SD-clocked BMP reader can consume it.
+    @(negedge clk);
+    write_req_ack = 1'b1;
+    tick();
+    expect_bit(dut.write_req_ack_meta, 1'b1, "ack first stage captures raw input");
+    expect_bit(dut.write_req_ack_sync, 1'b0, "ack second stage delays rising edge");
+    expect_bit(dut.u_bmp_read.write_req_ack, 1'b0, "bmp reader does not see raw ack");
+    tick();
+    expect_bit(dut.write_req_ack_sync, 1'b1, "ack reaches second stage after two clocks");
+    expect_bit(dut.u_bmp_read.write_req_ack, 1'b1, "bmp reader sees synchronized ack");
+
+    @(negedge clk);
+    write_req_ack = 1'b0;
+    tick();
+    expect_bit(dut.write_req_ack_meta, 1'b0, "ack first stage captures falling edge");
+    expect_bit(dut.write_req_ack_sync, 1'b1, "ack second stage retains level for one clock");
+    tick();
+    expect_bit(dut.write_req_ack_sync, 1'b0, "ack second stage clears after two clocks");
+    expect_bit(dut.u_bmp_read.write_req_ack, 1'b0, "bmp reader sees cleared synchronized ack");
+
     // A completed previous scan must not be accepted until the raw done level drops.
     dut.u_bmp_read.scan_done = 1'b1;
     pulse_scan_start();

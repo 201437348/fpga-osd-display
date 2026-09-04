@@ -55,3 +55,18 @@ item. The prior 125 MHz settings stay available as the immediate rollback.
    of a prolonged `341100` retry.
 5. If any functional check fails, restore C1/C2 divide-by-8 settings without
    changing any other source file.
+
+## Result (2026-09-04)
+
+The DQ objective passed, but the experiment failed functional acceptance. TD
+reported `SWNS=-1.526ns`, `STNS=-7.172ns`, `HWNS=0.037ns` and `HTNS=0.000ns`.
+The DQ path slacks were `+4.983ns` for `ext_mem_clk -> clkc[2]` and `+1.435ns`
+in the reverse direction.
+
+On JTAG, first image and ordinary manual switching worked. Automatic playback
+repeatedly held `341100` for about ten seconds, then displayed `341002` and
+retried. The same sequence occurred after TF-card reinitialization on a
+single manual next request. This establishes that 41.667 MHz does not complete
+every SDRAM write-frame transaction reliably; it is not an automatic-play
+input issue. The configuration Flash was not changed. The specified rollback
+to C1/C2 divide-by-8 is required before the next timing-closure approach.

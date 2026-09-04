@@ -51,6 +51,8 @@ reg [31:0] image_sector3;
 reg        scan_active_seen;
 reg        scan_complete_pending;
 reg        load_active_seen;
+reg        write_req_ack_meta;
+reg        write_req_ack_sync;
 
 wire [31:0] load_sector;
 
@@ -58,6 +60,17 @@ assign storage_ready = sd_init_done;
 assign write_en      = bmp_data_wr_en;
 assign write_data    = {bmp_data, 8'b0};
 assign core_rst      = rst | storage_reinit;
+
+// write_req_ack is generated in ext_mem_clk; bmp_read consumes it in clk.
+always @(posedge clk or posedge core_rst) begin
+    if (core_rst) begin
+        write_req_ack_meta <= 1'b0;
+        write_req_ack_sync <= 1'b0;
+    end else begin
+        write_req_ack_meta <= write_req_ack;
+        write_req_ack_sync <= write_req_ack_meta;
+    end
+end
 
 function [31:0] sector_for_index;
     input [1:0] index;
@@ -162,7 +175,7 @@ bmp_read u_bmp_read (
     .bmp_width              (16'd640),
     .bmp_height             (16'd480),
     .write_req              (write_req),
-    .write_req_ack          (write_req_ack),
+    .write_req_ack          (write_req_ack_sync),
     .sd_sec_read            (sd_sec_read),
     .sd_sec_read_addr       (sd_sec_read_addr),
     .sd_sec_read_data       (sd_sec_read_data),

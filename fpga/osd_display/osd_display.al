@@ -288,6 +288,14 @@
                     <Attr Name="CompileOrder" Val="40"/>
                 </FileInfo>
             </File>
+            <File Path="rtl/video/video_osd_overlay.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="41"/>
+                </FileInfo>
+            </File>
         </Verilog>
         <ADC_FILE>
             <File Path="constraints/pin.adc">
