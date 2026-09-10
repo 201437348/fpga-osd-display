@@ -25,6 +25,18 @@ module video_delay(input video_clk, input rst, output read_en, input [23:0] read
                    output [23:0] vout_data);
 endmodule
 
+module sd_card_top #(
+    parameter SPI_LOW_SPEED_DIV = 0, parameter SPI_HIGH_SPEED_DIV = 0
+)(
+    input clk, input rst, output SD_nCS, output SD_DCLK, output SD_MOSI, input SD_MISO,
+    output sd_init_done, input sd_sec_read, input [31:0] sd_sec_read_addr,
+    output [7:0] sd_sec_read_data, output sd_sec_read_data_valid, output sd_sec_read_end,
+    input sd_sec_write, input [31:0] sd_sec_write_addr, input [7:0] sd_sec_write_data,
+    output sd_sec_write_data_req, output sd_sec_write_end
+);
+endmodule
+
+`ifndef OSD_USE_REAL_FRAME_READ_WRITE
 module frame_read_write #(
     parameter WRITE_V_FLIP = 0, parameter FRAME_WIDTH = 0, parameter FRAME_HEIGHT = 0
 )(
@@ -33,7 +45,11 @@ module frame_read_write #(
     input [31:0] Sdr_rd_dout, input read_clk, input read_req, output read_req_ack,
     output read_finish, input [23:0] read_addr_0, input [23:0] read_addr_1,
     input [23:0] read_addr_2, input [23:0] read_addr_3, input [1:0] read_addr_index,
-    input [23:0] read_len, output read_en, output [31:0] read_data, output App_wr_en,
+    input [1:0] read_addr_index_old, input slide_active, input [9:0] slide_position,
+    input [23:0] read_len, input read_en, input display_valid,
+    output [31:0] read_data, output read_fault,
+    output [3:0] read_fifo_underflow_count_per_frame,
+    output App_wr_en,
     output [20:0] App_wr_addr, output [31:0] App_wr_din, output [3:0] App_wr_dm,
     input write_clk, input write_req, output write_req_ack, output write_finish,
     input [23:0] write_addr_0, input [23:0] write_addr_1, input [23:0] write_addr_2,
@@ -41,6 +57,7 @@ module frame_read_write #(
     input write_en, input [31:0] write_data, output write_fifo_afull
 );
 endmodule
+`endif
 
 module sdram(input Clk, input Clk_sft, input Rst, output Sdr_init_done,
              output Sdr_init_ref_vld, output Sdr_busy, input App_wr_en,

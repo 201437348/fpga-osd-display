@@ -8,6 +8,8 @@ reg storage_ready = 1'b0;
 reg scan_done = 1'b0;
 reg [2:0] scan_found_count = 3'd0;
 reg source_done_pulse = 1'b0;
+reg source_error_pulse = 1'b0;
+reg storage_fault_pulse = 1'b0;
 reg write_done_pulse = 1'b0;
 reg next_request = 1'b0;
 reg auto_request = 1'b0;
@@ -46,6 +48,8 @@ image_load_manager #(
     .scan_done(scan_done),
     .scan_found_count(scan_found_count),
     .source_done_pulse(source_done_pulse),
+    .source_error_pulse(source_error_pulse),
+    .storage_fault_pulse(storage_fault_pulse),
     .write_done_pulse(write_done_pulse),
     .next_request(next_request),
     .auto_request(auto_request),
@@ -149,6 +153,20 @@ task automatic complete_current_load;
     end
 endtask
 
+task automatic finish_preserving_recovery_scan;
+    input [2:0] count;
+    begin
+        scan_done = 1'b0;
+        scan_found_count = count;
+        wait_for_state(3'd1, "display-preserving recovery scan state");
+        tick();
+        scan_done = 1'b1;
+        tick();
+        scan_done = 1'b0;
+        wait_for_state(3'd5, "display-preserving recovery returns idle");
+    end
+endtask
+
 task automatic reset_dut;
     begin
         rst = 1'b1;
@@ -156,6 +174,8 @@ task automatic reset_dut;
         scan_done = 1'b0;
         scan_found_count = 3'd0;
         source_done_pulse = 1'b0;
+        source_error_pulse = 1'b0;
+        storage_fault_pulse = 1'b0;
         write_done_pulse = 1'b0;
         next_request = 1'b0;
         auto_request = 1'b0;
@@ -184,6 +204,26 @@ initial begin
     expect_bit(display_valid, 1'b1, "first frame committed");
     expect_bit(display_test_pattern, 1'b0, "test pattern disabled after commit");
     expect_value(display_buffer_index, 2'd0, "first display buffer");
+
+    // A hung sector request initiates SD recovery but must retain the current
+    // SDRAM frame. The recovered directory scan supplies audio metadata only;
+    // it must not reload or switch the displayed image.
+    storage_fault_pulse = 1'b1;
+    tick();
+    storage_fault_pulse = 1'b0;
+    expect_bit(storage_reinit, 1'b1, "storage fault emits reinit pulse");
+    expect_value(state, 3'd0, "storage fault returns to reset wait");
+    expect_bit(display_valid, 1'b1, "storage fault retains committed frame");
+    expect_value(current_image_index, 2'd0, "storage fault retains current index");
+    expect_value(display_buffer_index, 2'd0, "storage fault retains display buffer");
+    storage_ready = 1'b0;
+    tick();
+    storage_ready = 1'b1;
+    finish_preserving_recovery_scan(3'd3);
+    expect_value(image_count, 3'd3, "recovery refreshes image metadata");
+    expect_value(current_image_index, 2'd0, "recovery does not switch image");
+    expect_value(display_buffer_index, 2'd0, "recovery does not replace frame");
+    expect_bit(load_in_progress, 1'b0, "recovery does not start BMP load");
 
     next_request = 1'b1;
     tick();
@@ -218,6 +258,35 @@ initial begin
     expect_value(state, 3'd0, "storage loss returns to reset wait");
     expect_bit(display_valid, 1'b1, "storage loss retains displayed frame");
     expect_bit(display_test_pattern, 1'b0, "storage loss does not replace valid frame");
+
+    // A malformed FAT/BMP source retries immediately instead of consuming the timeout.
+    reset_dut();
+    storage_ready = 1'b1;
+    finish_scan(3'd1);
+    wait_for_state(3'd3, "source-error verify");
+    source_error_pulse = 1'b1;
+    tick();
+    source_error_pulse = 1'b0;
+    expect_value(state, 3'd2, "source error immediately starts retry");
+    expect_bit(load_abort, 1'b1, "source error aborts the active load");
+    expect_value(retry_count, 2'd1, "source error increments retry count");
+    expect_value(error_code, 4'd5, "source error has a distinct code");
+
+    // Valid source and write completion win even on the final timeout clock.
+    reset_dut();
+    storage_ready = 1'b1;
+    finish_scan(3'd1);
+    wait_for_state(3'd3, "deadline completion verify");
+    @(negedge clk);
+    dut.load_timeout_count = 32'd3;
+    source_done_pulse = 1'b1;
+    write_done_pulse = 1'b1;
+    tick();
+    source_done_pulse = 1'b0;
+    write_done_pulse = 1'b0;
+    wait_for_state(3'd5, "deadline completion commits frame");
+    expect_bit(display_valid, 1'b1, "deadline completion remains valid");
+    expect_value(error_code, 4'd0, "deadline completion is not a timeout");
 
     // After all candidate images fail, a manual request resets only storage.
     reset_dut();

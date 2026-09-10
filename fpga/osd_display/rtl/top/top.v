@@ -86,18 +86,42 @@ wire        frame_write_done_pulse;
 
 wire [1:0]  write_buf_idx;
 wire [1:0]  disp_buf_idx_sd;
+wire [1:0]  current_image_index_sd;
 reg [1:0]   disp_buf_idx_video_meta;
 reg [1:0]   disp_buf_idx_video_sync;
-wire [1:0]  disp_buf_idx;
+wire [1:0]  active_buffer_index;
+wire [1:0]  slide_old_buffer_index;
+wire [1:0]  slide_new_buffer_index;
+wire        slide_active;
+wire [9:0]  slide_position;
+wire        transition_busy;
+wire        frame_read_fault;
+wire [3:0]  frame_read_fifo_underflow_count_per_frame;
+reg [1:0]   frame_read_fault_video_sync;
+reg [3:0]   read_underflow_count_meta;
+reg [3:0]   read_underflow_count_sd_sync;
+reg [1:0]   transition_busy_sd_sync;
+wire        playback_manager_idle;
 reg         display_valid_video_meta;
 reg         display_valid_video_sync;
 reg         display_test_pattern_video_meta;
 reg         display_test_pattern_video_sync;
+wire [11:0] osd_status_sd;
+reg [11:0]  osd_status_video_meta;
+reg [11:0]  osd_status_video_sync;
+wire        osd_storage_ready;
+wire [2:0]  osd_manager_state;
+wire        osd_load_in_progress;
+wire [1:0]  osd_target_image_index;
+wire [1:0]  osd_current_image_index;
+wire [2:0]  osd_image_count;
 
 wire        storage_ready;
 wire        scan_done;
 wire [2:0]  scan_found_count;
 wire        source_done_pulse;
+wire        source_error_pulse;
+wire        storage_fault_pulse;
 wire        scan_start;
 wire        load_start;
 wire        load_abort;
@@ -116,6 +140,23 @@ wire        manager_idle;
 wire        next_request;
 wire        auto_request;
 wire        auto_play_enabled;
+
+wire        audio_fifo_wr_en;
+wire [31:0] audio_fifo_wr_data;
+wire [9:0]  audio_fifo_wrusedw;
+wire        audio_fifo_full;
+wire        audio_fifo_rst;
+wire        audio_fifo_re;
+wire [31:0] audio_fifo_dout;
+wire        audio_fifo_valid;
+wire        audio_fifo_empty;
+wire [9:0]  audio_fifo_rdusedw;
+wire        hdmi_audio_valid;
+wire [23:0] hdmi_audio_left_data;
+wire [23:0] hdmi_audio_right_data;
+wire        hdmi_acr_valid;
+wire [19:0] hdmi_acr_cts;
+wire [19:0] hdmi_acr_n;
 
 wire App_rd_en;
 wire [ADDR_BITS-1:0] App_rd_addr;
@@ -229,16 +270,75 @@ image_storage_adapter #(
     .scan_done         (scan_done),
     .scan_found_count  (scan_found_count),
     .source_done_pulse (source_done_pulse),
+    .source_error_pulse(source_error_pulse),
+    .storage_fault_pulse(storage_fault_pulse),
     .state_code        (storage_state_code),
     .write_req         (sd_card_write_req),
     .write_req_ack     (sd_card_write_req_ack),
     .write_fifo_afull  (frame_write_fifo_afull),
     .write_en          (sd_card_write_en),
     .write_data        (sd_card_write_data),
+    .audio_fifo_wr_en  (audio_fifo_wr_en),
+    .audio_fifo_wr_data(audio_fifo_wr_data),
+    .audio_fifo_wrusedw(audio_fifo_wrusedw),
+    .audio_fifo_full   (audio_fifo_full),
+    .audio_fifo_rst    (audio_fifo_rst),
     .SD_nCS            (sd_ncs),
     .SD_DCLK           (sd_dclk),
     .SD_MOSI           (sd_mosi),
     .SD_MISO           (sd_miso)
+);
+
+// BGM.WAV crosses from the TF clock to the HDMI pixel clock through the
+// generated asynchronous FIFO.  Show-ahead mode lets each sample pulse use
+// the current PCM frame while advancing the FIFO for the following pulse.
+wfifo_32_32_512 #(
+    .DATA_WIDTH_W  (32),
+    .DATA_WIDTH_R  (32),
+    .ADDR_WIDTH_W  (10),
+    .ADDR_WIDTH_R  (10),
+    .AL_FULL_NUM   (10'd980),
+    .AL_EMPTY_NUM  (11'd2),
+    .SHOW_AHEAD_EN (1'b1),
+    .OUTREG_EN     ("NOREG")
+) u_audio_async_fifo (
+    .rst        (audio_fifo_rst),
+    .clkw       (sd_card_clk),
+    .clkr       (video_clk),
+    .we         (audio_fifo_wr_en),
+    .di         (audio_fifo_wr_data),
+    .re         (audio_fifo_re),
+    .dout       (audio_fifo_dout),
+    .valid      (audio_fifo_valid),
+    .full_flag  (audio_fifo_full),
+    .empty_flag (audio_fifo_empty),
+    .afull      (),
+    .aempty     (),
+    .wrusedw    (audio_fifo_wrusedw),
+    .rdusedw    (audio_fifo_rdusedw)
+);
+
+audio_pcm_player u_audio_pcm_player (
+    .clk              (video_clk),
+    .rst              (rst_all),
+    .enable           (display_valid),
+    .fifo_empty       (audio_fifo_empty),
+    .fifo_valid       (audio_fifo_valid),
+    .fifo_rdusedw     (audio_fifo_rdusedw),
+    .fifo_dout        (audio_fifo_dout),
+    .fifo_re          (audio_fifo_re),
+    .audio_valid      (hdmi_audio_valid),
+    .audio_left_data  (hdmi_audio_left_data),
+    .audio_right_data (hdmi_audio_right_data)
+);
+
+hdmi_audio_acr u_hdmi_audio_acr (
+    .clk          (video_clk),
+    .rst          (rst_all),
+    .audio_valid  (hdmi_audio_valid),
+    .acr_valid    (hdmi_acr_valid),
+    .acr_cts      (hdmi_acr_cts),
+    .acr_n        (hdmi_acr_n)
 );
 
 image_load_manager #(
@@ -252,6 +352,8 @@ image_load_manager #(
     .scan_done            (scan_done),
     .scan_found_count     (scan_found_count),
     .source_done_pulse    (source_done_pulse),
+    .source_error_pulse   (source_error_pulse),
+    .storage_fault_pulse  (storage_fault_pulse),
     .write_done_pulse     (frame_write_done_pulse),
     .next_request         (next_request),
     .auto_request         (auto_request),
@@ -262,7 +364,7 @@ image_load_manager #(
     .target_image_index   (target_image_index),
     .write_buffer_index   (write_buf_idx),
     .display_buffer_index (disp_buf_idx_sd),
-    .current_image_index  (),
+    .current_image_index  (current_image_index_sd),
     .display_valid        (display_valid_sd),
     .display_test_pattern (display_test_pattern_sd),
     .state                (manager_state),
@@ -286,11 +388,46 @@ image_playback_control #(
     .key_auto              (key2),
     .display_valid         (display_valid_sd),
     .image_count           (image_count),
-    .manager_idle          (manager_idle),
+    .manager_idle          (playback_manager_idle),
     .next_request          (next_request),
     .auto_request          (auto_request),
     .auto_play_enabled     (auto_play_enabled)
 );
+
+// Hold new playback requests while the video-domain fade owns the display
+// handoff.  The image manager remains unchanged, preserving TF recovery and
+// load-state behavior.
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all)
+        transition_busy_sd_sync <= 2'b00;
+    else
+        transition_busy_sd_sync <= {transition_busy_sd_sync[0], transition_busy};
+end
+
+assign playback_manager_idle = manager_idle && !transition_busy_sd_sync[1];
+
+// Diagnostic only: surfaces frame_read_write's per-frame read-FIFO-empty
+// episode count (video_delay.read_en has no empty gating, so an underflow
+// shows up as raw FIFO data on screen). The value updates once per video
+// frame (~16.8ms) and holds steady for the whole next frame, so unlike a
+// forever-sticky counter it shows whether the SAME high count recurs every
+// single frame (a chronic per-frame throughput problem) or only appears
+// for the first frame or two after the image commits (a one-time startup
+// transient) -- watch it over several seconds, not just its first value.
+// A plain double-register sync of the whole bus, matching this file's
+// existing multi-bit diagnostic buses (disp_buf_idx_video_sync,
+// osd_status_video_sync) — acceptable here because the value only changes
+// once per frame, and a transient wrong digit during a rare crossing is
+// harmless for a board-visible diagnostic.
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all) begin
+        read_underflow_count_meta    <= 4'd0;
+        read_underflow_count_sd_sync <= 4'd0;
+    end else begin
+        read_underflow_count_meta    <= frame_read_fifo_underflow_count_per_frame;
+        read_underflow_count_sd_sync <= read_underflow_count_meta;
+    end
+end
 
 assign state_code = {1'b0, manager_state};
 assign seg_digit_s = state_code;
@@ -298,7 +435,8 @@ assign seg_digit_c = {1'b0, image_count};
 assign seg_digit_l = {3'b000, load_in_progress};
 assign seg_digit_r = {3'b000, source_done_seen};
 assign seg_digit_w = {3'b000, write_done_seen};
-assign seg_digit_x = error_code;
+assign seg_digit_x = (read_underflow_count_sd_sync != 4'd0) ?
+                     read_underflow_count_sd_sync : error_code;
 
 seg_decoder seg_decoder_s(
     .bin_data          (seg_digit_s),
@@ -355,6 +493,21 @@ video_timing_data video_timing_data_m0(
     .de                (de_0)
 );
 
+video_transition_controller video_transition_controller_m0(
+    .video_clk              (video_clk),
+    .rst                    (rst_all),
+    .video_read_req         (video_read_req),
+    .display_valid          (display_valid_video_sync),
+    .committed_buffer_index (disp_buf_idx_video_sync),
+    .read_fault             (frame_read_fault_video_sync[1]),
+    .active_buffer_index    (active_buffer_index),
+    .slide_old_buffer_index (slide_old_buffer_index),
+    .slide_new_buffer_index (slide_new_buffer_index),
+    .slide_active           (slide_active),
+    .transition_busy        (transition_busy),
+    .slide_position         (slide_position)
+);
+
 video_delay video_delay_m0(
     .video_clk         (video_clk),
     .rst               (rst_all),
@@ -378,6 +531,9 @@ always @(posedge video_clk or posedge rst_all) begin
         display_valid_video_sync        <= 1'b0;
         display_test_pattern_video_meta <= 1'b0;
         display_test_pattern_video_sync <= 1'b0;
+        osd_status_video_meta           <= 12'd0;
+        osd_status_video_sync           <= 12'd0;
+        frame_read_fault_video_sync     <= 2'b00;
     end else begin
         disp_buf_idx_video_meta         <= disp_buf_idx_sd;
         disp_buf_idx_video_sync         <= disp_buf_idx_video_meta;
@@ -385,12 +541,20 @@ always @(posedge video_clk or posedge rst_all) begin
         display_valid_video_sync        <= display_valid_video_meta;
         display_test_pattern_video_meta <= display_test_pattern_sd;
         display_test_pattern_video_sync <= display_test_pattern_video_meta;
+        osd_status_video_meta           <= osd_status_sd;
+        osd_status_video_sync           <= osd_status_video_meta;
+        frame_read_fault_video_sync     <= {frame_read_fault_video_sync[0],
+                                            frame_read_fault};
     end
 end
 
-assign disp_buf_idx         = disp_buf_idx_video_sync;
 assign display_valid        = display_valid_video_sync;
 assign display_test_pattern = display_test_pattern_video_sync;
+assign osd_status_sd = {storage_ready, manager_state, load_in_progress,
+                        target_image_index, current_image_index_sd, image_count};
+assign {osd_storage_ready, osd_manager_state, osd_load_in_progress,
+        osd_target_image_index, osd_current_image_index, osd_image_count} =
+       osd_status_video_sync;
 
 video_fallback_pattern video_fallback_pattern_m0(
     .video_clk         (video_clk),
@@ -411,14 +575,19 @@ video_osd_overlay video_osd_overlay_m0(
     .rgb_in               (vout_data),
     .display_valid        (display_valid),
     .display_test_pattern (display_test_pattern),
-    .display_buffer_index (disp_buf_idx),
+    .storage_ready        (osd_storage_ready),
+    .manager_state        (osd_manager_state),
+    .load_in_progress     (osd_load_in_progress),
+    .target_image_index   (osd_target_image_index),
+    .current_image_index  (osd_current_image_index),
+    .image_count          (osd_image_count),
     .rgb_out              (vout_data_osd)
 );
 
 frame_read_write #(
-    .WRITE_V_FLIP     (1),
-    .FRAME_WIDTH      (640),
-    .FRAME_HEIGHT     (480)
+    .WRITE_V_FLIP        (1),
+    .FRAME_WIDTH         (640),
+    .FRAME_HEIGHT        (480)
 ) frame_read_write_m0(
     .mem_clk           (ext_mem_clk),
     .rst               (rst_all),
@@ -439,10 +608,17 @@ frame_read_write #(
     .read_addr_1       (BUF1_ADDR),
     .read_addr_2       (24'd0),
     .read_addr_3       (24'd0),
-    .read_addr_index   (disp_buf_idx),
+    .read_addr_index   (slide_active ? slide_new_buffer_index :
+                                       active_buffer_index),
+    .read_addr_index_old(slide_old_buffer_index),
+    .slide_active      (slide_active),
+    .slide_position    (slide_position),
     .read_len          (FRAME_PIXELS),
     .read_en           (video_read_en),
+    .display_valid     (display_valid),
     .read_data         (video_read_data),
+    .read_fault        (frame_read_fault),
+    .read_fifo_underflow_count_per_frame (frame_read_fifo_underflow_count_per_frame),
 
     .App_wr_en         (App_wr_en),
     .App_wr_addr       (App_wr_addr),
@@ -534,12 +710,12 @@ hdmi_1_4b_transmitter_core_wrapper #(
     .I_axis_s_data      (axis_s_data),
     .O_axis_s_ready     (axis_s_ready),
 
-    .I_audio_valid      (1'b0),
-    .I_audio_left_data  (24'd0),
-    .I_audio_right_data (24'd0),
-    .I_acr_valid        (1'b0),
-    .I_acr_cts          (20'd0),
-    .I_acr_n            (20'd0),
+    .I_audio_valid      (hdmi_audio_valid),
+    .I_audio_left_data  (hdmi_audio_left_data),
+    .I_audio_right_data (hdmi_audio_right_data),
+    .I_acr_valid        (hdmi_acr_valid),
+    .I_acr_cts          (hdmi_acr_cts),
+    .I_acr_n            (hdmi_acr_n),
 
     .O_video_locked     (),
     .O_ddc_scl          (HDMI_DDC_SCL),

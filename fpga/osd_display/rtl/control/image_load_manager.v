@@ -10,6 +10,8 @@ module image_load_manager #(
     input  wire       scan_done,
     input  wire [2:0] scan_found_count,
     input  wire       source_done_pulse,
+    input  wire       source_error_pulse,
+    input  wire       storage_fault_pulse,
     input  wire       write_done_pulse,
     input  wire       next_request,
     input  wire       auto_request,
@@ -48,6 +50,7 @@ localparam [3:0] ERR_SCAN_EMPTY = 4'd1;
 localparam [3:0] ERR_TIMEOUT    = 4'd2;
 localparam [3:0] ERR_ALL_FAILED = 4'd3;
 localparam [3:0] ERR_STORAGE_INIT = 4'd4;
+localparam [3:0] ERR_SOURCE = 4'd5;
 
 localparam [31:0] LOAD_TIMEOUT_CYCLES = CLK_FREQ_HZ * LOAD_TIMEOUT_SECONDS;
 localparam [31:0] STORAGE_INIT_TIMEOUT_CYCLES =
@@ -58,6 +61,7 @@ reg [31:0] load_timeout_count;
 reg [31:0] storage_init_wait_count;
 reg        scan_active_seen;
 reg        resume_next_after_reinit;
+reg        preserve_display_after_reinit;
 
 assign load_in_progress = (state == ST_LOAD) || (state == ST_VERIFY);
 assign idle             = (state == ST_IDLE);
@@ -107,13 +111,28 @@ always @(posedge clk or posedge rst) begin
         write_done_seen     <= 1'b0;
         scan_active_seen    <= 1'b0;
         resume_next_after_reinit <= 1'b0;
+        preserve_display_after_reinit <= 1'b0;
     end else begin
         scan_start <= 1'b0;
         load_start <= 1'b0;
         load_abort <= 1'b0;
         storage_reinit <= 1'b0;
 
-        if (!storage_ready) begin
+        if (storage_fault_pulse) begin
+            storage_reinit      <= 1'b1;
+            load_abort          <= (state == ST_LOAD) || (state == ST_VERIFY);
+            state               <= ST_RESET_WAIT;
+            pending_next        <= 1'b0;
+            image_count         <= 3'd0;
+            retry_count         <= 2'd0;
+            skipped_image_count <= 3'd0;
+            load_timeout_count  <= 32'd0;
+            source_done_seen    <= 1'b0;
+            write_done_seen     <= 1'b0;
+            scan_active_seen    <= 1'b0;
+            resume_next_after_reinit <= 1'b0;
+            preserve_display_after_reinit <= display_valid;
+        end else if (!storage_ready) begin
             // The vendor SD core stays uninitialized when no card is present.
             // Keep a prior frame, but make a no-card startup visible after a guard period.
             if (!display_valid) begin
@@ -164,10 +183,16 @@ always @(posedge clk or posedge rst) begin
                             retry_count         <= 2'd0;
                             skipped_image_count <= 3'd0;
                             resume_next_after_reinit <= 1'b0;
-                            state               <= ST_LOAD;
+                            if (preserve_display_after_reinit && display_valid) begin
+                                preserve_display_after_reinit <= 1'b0;
+                                state                         <= ST_IDLE;
+                            end else begin
+                                state <= ST_LOAD;
+                            end
                         end else begin
                             error_code <= ERR_SCAN_EMPTY;
                             resume_next_after_reinit <= 1'b0;
+                            preserve_display_after_reinit <= 1'b0;
                             if (!display_valid)
                                 display_test_pattern <= 1'b1;
                             state <= ST_RECOVER;
@@ -189,12 +214,12 @@ always @(posedge clk or posedge rst) begin
                     if (write_done_pulse)
                         write_done_seen <= 1'b1;
 
-                    if ((source_done_seen || source_done_pulse) &&
-                        (write_done_seen || write_done_pulse)) begin
-                        state <= ST_COMMIT;
-                    end else if (load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 1'b1)) begin
+                    if (source_error_pulse ||
+                        (!((source_done_seen || source_done_pulse) &&
+                           (write_done_seen || write_done_pulse)) &&
+                         (load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 1'b1)))) begin
                         load_abort <= 1'b1;
-                        error_code <= ERR_TIMEOUT;
+                        error_code <= source_error_pulse ? ERR_SOURCE : ERR_TIMEOUT;
 
                         if (retry_count < MAX_LOAD_RETRIES) begin
                             retry_count <= retry_count + 2'd1;
@@ -215,6 +240,9 @@ always @(posedge clk or posedge rst) begin
                             error_code  <= ERR_ALL_FAILED;
                             state       <= ST_IDLE;
                         end
+                    end else if ((source_done_seen || source_done_pulse) &&
+                        (write_done_seen || write_done_pulse)) begin
+                        state <= ST_COMMIT;
                     end else begin
                         load_timeout_count <= load_timeout_count + 32'd1;
                     end
