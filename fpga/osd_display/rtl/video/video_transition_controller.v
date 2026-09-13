@@ -61,7 +61,7 @@ function [9:0] slide_curve;
             5'd24: slide_curve = 10'd605;
             5'd25: slide_curve = 10'd620;
             5'd26: slide_curve = 10'd631;
-            5'd27: slide_curve = 10'd638;
+            5'd27: slide_curve = 10'd640;
             5'd28: slide_curve = 10'd640;
             default: slide_curve = 10'd640;
         endcase

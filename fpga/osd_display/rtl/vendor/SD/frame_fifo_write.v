@@ -78,8 +78,12 @@ wire								wr_burst_finish;
 reg App_wr_en_r;
 reg App_wr_en_d0;
 
+reg fifo_ready_r;
+wire fifo_ready_now;
 wire into_burst;
-assign into_burst = (((write_len_latch <= (rdusedw + write_cnt))||rdusedw > BURST_SIZE) && ~App_rd_busy);//当rd在突发时不会进入burst
+assign fifo_ready_now = ((write_len_latch <= (rdusedw + write_cnt)) ||
+                         (rdusedw > BURST_SIZE));
+assign into_burst = fifo_ready_r && ~App_rd_busy;
 
 assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};
 //assign O_wr_busy = (state != S_IDLE || (S_IDLE && write_req_d2));
@@ -87,6 +91,18 @@ assign O_wr_busy = (state == S_WRITE_BURST || (state == S_CHECK_FIFO && into_bur
 assign wr_burst_finish = (burst_cnt >= BURST_SIZE);
 assign write_finish = (state == S_END) ? 1'b1 : 1'b0;            //write finish at state 'S_END'
 assign App_wr_en = App_wr_en_d0;
+
+// Stop the FIFO pointer/count arithmetic at this register instead of letting
+// it propagate through O_wr_busy into the read scheduler in the same cycle.
+always @(posedge mem_clk or posedge rst)
+begin
+	if(rst == 1'b1)
+		fifo_ready_r <= 1'b0;
+	else if(state == S_CHECK_FIFO)
+		fifo_ready_r <= fifo_ready_now;
+	else
+		fifo_ready_r <= 1'b0;
+end
 
 
 always@(posedge mem_clk or posedge rst)

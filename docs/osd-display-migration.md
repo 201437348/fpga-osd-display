@@ -1,7 +1,7 @@
 # Formal Video Baseline Migration
 
-Date: 2026-09-10
-Current status: line-buffer horizontal transition source-complete, TD/JTAG-pending
+Date: 2026-09-13
+Current status: line-buffer horizontal transition board-validated; stable baseline frozen
 
 ## Migration boundary
 
@@ -1341,3 +1341,53 @@ margin and the fix is to add explicit rate limiting to
 `frame_slide_fifo_read` (e.g. bound how many rows it may complete ahead of
 the video's actual real-time line position, not just bound instantaneous
 FIFO occupancy) rather than continuing to treat this as transition-specific.
+
+## Final horizontal-transition baseline (2026-09-13)
+
+The diagnostic sequence continued past the per-frame underflow experiment.
+Solid-color, address-pattern, phase-color, FIFO-uniform, and SDRAM-uniform
+builds separated the fixed physical-left-edge artifact from the moving
+old/new-image boundary artifact. The final hardware result did not require a
+deeper FIFO, an SDRAM clock change, or video-rate pacing.
+
+The accepted read path discards four preroll responses before every visible
+address chunk and issues each payload as a complete fixed 128-word burst.
+Surplus tail responses are drained before the scheduler changes address
+segments. `video_delay.v` consumes the FIFO `valid` signal through a four-entry
+video-domain alignment queue, and the read FIFO remains
+`SHOW_AHEAD_EN=0 + OUTREG` so it continues to use BRAM.
+
+The production top selects this exact configuration:
+
+```verilog
+.WRITE_BUFFER_SOLID_DIAGNOSTIC(0),
+.SLIDE_FEATHER_ENABLE(0),
+.SLIDE_FIFO_UNIFORM_DIAGNOSTIC(0),
+.SLIDE_SDRAM_UNIFORM_DIAGNOSTIC(0),
+.SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC(0),
+.SLIDE_PHASE_COLOR_DIAGNOSTIC(0),
+.READ_CHUNK_PREROLL_WORDS(4),
+.FIXED_READ_BURST_ENABLE(1),
+```
+
+Focused stale-return and fixed-burst tests, a 640x480 full-frame test, seven
+slide positions with pixel-exact multiframe checking, FIFO/video-delay/AXIS/
+OSD/underflow/marker/write diagnostics, real and stub top elaboration, and
+both TD project-list parses pass. The completed refresh-stall/depth records
+show zero underflow, dropped commands, and scheduler stalls; the worst
+`stall=16, depth=512` case completed 24 frames. `git diff --check` also passes.
+
+TD synthesis, place/route, bitstream generation, and JTAG board acceptance are
+complete. Real-image manual transitions and automatic playback no longer show
+either the fixed left-edge color line or the moving boundary line. Stable
+display, OSD, audio, controls, and TF-card removal/reinsertion recovery also
+pass. This feather-disabled build is the formal development and competition
+baseline for subsequent stages.
+
+Feathering is retired from the plan. With complete fixed bursts, its two extra
+32-pixel segments per row caused incomplete frames, severe horizontal and
+vertical ghosting, a failed transition, and a blocked next-image key on real
+hardware. Restoring `SLIDE_FEATHER_ENABLE=0` restored correct behavior.
+Sixteen-word preroll was also rejected after producing almost no improvement
+over four words. Do not reopen SDRAM frequency/phase, FIFO-depth, preroll, or
+feather experiments while beginning the image-scaling stage.

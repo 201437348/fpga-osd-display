@@ -21,6 +21,7 @@ module video_timing_data(input video_clk, input rst, output read_req, input read
 endmodule
 
 module video_delay(input video_clk, input rst, output read_en, input [23:0] read_data,
+                   input read_data_valid,
                    input hs, input vs, input de, output hs_r, output vs_r, output de_r,
                    output [23:0] vout_data);
 endmodule
@@ -38,7 +39,19 @@ endmodule
 
 `ifndef OSD_USE_REAL_FRAME_READ_WRITE
 module frame_read_write #(
-    parameter WRITE_V_FLIP = 0, parameter FRAME_WIDTH = 0, parameter FRAME_HEIGHT = 0
+    parameter WRITE_V_FLIP = 0,
+    parameter WRITE_BUFFER_SOLID_DIAGNOSTIC = 0,
+    parameter FRAME_WIDTH = 0,
+    parameter FRAME_HEIGHT = 0, parameter SLIDE_FEATHER_ENABLE = 1,
+    parameter SLIDE_FIFO_UNIFORM_DIAGNOSTIC = 0,
+    parameter SLIDE_SDRAM_UNIFORM_DIAGNOSTIC = 0,
+    parameter SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC = 0,
+    parameter SLIDE_PHASE_COLOR_DIAGNOSTIC = 0,
+    parameter READ_CHUNK_PREROLL_WORDS = 0,
+    parameter FIXED_READ_BURST_ENABLE = 0,
+    parameter READ_FIFO_MARKER_ENABLE = 0,
+    parameter READ_FIFO_MARKER_START = 0,
+    parameter READ_FIFO_MARKER_WIDTH = 16
 )(
     input mem_clk, input rst, input Sdr_init_done, input Sdr_init_ref_vld, input Sdr_busy,
     output App_rd_en, output [20:0] App_rd_addr, input Sdr_rd_en,
@@ -47,7 +60,7 @@ module frame_read_write #(
     input [23:0] read_addr_2, input [23:0] read_addr_3, input [1:0] read_addr_index,
     input [1:0] read_addr_index_old, input slide_active, input [9:0] slide_position,
     input [23:0] read_len, input read_en, input display_valid,
-    output [31:0] read_data, output read_fault,
+    output [31:0] read_data, output read_data_valid, output read_fault,
     output [3:0] read_fifo_underflow_count_per_frame,
     output App_wr_en,
     output [20:0] App_wr_addr, output [31:0] App_wr_din, output [3:0] App_wr_dm,
@@ -66,12 +79,15 @@ module sdram(input Clk, input Clk_sft, input Rst, output Sdr_init_done,
              output [31:0] Sdr_rd_dout);
 endmodule
 
+`ifndef OSD_USE_REAL_VIDEO_RGB_TO_AXIS
 module video_rgb_to_axis_640x480(
     input I_clk, input I_rst, input I_vs, input I_de, input [23:0] I_rgb,
+    input I_video_ready, input I_marker_enable,
     output O_video_user, output O_video_valid, output O_video_last,
-    output [23:0] O_video_data
+    output [23:0] O_video_data, output [3:0] O_backpressure_count
 );
 endmodule
+`endif
 
 module startup_pulse #(parameter CNT_MAX = 0)(input I_clk, input I_rst, output O_pulse);
 endmodule

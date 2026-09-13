@@ -73,6 +73,7 @@ wire        video_read_req;
 wire        video_read_req_ack;
 wire        video_read_en;
 wire [31:0] video_read_data;
+wire        video_read_data_valid;
 
 wire        sd_card_write_en;
 wire [31:0] sd_card_write_data;
@@ -100,6 +101,8 @@ wire [3:0]  frame_read_fifo_underflow_count_per_frame;
 reg [1:0]   frame_read_fault_video_sync;
 reg [3:0]   read_underflow_count_meta;
 reg [3:0]   read_underflow_count_sd_sync;
+reg [3:0]   axis_backpressure_count_meta;
+reg [3:0]   axis_backpressure_count_sd_sync;
 reg [1:0]   transition_busy_sd_sync;
 wire        playback_manager_idle;
 reg         display_valid_video_meta;
@@ -177,6 +180,7 @@ wire        axis_s_valid;
 wire        axis_s_last;
 wire [23:0] axis_s_data;
 wire        axis_s_ready;
+wire [3:0]  axis_backpressure_count;
 
 wire        edid_trig;
 wire        edid_valid;
@@ -423,9 +427,13 @@ always @(posedge sd_card_clk or posedge rst_all) begin
     if (rst_all) begin
         read_underflow_count_meta    <= 4'd0;
         read_underflow_count_sd_sync <= 4'd0;
+        axis_backpressure_count_meta    <= 4'd0;
+        axis_backpressure_count_sd_sync <= 4'd0;
     end else begin
         read_underflow_count_meta    <= frame_read_fifo_underflow_count_per_frame;
         read_underflow_count_sd_sync <= read_underflow_count_meta;
+        axis_backpressure_count_meta    <= axis_backpressure_count;
+        axis_backpressure_count_sd_sync <= axis_backpressure_count_meta;
     end
 end
 
@@ -513,6 +521,7 @@ video_delay video_delay_m0(
     .rst               (rst_all),
     .read_en           (video_read_en),
     .read_data         (video_read_data[31:8]),
+    .read_data_valid   (video_read_data_valid),
     .hs                (hs_0),
     .vs                (vs_0),
     .de                (de_0),
@@ -586,8 +595,19 @@ video_osd_overlay video_osd_overlay_m0(
 
 frame_read_write #(
     .WRITE_V_FLIP        (1),
+    .WRITE_BUFFER_SOLID_DIAGNOSTIC(0),
     .FRAME_WIDTH         (640),
-    .FRAME_HEIGHT        (480)
+    .FRAME_HEIGHT        (480),
+    .SLIDE_FEATHER_ENABLE(0),
+    .SLIDE_FIFO_UNIFORM_DIAGNOSTIC(0),
+    .SLIDE_SDRAM_UNIFORM_DIAGNOSTIC(0),
+    .SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC(0),
+    .SLIDE_PHASE_COLOR_DIAGNOSTIC(0),
+    .READ_CHUNK_PREROLL_WORDS(4),
+    .FIXED_READ_BURST_ENABLE(1),
+    .READ_FIFO_MARKER_ENABLE(0),
+    .READ_FIFO_MARKER_START (26),
+    .READ_FIFO_MARKER_WIDTH (5)
 ) frame_read_write_m0(
     .mem_clk           (ext_mem_clk),
     .rst               (rst_all),
@@ -617,6 +637,7 @@ frame_read_write #(
     .read_en           (video_read_en),
     .display_valid     (display_valid),
     .read_data         (video_read_data),
+    .read_data_valid   (video_read_data_valid),
     .read_fault        (frame_read_fault),
     .read_fifo_underflow_count_per_frame (frame_read_fifo_underflow_count_per_frame),
 
@@ -664,10 +685,13 @@ video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_vs          (vs),
     .I_de          (de),
     .I_rgb         (vout_data_osd),
+    .I_video_ready (axis_s_ready),
+    .I_marker_enable(1'b0),
     .O_video_user  (axis_s_user),
     .O_video_valid (axis_s_valid),
     .O_video_last  (axis_s_last),
-    .O_video_data  (axis_s_data)
+    .O_video_data  (axis_s_data),
+    .O_backpressure_count(axis_backpressure_count)
 );
 
 // 上电后自动打一拍，触发一次 EDID 读取

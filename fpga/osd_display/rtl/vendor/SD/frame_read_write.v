@@ -11,8 +11,19 @@ module frame_read_write
 	parameter READ_BURST_SIZE        = 128,
 	parameter READ_FIFO_DEPTH        = 512,
 	parameter WRITE_V_FLIP           = 1,
+	parameter WRITE_BUFFER_SOLID_DIAGNOSTIC = 0,
 	parameter FRAME_WIDTH            = 640,
-	parameter FRAME_HEIGHT           = 480
+	parameter FRAME_HEIGHT           = 480,
+	parameter SLIDE_FEATHER_ENABLE   = 1,
+	parameter SLIDE_FIFO_UNIFORM_DIAGNOSTIC = 0,
+	parameter SLIDE_SDRAM_UNIFORM_DIAGNOSTIC = 0,
+	parameter SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC = 0,
+	parameter SLIDE_PHASE_COLOR_DIAGNOSTIC = 0,
+	parameter READ_CHUNK_PREROLL_WORDS = 0,
+	parameter FIXED_READ_BURST_ENABLE = 0,
+	parameter READ_FIFO_MARKER_ENABLE = 0,
+	parameter READ_FIFO_MARKER_START  = 0,
+	parameter READ_FIFO_MARKER_WIDTH  = 16
 )
 (
 	input                            rst,
@@ -42,6 +53,7 @@ module frame_read_write
 	input                            read_en,
 	input                            display_valid,
 	output [READ_DATA_BITS - 1:0]    read_data,
+	output                           read_data_valid,
 	output                           read_fault,
 	output [3:0]                     read_fifo_underflow_count_per_frame,
 
@@ -74,13 +86,42 @@ wire write_fifo_aclr;
 wire O_wr_busy;
 wire O_rd_busy;
 wire read_fifo_write_en;
+wire [MEM_DATA_BITS - 1:0] slide_fifo_write_data;
 wire [MEM_DATA_BITS - 1:0] read_fifo_write_data;
+wire [WRITE_DATA_BITS - 1:0] write_fifo_data;
+reg  [15:0] read_fifo_marker_x;
 wire read_fifo_empty;
 wire read_fifo_underflow_now;
 reg  read_fifo_underflow_prev;
 reg  read_req_prev;
 reg  [3:0] read_fifo_underflow_count_running;
 reg  [3:0] read_fifo_underflow_count_frame_r;
+
+assign read_fifo_write_data =
+	(READ_FIFO_MARKER_ENABLE &&
+	 (read_fifo_marker_x >= READ_FIFO_MARKER_START) &&
+	 (read_fifo_marker_x <
+	  READ_FIFO_MARKER_START + READ_FIFO_MARKER_WIDTH)) ?
+	32'hFFFFFF00 : slide_fifo_write_data;
+
+assign write_fifo_data = WRITE_BUFFER_SOLID_DIAGNOSTIC ?
+	(write_addr_index == 2'd0) ? 32'hE0202000 :
+	(write_addr_index == 2'd1) ? 32'h20E04000 :
+	(write_addr_index == 2'd2) ? 32'h2040E000 :
+	                            32'hE0E02000 : write_data;
+
+always @(posedge mem_clk or posedge rst) begin
+	if (rst) begin
+		read_fifo_marker_x <= 16'd0;
+	end else if (read_fifo_aclr) begin
+		read_fifo_marker_x <= 16'd0;
+	end else if (read_fifo_write_en) begin
+		if (read_fifo_marker_x == FRAME_WIDTH - 1)
+			read_fifo_marker_x <= 16'd0;
+		else
+			read_fifo_marker_x <= read_fifo_marker_x + 16'd1;
+	end
+end
 
 // Gated by display_valid: before the first committed frame (or briefly at
 // power-on before Sdr_init_done), video_delay.read_en still pulses every
@@ -138,7 +179,7 @@ wfifo_32_32_512 #(
 	.rst        (write_fifo_aclr),
 	.we         (write_en),
 	.re         (App_wr_en),
-	.di         (write_data),
+	.di         (write_fifo_data),
 	.empty_flag (),
 	.full_flag  (),
 	.afull      (write_fifo_afull),
@@ -178,7 +219,10 @@ frame_fifo_write #(
 	.rdusedw          (rdusedw)
 );
 
-rfifo_32_32_512 read_buf (
+rfifo_32_32_512 #(
+	.SHOW_AHEAD_EN (1'b0),
+	.OUTREG_EN     ("OUTREG")
+) read_buf (
 	.clkr       (read_clk),
 	.clkw       (mem_clk),
 	.rst        (read_fifo_aclr),
@@ -189,6 +233,7 @@ rfifo_32_32_512 read_buf (
 	.full_flag  (),
 	.wrusedw    (wrusedw),
 	.rdusedw    (),
+	.valid      (read_data_valid),
 	.dout       (read_data)
 );
 
@@ -199,7 +244,14 @@ frame_slide_fifo_read #(
 	.FIFO_DEPTH      (READ_FIFO_DEPTH),
 	.FIFO_LEVEL_BITS (BURST_BITS),
 	.MAX_BURST       (READ_BURST_SIZE),
-	.FEATHER_WIDTH   (32)
+	.FEATHER_WIDTH   (32),
+	.FEATHER_ENABLE  (SLIDE_FEATHER_ENABLE),
+	.SLIDE_FIFO_UNIFORM_DIAGNOSTIC (SLIDE_FIFO_UNIFORM_DIAGNOSTIC),
+	.SLIDE_SDRAM_UNIFORM_DIAGNOSTIC (SLIDE_SDRAM_UNIFORM_DIAGNOSTIC),
+	.SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC (SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC),
+	.SLIDE_PHASE_COLOR_DIAGNOSTIC (SLIDE_PHASE_COLOR_DIAGNOSTIC),
+	.READ_CHUNK_PREROLL_WORDS (READ_CHUNK_PREROLL_WORDS),
+	.FIXED_READ_BURST_ENABLE (FIXED_READ_BURST_ENABLE)
 ) frame_slide_fifo_read_m0 (
 	.mem_clk          (mem_clk),
 	.rst              (rst),
@@ -222,7 +274,7 @@ frame_slide_fifo_read #(
 	.fifo_aclr        (read_fifo_aclr),
 	.wrusedw          (wrusedw),
 	.fifo_write_en    (read_fifo_write_en),
-	.fifo_write_data  (read_fifo_write_data),
+	.fifo_write_data  (slide_fifo_write_data),
 	.App_rd_en        (App_rd_en),
 	.App_rd_addr      (App_rd_addr),
 	.read_busy        (O_rd_busy),

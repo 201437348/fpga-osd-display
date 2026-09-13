@@ -30,7 +30,10 @@ module wfifo_32_32_512 #(
     assign dout       = 32'd0;
 endmodule
 
-module rfifo_32_32_512 (
+module rfifo_32_32_512 #(
+    parameter SHOW_AHEAD_EN = 1'b0,
+    parameter OUTREG_EN = "NOREG"
+) (
     input         clkr,
     input         clkw,
     input         rst,
@@ -41,6 +44,7 @@ module rfifo_32_32_512 (
     output        full_flag,
     output [8:0]  wrusedw,
     output [8:0]  rdusedw,
+    output        valid,
     output [31:0] dout
 );
     localparam DEPTH = 512;
@@ -66,6 +70,7 @@ module rfifo_32_32_512 (
     assign full_flag  = (count == DEPTH);
     assign wrusedw    = count[8:0];
     assign rdusedw    = count[8:0];
+    assign valid      = 1'b0;
     assign dout       = dout_r;
 
     always @(posedge clkw or posedge rst) begin
@@ -142,7 +147,14 @@ module frame_slide_fifo_read #(
     parameter FIFO_DEPTH      = 512,
     parameter FIFO_LEVEL_BITS = 9,
     parameter MAX_BURST       = 128,
-    parameter FEATHER_WIDTH   = 32
+    parameter FEATHER_WIDTH   = 32,
+    parameter FEATHER_ENABLE  = 1,
+    parameter SLIDE_FIFO_UNIFORM_DIAGNOSTIC = 0,
+    parameter SLIDE_SDRAM_UNIFORM_DIAGNOSTIC = 0,
+    parameter SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC = 0,
+    parameter SLIDE_PHASE_COLOR_DIAGNOSTIC = 0,
+    parameter READ_CHUNK_PREROLL_WORDS = 0,
+    parameter FIXED_READ_BURST_ENABLE = 0
 ) (
     input                             mem_clk,
     input                             rst,

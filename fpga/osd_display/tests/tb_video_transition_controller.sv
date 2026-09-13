@@ -105,7 +105,7 @@ initial begin
     expected_position[24] = 10'd605;
     expected_position[25] = 10'd620;
     expected_position[26] = 10'd631;
-    expected_position[27] = 10'd638;
+    expected_position[27] = 10'd640;
     expected_position[28] = 10'd640;
 
     repeat (2) @(posedge video_clk);
@@ -135,6 +135,12 @@ initial begin
         pulse_read_request;
         expect_position(slide_position, expected_position[step],
                         "exact smoothstep position");
+        if (step == 27) begin
+            expect_bit(slide_active, 1'b1, "full endpoint remains active");
+            expect_bit(transition_busy, 1'b1, "full endpoint keeps reservation");
+            expect_index(active_buffer_index, 2'd0,
+                         "full endpoint precedes ownership commit");
+        end
     end
     expect_position(slide_position, 10'd640, "slide endpoint");
     expect_index(active_buffer_index, 2'd1, "target becomes active");

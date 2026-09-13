@@ -126,11 +126,11 @@ function [31:0] mixed_word;
     end
 endfunction
 
-// Queue every accepted address and return words in order with deterministic
-// gaps. This prevents the DUT from relying on a fixed SDRAM latency.
-always @(negedge mem_clk) begin
-    Sdr_rd_en = 1'b0;
-    gap_count = gap_count + 1;
+// Capture commands on the DUT/controller interface edge. Returns use the
+// opposite edge with deterministic gaps so there is no stimulus race.
+always @(posedge mem_clk) begin
+    if (App_rd_en && Sdr_busy)
+        $fatal(1, "FAIL App_rd_en asserted while Sdr_busy");
 
     if (App_rd_en) begin
         trace_addr[trace_count] = App_rd_addr;
@@ -139,6 +139,11 @@ always @(negedge mem_clk) begin
         queue_tail = (queue_tail + 1) & 255;
         queue_count = queue_count + 1;
     end
+end
+
+always @(negedge mem_clk) begin
+    Sdr_rd_en = 1'b0;
+    gap_count = gap_count + 1;
 
     if ((queue_count > 0) && ((gap_count % 3) != 0)) begin
         Sdr_rd_en = 1'b1;
@@ -171,6 +176,36 @@ task automatic start_read;
         read_req = 1'b0;
         wait (read_finish === 1'b1);
         @(negedge mem_clk);
+    end
+endtask
+
+task automatic pulse_busy_at_issue_count;
+    input integer target_issue_count;
+    reg [9:0] held_addr;
+    reg [15:0] held_issue_count;
+    begin
+        wait ((dut.state == 4'd4) && (dut.issue_count == target_issue_count));
+        @(negedge mem_clk);
+        #1;
+        Sdr_busy = 1'b1;
+        held_addr = App_rd_addr;
+        held_issue_count = dut.issue_count;
+        repeat (3) begin
+            @(posedge mem_clk);
+            #1;
+            if (App_rd_en !== 1'b0)
+                $fatal(1, "FAIL App_rd_en high during busy at issue_count %0d",
+                       target_issue_count);
+            if (App_rd_addr !== held_addr)
+                $fatal(1, "FAIL App_rd_addr changed during busy at issue_count %0d",
+                       target_issue_count);
+            if (dut.issue_count !== held_issue_count)
+                $fatal(1, "FAIL issue_count changed during busy at issue_count %0d",
+                       target_issue_count);
+        end
+        @(negedge mem_clk);
+        #1;
+        Sdr_busy = 1'b0;
     end
 endtask
 
@@ -254,6 +289,28 @@ initial begin
     end
     if (read_fault !== 1'b0)
         $fatal(1, "FAIL normal frame requests latched read_fault");
+
+    // Refresh backpressure at the first, middle, and final command positions
+    // must not drop, duplicate, or skip any address in a chunk.
+    clear_observations;
+    slide_active = 1'b0;
+    fork
+        start_read;
+        begin
+            pulse_busy_at_issue_count(0);
+            pulse_busy_at_issue_count(2);
+            pulse_busy_at_issue_count(3);
+        end
+    join
+    expect_integer(trace_count, 16, "busy-stalled frame read count");
+    expect_integer(output_count, 16, "busy-stalled frame output count");
+    for (i = 0; i < 16; i = i + 1) begin
+        expect_integer(trace_addr[i], i + 64, "busy-stalled address sequence");
+        expect_word(output_word[i], memory_word(i + 64),
+                    "busy-stalled output sequence");
+    end
+    if (read_fault !== 1'b0)
+        $fatal(1, "FAIL busy-stalled frame latched read_fault");
 
     // A new frame request while returns are outstanding must latch a fault.
     slide_active = 1'b1;

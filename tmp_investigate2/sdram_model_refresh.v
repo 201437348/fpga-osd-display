@@ -8,9 +8,10 @@
 // declared-but-unused input port in both), any App_rd_en pulse that lands
 // during the stall window is modeled as SILENTLY DROPPED -- not queued,
 // never returns -- which is the more pessimistic of the two plausible real
-// controller behaviors and therefore the more informative one to test:
-// if a real controller instead queues/stalls the requester, this model's
-// findings are a conservative (worse-than-real) bound.
+// controller behaviors and therefore the more informative one to test. The
+// active frame_slide_fifo_read now gates commands with Sdr_busy; retaining
+// drop-on-busy semantics here makes any backpressure regression immediately
+// visible instead of allowing the model to hide it by queuing the command.
 //
 // REFRESH_INTERVAL_CYCLES = 0 disables refresh modeling entirely (falls back
 // to the same behavior as sdram_model.v).

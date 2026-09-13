@@ -7,7 +7,11 @@
 // here -- this is a functional testbench model, not a synthesizable macro --
 // but each domain's pointer only ever ticks on its own clock edge, which is
 // the property that matters for reproducing the real count trajectory.
-module rfifo_32_32_512 (
+module rfifo_32_32_512 #(
+    parameter DEPTH = 512,
+    parameter AW    = 9,
+    parameter OUTREG_EN = "OUTREG"
+) (
     input         clkr,
     input         clkw,
     input         rst,
@@ -16,13 +20,10 @@ module rfifo_32_32_512 (
     input  [31:0] di,
     output        empty_flag,
     output        full_flag,
-    output [8:0]  wrusedw,
-    output [8:0]  rdusedw,
+    output [AW-1:0] wrusedw,
+    output [AW-1:0] rdusedw,
     output [31:0] dout
 );
-    localparam DEPTH = 512;
-    localparam AW    = 9; // 2^9 = 512
-
     reg [31:0] mem [0:DEPTH-1];
     reg [AW:0] wptr; // AW+1 bits: extra bit disambiguates full vs empty on wrap
     reg [AW:0] rptr;
@@ -37,11 +38,10 @@ module rfifo_32_32_512 (
     wire [AW:0] diff       = wptr - rptr;
     assign empty_flag = (diff == {(AW+1){1'b0}});
     assign full_flag  = (diff == (DEPTH));
-    // NOTE: diff ranges 0..512 (10 bits), but wrusedw/rdusedw are only 9
-    // bits wide (matching the vendor macro's port width, which can only
-    // represent 0..511). A naive diff[AW-1:0] truncation aliases the FULL
-    // count (512) to 0, which looks like "empty" to any consumer of this
-    // bus -- that was a real bug caught via trace: it fooled the scheduler's
+    // NOTE: diff needs AW+1 bits, but wrusedw/rdusedw match the vendor-style
+    // AW-bit ports and can only represent 0..DEPTH-1. A naive truncation
+    // aliases the full count to 0, which looks like "empty" to a consumer of
+    // this bus -- that was a real bug caught via trace: it fooled the scheduler's
     // admission check (wrusedw < FIFO_START_LEVEL) into thinking there was
     // room when the FIFO was actually full, causing it to keep issuing SDRAM
     // reads whose writes then got silently dropped by the we&&!full_flag

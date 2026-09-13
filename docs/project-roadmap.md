@@ -1,7 +1,7 @@
 # OSD 多图层交互式商显系统：项目路线与上板记录
 
-更新日期：2026-09-10
-当前阶段：阶段 6，行缓存水平转场源码完成，TD/JTAG 待验证
+更新日期：2026-09-13
+当前阶段：阶段 6 已完成并通过上板验收；准备进入阶段 7 图片缩放
 目标平台：康芯 HX4S20C，安路 EG4S20BG256
 
 ## 1. 项目目标
@@ -698,3 +698,104 @@ read_fifo_empty`）做边沿检测，一次连续的空读区间只算一次事�
 真实节拍余量，下一步应该给 `frame_slide_fifo_read` 加上明确的速率限制（例如限制它相对
 视频真实行位置最多能提前多少行，而不是只限制 FIFO 瞬时占用），而不是继续把这当成
 转场分界线特有的问题。
+
+### 7.18 固定左侧色线定位为 AXIS 行末标志错位（2026-09-11）
+
+刷新停顿握手修复上板后，花屏和原有黄色线条已经消失，但转场运动期间屏幕最左侧仍有
+一列随图片内容变色的竖线，停止运动后消失。进一步确认该线固定在屏幕 `x=0`，不跟随
+新旧图片分界线移动，因此排除了 32 像素柔边和 SDRAM 跨缓冲区读跳变。
+
+新增 `tb_video_delay_line_boundary.sv`，使用生产异步 FIFO 和 `video_delay` 对两行首尾
+标记像素逐个核对；测试通过，证明 FIFO 读延迟没有把上一行末像素送到下一行首像素。
+随后新增 `tb_video_rgb_to_axis_line_boundary.sv`，对两条完整 640 像素 AXIS 行逐像素核对，
+稳定复现第 640 个像素到来时 `O_video_last=0`。根因是每行首像素分支把 `S_x_cnt` 保持
+为 0，导致其余整行计数落后一拍，最后一个像素只能观察到 638，永远达不到原判定值 639。
+
+修复仅把首像素分支的下一计数值改为 1；RGB、valid、SOF、视频时序、转场合成和 SDRAM
+路径均未改。修复后两条 640 像素测试行都只在 `x=639` 精确产生一次 TLAST，FIFO 边界、
+转场控制器、行调度器、逐帧 underflow 和真实顶层展开全部通过。七组 refresh-stall/FIFO
+扫描再次跑满 24 帧，均为 `underflow=0`、`dropped=0`、`scheduler_stuck=0`。
+
+TD 命令行已用最新源码重新综合，并通过 multi-seed 的 seed 2 完成布局布线和 bitstream：
+routing overflow 为 0，Hold WNS 为 `+0.021 ns`。下一步只烧录 seed 2 的 bitstream，确认
+转场期间固定在屏幕最左侧的内容相关色线是否消失。
+
+### 7.19 Pipeline the transition feather datapath (2026-09-11)
+
+Board testing showed that the TLAST correction did not materially reduce the
+fixed left-edge color line. The routed timing report then identified a
+transition-only hardware defect: the 125 MHz `ext_mem_clk` path from the
+overlap cache through the feather multiplier/add chain to `fifo_write_data`
+had -4.746 ns setup slack and ten logic levels.
+
+`frame_slide_fifo_read.v` now carries direct and blended pixels through one
+ordered output-valid pipeline. Feather processing is split into registered
+difference/direction, registered multiplication, and final add/sub stages.
+The scheduler reserves three FIFO entries for in-flight output and waits for
+the pipeline to drain before ending a frame. SDRAM command/return accounting
+and transition addresses are unchanged.
+
+The new `tb_frame_slide_full_line.sv` checks every pixel in two 640-pixel rows
+at slide positions 0, 2, 16, 320, 624, 638, and 640. It passes together with
+the scheduler, controller, underflow, FIFO/video-delay, and RGB-to-AXIS tests.
+The seven refresh/depth cases passed an eight-frame post-change matrix with
+zero underflow, dropped commands, or scheduler stalls. A full 24-frame rerun
+was attempted first but all parallel jobs reached the script's 900-second
+process limit before producing final result records.
+
+TD synthesis and seed-2 place/route/bitgen completed. The former feather
+datapath no longer appears among the worst `ext_mem_clk` paths; the registered
+`fifo_write_data` to read-FIFO RAM path has +0.134 ns slack. The remaining
+internal `ext_mem_clk` WNS is -1.253 ns in write-FIFO-level to read/write
+arbitration control, while the global -6.565 ns remains the SDRAM DQ external
+capture path. Board validation of the new bitstream is pending.
+
+### 7.20 SDRAM 读取稳定化与水平转场最终验收（2026-09-13）
+
+在 7.19 之后继续用纯色诊断、地址图案、阶段着色和真实图片逐层缩小故障范围，最终确认
+转场期间的两类内容相关彩线来自 SDRAM 分段读取时的陈旧返回和不完整突发处理，而不是
+OSD、HDMI 输出、图片文件或屏幕物理边缘。最终修复由以下两部分组成：
+
+- 每个可见读段开始前执行 4-word 预读并丢弃返回，隔离地址切换后的陈旧数据；
+- 可见 payload 始终发出完整的固定 128-word burst，并在切换到下一地址段前排空多余尾部返回。
+
+`video_delay.v` 同时改为使用读 FIFO 的 `valid`，并通过 4 项视频域对齐队列保证数据、有效
+标志与显示时序一致，避免行首沿用上一行末像素。读 FIFO 最终保持
+`SHOW_AHEAD_EN=0 + OUTREG`，继续映射到 BRAM；没有采用加深 FIFO、SDRAM 降频或 PLL
+相位调整作为最终修复。
+
+最终生产配置为：
+
+```verilog
+.WRITE_BUFFER_SOLID_DIAGNOSTIC(0),
+.SLIDE_FEATHER_ENABLE(0),
+.SLIDE_FIFO_UNIFORM_DIAGNOSTIC(0),
+.SLIDE_SDRAM_UNIFORM_DIAGNOSTIC(0),
+.SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC(0),
+.SLIDE_PHASE_COLOR_DIAGNOSTIC(0),
+.READ_CHUNK_PREROLL_WORDS(4),
+.FIXED_READ_BURST_ENABLE(1),
+```
+
+专项仿真覆盖陈旧返回、固定 burst、640x480 全帧、七个滑动位置逐像素、多帧显示、FIFO、
+视频延迟、AXIS、OSD、转场、underflow、marker、写入诊断以及真实/桩顶层展开，均通过。
+refresh-stall/FIFO 深度矩阵的有效完成记录均为 `underflow=0`、`dropped=0`、
+`scheduler_stuck=0`；最坏的 `stall=16, depth=512` 另完成 24 帧运行。固定 burst 全帧读取
+约耗时 `107.2 us`，低于一帧周期。
+
+最终 bitstream 已完成 TD 综合、布局布线、生成和 JTAG 上板验证。真实图片手动切换和自动
+轮播期间，屏幕最左侧彩线与随分界线移动的彩线均消失；画面没有花屏、黑屏、异常重影、
+上下乱动或按键失灵。音频、OSD、TF 卡拔插恢复及稳定显示回归均通过。因此阶段 6 正式
+验收完成，当前无羽化版本作为后续开发和比赛展示的稳定基线。
+
+羽化不再列入项目计划。启用羽化会为每行增加两个 32 像素读段；在固定 burst 机制下造成
+显著额外读取，上板出现多重残影、横纵乱动、转场无法完成和下一张按键失效。恢复
+`SLIDE_FEATHER_ENABLE=0` 后全部恢复正常。16-word 预读也已由实测否决，其相对 4-word
+方案几乎没有改善，不再继续增加。
+
+### 7.21 下一阶段入口：图片缩放
+
+下一阶段按总体计划进入阶段 7。首先建立独立、可逐像素核对的最近邻缩放模块和测试，
+再接入现有图片加载/显示路径；最近邻稳定后才评估双线性插值。阶段 7 必须以本节记录的
+无羽化稳定配置为回归基线，不再修改已经验收的 SDRAM 滑动调度、时钟、FIFO 深度或
+固定 burst 策略。任何新功能均先通过 Icarus 回归，再进入 TD 和 JTAG 上板验证。
