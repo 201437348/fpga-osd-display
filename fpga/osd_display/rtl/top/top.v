@@ -4,6 +4,8 @@ module top(
     input                       rst_n,
     input                       key1,           // 手动下一张
     input                       key2,           // 自动播放 开/关
+    input                       key3,           // 亮度/对比度：短按 +步长，长按 -步长
+    input  [3:0]                sw,             // SW1..SW4，低有效（PULLUP，合上=0）
 
 	output [5:0]                seg_sel,
 	output [7:0]                seg_data,
@@ -81,13 +83,17 @@ wire        sd_card_write_req;
 wire        sd_card_write_req_ack;
 wire        frame_write_fifo_afull;
 wire        frame_write_finish;
+// 上板诊断总线（来自 image_storage_adapter，只读）
+wire [3:0]  load_diag_state;
+wire [3:0]  load_diag_sector;
+wire [3:0]  load_diag_flags;
 reg         frame_write_toggle_mem;
 reg [2:0]   frame_write_toggle_sync;
 wire        frame_write_done_pulse;
 
 wire [1:0]  write_buf_idx;
 wire [1:0]  disp_buf_idx_sd;
-wire [1:0]  current_image_index_sd;
+wire [2:0]  current_image_index_sd;
 reg [1:0]   disp_buf_idx_video_meta;
 reg [1:0]   disp_buf_idx_video_sync;
 wire [1:0]  active_buffer_index;
@@ -109,27 +115,28 @@ reg         display_valid_video_meta;
 reg         display_valid_video_sync;
 reg         display_test_pattern_video_meta;
 reg         display_test_pattern_video_sync;
-wire [11:0] osd_status_sd;
-reg [11:0]  osd_status_video_meta;
-reg [11:0]  osd_status_video_sync;
+wire [14:0] osd_status_sd;
+reg [14:0]  osd_status_video_meta;
+reg [14:0]  osd_status_video_sync;
 wire        osd_storage_ready;
 wire [2:0]  osd_manager_state;
 wire        osd_load_in_progress;
-wire [1:0]  osd_target_image_index;
-wire [1:0]  osd_current_image_index;
-wire [2:0]  osd_image_count;
+wire [2:0]  osd_target_image_index;
+wire [2:0]  osd_current_image_index;
+wire [3:0]  osd_image_count;
 
 wire        storage_ready;
 wire        scan_done;
-wire [2:0]  scan_found_count;
+wire [3:0]  scan_found_count;
 wire        source_done_pulse;
 wire        source_error_pulse;
+wire        load_progress_pulse;
 wire        storage_fault_pulse;
 wire        scan_start;
 wire        load_start;
 wire        load_abort;
 wire        storage_reinit;
-wire [1:0]  target_image_index;
+wire [2:0]  target_image_index;
 wire [3:0]  storage_state_code;
 wire [2:0]  manager_state;
 wire [1:0]  retry_count;
@@ -137,7 +144,7 @@ wire [3:0]  error_code;
 wire        pending_next;
 wire        source_done_seen;
 wire        write_done_seen;
-wire [2:0]  image_count;
+wire [3:0]  image_count;
 wire        load_in_progress;
 wire        manager_idle;
 wire        next_request;
@@ -157,6 +164,14 @@ wire [9:0]  audio_fifo_rdusedw;
 wire        hdmi_audio_valid;
 wire [23:0] hdmi_audio_left_data;
 wire [23:0] hdmi_audio_right_data;
+wire [7:0]  audio_visual_level;
+wire [15:0] spectrum_mag;
+wire [9:0] spectrum_index;
+wire spectrum_mag_valid, spectrum_overrun, bands_valid;
+wire [15:0] band_mag;
+wire [5:0] band_index;
+wire band_valid;
+wire [383:0] audio_bands;
 wire        hdmi_acr_valid;
 wire [19:0] hdmi_acr_cts;
 wire [19:0] hdmi_acr_n;
@@ -261,7 +276,7 @@ assign frame_write_done_pulse = frame_write_toggle_sync[2] ^ frame_write_toggle_
 image_storage_adapter #(
     .SCAN_START_SECTOR (32'd0),
     .SCAN_MAX_SECTOR   (32'd131071),
-    .SCAN_TARGET_COUNT (3'd4)
+    .SCAN_TARGET_COUNT (4'd8)
 ) image_storage_adapter_m0(
     .clk               (sd_card_clk),
     .rst               (rst_all),
@@ -273,10 +288,14 @@ image_storage_adapter #(
     .storage_ready     (storage_ready),
     .scan_done         (scan_done),
     .scan_found_count  (scan_found_count),
+    .load_progress_pulse(load_progress_pulse),
     .source_done_pulse (source_done_pulse),
     .source_error_pulse(source_error_pulse),
     .storage_fault_pulse(storage_fault_pulse),
     .state_code        (storage_state_code),
+    .load_diag_state   (load_diag_state),
+    .load_diag_sector  (load_diag_sector),
+    .load_diag_flags   (load_diag_flags),
     .write_req         (sd_card_write_req),
     .write_req_ack     (sd_card_write_req_ack),
     .write_fifo_afull  (frame_write_fifo_afull),
@@ -336,6 +355,34 @@ audio_pcm_player u_audio_pcm_player (
     .audio_right_data (hdmi_audio_right_data)
 );
 
+audio_visualizer u_audio_visualizer (
+    .clk          (video_clk),
+    .rst          (rst_all),
+    .sample_valid (hdmi_audio_valid),
+    .left_sample  (hdmi_audio_left_data),
+    .right_sample (hdmi_audio_right_data),
+    .level        (audio_visual_level)
+);
+
+audio_spectrum_fft u_audio_spectrum_fft (
+    .clk(video_clk), .rst(rst_all), .sample_valid(hdmi_audio_valid),
+    .sample_left(hdmi_audio_left_data), .sample_right(hdmi_audio_right_data),
+    .mag(spectrum_mag), .mag_index(spectrum_index),
+    .mag_valid(spectrum_mag_valid), .overrun(spectrum_overrun)
+);
+audio_spectrum_bands u_audio_spectrum_bands (
+    .clk(video_clk), .rst(rst_all), .mag_valid(spectrum_mag_valid),
+    .mag(spectrum_mag), .mag_index(spectrum_index),
+    .bands_raw(), .bands_valid(bands_valid),
+    .band_mag(band_mag), .band_index(band_index), .band_valid(band_valid)
+);
+audio_band_processor u_audio_band_processor (
+    .clk(video_clk), .rst(rst_all), .vs(vs), .sample_valid(hdmi_audio_valid),
+    .sample_left(hdmi_audio_left_data), .sample_right(hdmi_audio_right_data),
+    .bands_valid(bands_valid), .band_mag(band_mag),
+    .band_index(band_index), .band_valid(band_valid), .bands_display(audio_bands)
+);
+
 hdmi_audio_acr u_hdmi_audio_acr (
     .clk          (video_clk),
     .rst          (rst_all),
@@ -357,6 +404,7 @@ image_load_manager #(
     .scan_found_count     (scan_found_count),
     .source_done_pulse    (source_done_pulse),
     .source_error_pulse   (source_error_pulse),
+    .load_progress_pulse  (load_progress_pulse),
     .storage_fault_pulse  (storage_fault_pulse),
     .write_done_pulse     (frame_write_done_pulse),
     .next_request         (next_request),
@@ -398,6 +446,40 @@ image_playback_control #(
     .auto_play_enabled     (auto_play_enabled)
 );
 
+// ---------------------------------------------------------------------------
+// 亮度/对比度参数菜单（第13课）—— 控制域 sd_card_clk (100 MHz)
+//
+// 拨码开关极性，依据《HX4S20开发板手册-HDL版2410.pdf》2.19 节原文：
+//   "SW1-SW4 作为与FPGA的IO输入信号，拨上为'1'，拨下为'0'"
+//   同节引脚表：SW1=C8  SW2=C7  SW3=C6  SW4=C5
+// 即引脚电平本身就是逻辑值，不做取反：sw_act[i] = 1 表示第 i 个开关拨上。
+// （早期版本按 PULLUP 推断成"合上=0"并取了反，方向与手册相反，已修正。）
+// ---------------------------------------------------------------------------
+wire [3:0] sw_act = sw;
+
+wire [7:0] cfg_brightness;
+wire [7:0] cfg_contrast;
+wire [1:0] cfg_menu_channel;
+wire       cfg_menu_active;
+wire       cfg_toggle_sd;
+
+param_menu_controller #(
+    .CLK_FREQ_HZ   (100_000_000),
+    .DEBOUNCE_MS   (20),
+    .LONG_PRESS_MS (1000),
+    .MENU_HOLD_MS  (5000)
+) param_menu_controller_m0(
+    .clk           (sd_card_clk),
+    .rst           (rst_all),
+    .key           (key3),
+    .sw            (sw_act),
+    .brightness    (cfg_brightness),
+    .contrast      (cfg_contrast),
+    .menu_channel  (cfg_menu_channel),
+    .menu_active   (cfg_menu_active),
+    .cfg_toggle    (cfg_toggle_sd)
+);
+
 // Hold new playback requests while the video-domain fade owns the display
 // handoff.  The image manager remains unchanged, preserving TF recovery and
 // load-state behavior.
@@ -437,12 +519,32 @@ always @(posedge sd_card_clk or posedge rst_all) begin
     end
 end
 
+// Sdr_init_done 来自 ext_mem_clk(125MHz) 域，数码管诊断要跨域读，先同步两拍，
+// 免得给布局布线新增一条跨时钟的组合路径。
+reg [1:0] sdr_init_done_sd_sync;
+
+always @(posedge sd_card_clk or posedge rst_all) begin
+    if (rst_all)
+        sdr_init_done_sd_sync <= 2'b00;
+    else
+        sdr_init_done_sd_sync <= {sdr_init_done_sd_sync[0], Sdr_init_done};
+end
+
 assign state_code = {1'b0, manager_state};
 assign seg_digit_s = state_code;
-assign seg_digit_c = {1'b0, image_count};
-assign seg_digit_l = {3'b000, load_in_progress};
+// ---- 上板诊断：加载/校验期间（load_in_progress）借用 C/L/W 三位 ----
+//   C = fat32_bmp_loader 状态码（5 = 卡在 ST_WRITE_WAIT，等 write_req_ack；
+//       8 = STREAM_WAIT 正常在收数据；9 = STREAM_PAUSE 被反压挂住）
+//   L = 已读完扇区数的低 4 位（在跳 = 有进度，冻结 = 卡死）
+//   W = {write_req_ack, Sdr_init_done, 缩放器 out_stall, 缩放器输入 FIFO afull}
+// 正常显示（非加载期）时这三位含义不变，仍然可读 image_count / 加载中 / 写完成。
+assign seg_digit_c = load_in_progress ? load_diag_state : image_count;
+assign seg_digit_l = load_in_progress ? load_diag_sector : {3'b000, load_in_progress};
 assign seg_digit_r = {3'b000, source_done_seen};
-assign seg_digit_w = {3'b000, write_done_seen};
+assign seg_digit_w = load_in_progress ?
+                     {load_diag_flags[3], sdr_init_done_sd_sync[1],
+                      load_diag_flags[1], load_diag_flags[0]} :
+                     {3'b000, write_done_seen};
 assign seg_digit_x = (read_underflow_count_sd_sync != 4'd0) ?
                      read_underflow_count_sd_sync : error_code;
 
@@ -540,8 +642,8 @@ always @(posedge video_clk or posedge rst_all) begin
         display_valid_video_sync        <= 1'b0;
         display_test_pattern_video_meta <= 1'b0;
         display_test_pattern_video_sync <= 1'b0;
-        osd_status_video_meta           <= 12'd0;
-        osd_status_video_sync           <= 12'd0;
+        osd_status_video_meta           <= 15'd0;
+        osd_status_video_sync           <= 15'd0;
         frame_read_fault_video_sync     <= 2'b00;
     end else begin
         disp_buf_idx_video_meta         <= disp_buf_idx_sd;
@@ -576,12 +678,77 @@ video_fallback_pattern video_fallback_pattern_m0(
 assign vout_data = display_valid ? vout_data_raw :
                    display_test_pattern ? fallback_rgb : 24'd0;
 
+// ---------------------------------------------------------------------------
+// 亮度/对比度调节（第13课）
+// 插在显示复用器与 OSD 之间：只调图片本身，OSD 标题/状态栏保持全亮。
+// 纯组合、0 拍，de/vs 不需要重新对齐。
+//
+// 参数从控制域 sd_card_clk (100 MHz) 跨到 video_clk (25 MHz)：
+//   1) 19 位配置包 {menu_channel, menu_active, contrast, brightness} 与
+//      cfg_toggle 各过 2FF 同步器；
+//   2) 模块内部在 cfg_toggle 边沿把整包挂起，在 vs 上升沿整体提交。
+// 视频域比控制域慢 4 倍：等 cfg_toggle 的边沿被检出时，配置包早已稳定，
+// 不会采到中间态；整包一起提交也避免各字段撕裂。
+// ---------------------------------------------------------------------------
+wire [23:0] vout_data_bc;
+
+// 亮度/对比度模块在 vs 上升沿整包提交后的"已生效值"，送给 OSD 画进度条。
+// 它们只在帧边界变化，所以 OSD 读到的一定是整帧一致的稳定值，不会撕裂。
+wire [7:0]  bc_brightness_committed;
+wire [7:0]  bc_contrast_committed;
+wire [1:0]  bc_channel_committed;
+wire        bc_active_committed;
+
+wire [18:0] cfg_sd_bundle = {cfg_menu_channel, cfg_menu_active,
+                             cfg_contrast, cfg_brightness};
+
+reg [18:0] cfg_sync0;
+reg [18:0] cfg_sync1;
+reg        cfg_tgl_sync0;
+reg        cfg_tgl_sync1;
+
+always @(posedge video_clk or posedge rst_all) begin
+    if (rst_all) begin
+        cfg_sync0     <= 19'd0;
+        cfg_sync1     <= 19'd0;
+        cfg_tgl_sync0 <= 1'b0;
+        cfg_tgl_sync1 <= 1'b0;
+    end else begin
+        cfg_sync0     <= cfg_sd_bundle;
+        cfg_sync1     <= cfg_sync0;
+        cfg_tgl_sync0 <= cfg_toggle_sd;
+        cfg_tgl_sync1 <= cfg_tgl_sync0;
+    end
+end
+
+wire [7:0] cfg_brightness_v = cfg_sync1[7:0];
+wire [7:0] cfg_contrast_v   = cfg_sync1[15:8];
+wire       cfg_active_v     = cfg_sync1[16];
+wire [1:0] cfg_channel_v    = cfg_sync1[18:17];
+
+brightness_contrast_adjust brightness_contrast_adjust_m0(
+    .video_clk        (video_clk),
+    .rst              (rst_all),
+    .vs               (vs),
+    .brightness_in    (cfg_brightness_v),
+    .contrast_in      (cfg_contrast_v),
+    .menu_channel_in  (cfg_channel_v),
+    .menu_active_in   (cfg_active_v),
+    .cfg_toggle       (cfg_tgl_sync1),
+    .rgb_in           (vout_data),
+    .rgb_out          (vout_data_bc),
+    .brightness_q     (bc_brightness_committed),
+    .contrast_q       (bc_contrast_committed),
+    .menu_channel_q   (bc_channel_committed),
+    .menu_active_q    (bc_active_committed)
+);
+
 video_osd_overlay video_osd_overlay_m0(
     .video_clk            (video_clk),
     .rst                  (rst_all),
     .vs                   (vs),
     .de                   (de),
-    .rgb_in               (vout_data),
+    .rgb_in               (vout_data_bc),
     .display_valid        (display_valid),
     .display_test_pattern (display_test_pattern),
     .storage_ready        (osd_storage_ready),
@@ -590,6 +757,12 @@ video_osd_overlay video_osd_overlay_m0(
     .target_image_index   (osd_target_image_index),
     .current_image_index  (osd_current_image_index),
     .image_count          (osd_image_count),
+    .audio_level(audio_visual_level),
+    .audio_bands(audio_bands),
+    .menu_active          (bc_active_committed),
+    .brightness_value     (bc_brightness_committed),
+    .contrast_value       (bc_contrast_committed),
+    .menu_channel         (bc_channel_committed),
     .rgb_out              (vout_data_osd)
 );
 

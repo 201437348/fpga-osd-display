@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 module fat32_directory_scan #(
-    parameter [2:0]  MAX_FILES = 3'd4,
+    parameter [3:0]  MAX_FILES = 4'd8,
     parameter [15:0] MAX_ROOT_DIR_CLUSTERS = 16'd64
 )(
     input  wire        clk,
@@ -19,7 +19,7 @@ module fat32_directory_scan #(
     input  wire        sd_sec_read_end,
 
     output reg         file_found,
-    output reg [2:0]   file_count,
+    output reg [3:0]   file_count,
     output reg [87:0]  file_name,
     output reg [31:0]  file_first_cluster,
     output reg [31:0]  file_size,
@@ -144,7 +144,7 @@ always @(posedge clk or posedge rst) begin
         sd_sec_read            <= 1'b0;
         sd_sec_read_addr       <= 32'd0;
         file_found             <= 1'b0;
-        file_count             <= 3'd0;
+        file_count             <= 4'd0;
         file_name              <= 88'd0;
         file_first_cluster     <= 32'd0;
         file_size              <= 32'd0;
@@ -209,7 +209,7 @@ always @(posedge clk or posedge rst) begin
                     busy                    <= 1'b1;
                     sd_sec_read_addr        <= 32'd0;
                     sector_byte_index       <= 9'd0;
-                    file_count              <= 3'd0;
+                    file_count              <= 4'd0;
                     file_name               <= 88'd0;
                     file_first_cluster      <= 32'd0;
                     file_size               <= 32'd0;
@@ -443,8 +443,8 @@ always @(posedge clk or posedge rst) begin
                                 file_name          <= dir_entry_name;
                                 file_first_cluster <= dir_entry_first_cluster;
                                 file_size          <= {sd_sec_read_data, dir_entry_size[23:0]};
-                                file_count         <= file_count + 3'd1;
-                                if ((file_count + 3'd1) >= MAX_FILES)
+                                file_count         <= file_count + 4'd1;
+                                if ((file_count + 4'd1) >= MAX_FILES)
                                     dir_limit_seen <= 1'b1;
                             end
                             if (!bgm_found &&

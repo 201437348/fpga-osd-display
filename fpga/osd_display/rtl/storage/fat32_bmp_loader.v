@@ -3,7 +3,27 @@
 // Loads one FAT32 BMP through logical file sectors. The header pass is kept
 // separate from the data pass so SDRAM buffer ownership is known before pixels
 // from logical sector zero are emitted.
-module fat32_bmp_loader(
+//
+// 支持任意分辨率（供写侧双线性缩放器使用）三处改动：
+//   1) 不再要求图片尺寸等于某个固定值。改为「范围 + 最小像素数」校验，
+//      并把解析出的原始宽高从 src_width/src_height 输出给缩放器。
+//   2) 支持 BMP 行填充（row padding）。每行字节数按 4 字节对齐，
+//      行尾 0..3 个填充字节被跳过，不参与像素打包。
+//      旧版因为 640*3=1920 恰好 4 字节对齐，完全没有这段逻辑。
+//   3) 结束条件由「字节数是 3 的倍数」改为「已输出恰好 W*H 个像素」。
+module fat32_bmp_loader #(
+    // 允许的源分辨率范围。必须与 image_bilinear_scaler 的 MAX_SRC_* 一致。
+    parameter [15:0] MAX_SRC_WIDTH  = 16'd1920,
+    parameter [15:0] MAX_SRC_HEIGHT = 16'd1080,
+    // 最小源像素数。源码流速率由 SPI(25MHz) 决定 —— 每个源像素 3 字节，
+    // 即约 96 拍(@100MHz)才送来 1 个像素；而写侧缩放器每输出 1 个像素要 7 拍，
+    // 一帧要 640*480 个输出像素。因此必须满足
+    //       640*480*7 <= W*H*96   ->   W*H >= 22400
+    // 取 32000（例如 200x160、320x100）留约 1.4 倍余量。
+    // 比这更小的源图不会损坏数据（输入 FIFO 会反压），但会拖慢加载甚至触发
+    // 扇区读取看门狗，所以在头校验阶段直接拒绝更干净。
+    parameter [31:0] MIN_SRC_PIXELS = 32'd32000
+)(
     input  wire        clk,
     input  wire        rst,
     input  wire        start,
@@ -13,12 +33,23 @@ module fat32_bmp_loader(
     input  wire [31:0] first_fat_lba,
     input  wire [31:0] first_data_lba,
     input  wire [7:0]  sectors_per_cluster,
-    input  wire [15:0] bmp_width,
-    input  wire [15:0] bmp_height,
+
+    // 解析出的源图原始尺寸，供 image_bilinear_scaler 配置使用。
+    // 直接由 header_width/header_height 这两个寄存器驱动，无毛刺。
+    output wire [15:0] src_width,
+    output wire [15:0] src_height,
+    // 头校验通过（header_match 为真）后拉高，直到下一次 start 才清零。
+    // 缩放器必须以它作为「可以开始配置」的依据 —— 只看 src_width != 0 会把
+    // 校验失败时的垃圾头也当成有效配置。
+    output reg         header_valid,
 
     output reg         busy,
     output reg         done,
     output reg         error,
+    // 诊断用：当前状态码。只读，不改任何控制流。
+    // 0=IDLE 1..4=头解析 5=ST_WRITE_WAIT(等 write_req_ack) 6=STREAM_START
+    // 7=STREAM_REQUEST 8=STREAM_WAIT 9=STREAM_PAUSE 10=LOCAL_ERROR 11=ABORT_WAIT
+    output wire [3:0]  dbg_state,
     output reg         write_req,
     input  wire        write_req_ack,
     input  wire        write_fifo_afull,
@@ -81,25 +112,70 @@ reg [31:0] next_stream_sector_index;
 reg [1:0]  pixel_byte_index;
 reg         abort_pending;
 
+// ---- 行填充与像素计数（新增）----
+reg [15:0] src_row_bytes;   // W*3：一行里真正的像素字节数
+reg [15:0] src_stride;      // ((W*3)+3) & ~3：一行占用的总字节数（含行尾填充）
+reg [15:0] row_byte_pos;    // 当前行内字节偏移，0..src_stride-1
+reg [15:0] col_pixel;       // 当前行内已产出的像素数，0..W-1
+reg [15:0] row_index;       // 已产出的源行数，0..H-1
+
 wire header_match;
 wire stream_pixel_valid;
+wire row_pixel_byte;
+wire pixels_complete;
 wire [31:0] reader_session_file_size;
+
+assign src_width  = header_width[15:0];
+assign src_height = header_height[15:0];
 
 assign sd_sec_read      = reader_sd_sec_read;
 assign sd_sec_read_addr = reader_sd_sec_read_addr;
 
+// 尺寸校验：拒绝 0、超上限，以及高 16 位非零
+// （负高度 = top-down BMP 会让 header_height[31] 为 1，在这里被一并拒绝）
+wire src_w_ok = (header_width[31:16]  == 16'd0) &&
+                (header_width[15:0]   >= 16'd1) &&
+                (header_width[15:0]   <= MAX_SRC_WIDTH);
+wire src_h_ok = (header_height[31:16] == 16'd0) &&
+                (header_height[15:0]  >= 16'd1) &&
+                (header_height[15:0]  <= MAX_SRC_HEIGHT);
+// 像素总数下限：保证写侧缩放器有足够时钟消费源码流（见文件头注释）
+// 注意显式补零到 32 位再做乘法 —— 16bit*16bit 在 Verilog 里会按 16 位截断，
+// 而 1920*1080 = 2073600 需要 21 位。
+wire [31:0] src_pixels = {16'd0, header_width[15:0]} * {16'd0, header_height[15:0]};
+wire src_pixels_ok = (src_pixels >= MIN_SRC_PIXELS);
+
+// BMP 24bpp 行距：每行字节数向上取整到 4 的倍数
+//   src_row_bytes = W*3          （真正的像素字节数，W<=1920 -> <=5760，16 bit 足够）
+//   src_stride    = (W*3+3)&~3   （含行尾 0..3 个填充字节）
+// 640x480 时 stride==row_bytes==1920，所以旧版没有填充也不会出错。
+wire [15:0] hdr_row_bytes = header_width[15:0] + (header_width[15:0] << 1);
+wire [15:0] hdr_stride    = (hdr_row_bytes + 16'd3) & 16'hFFFC;
+
 assign header_match = (header_0 == 8'h42) &&
                       (header_1 == 8'h4D) &&
-                      (header_width[15:0] == bmp_width) &&
-                      (header_height[15:0] == bmp_height) &&
+                      src_w_ok &&
+                      src_h_ok &&
+                      src_pixels_ok &&
                       (bit_count == 16'd24) &&
                       (compression == 32'd0) &&
                       (header_file_len != 32'd0) &&
                       (pixel_offset < header_file_len) &&
                       (header_file_len <= file_size_latched);
 
+// 字节处于像素数据区（从 pixel_offset 到文件尾）
 assign stream_pixel_valid = (stream_byte_count >= pixel_offset) &&
                             (stream_byte_count < header_file_len);
+
+// 该字节属于本行的真实像素部分（不是行尾填充），且还有行要产出
+assign row_pixel_byte = stream_pixel_valid &&
+                        (row_byte_pos < src_row_bytes) &&
+                        (row_index < src_height) &&
+                        !pixels_complete;
+
+// 所有源像素都已产出
+assign pixels_complete = (row_index >= src_height);
+assign dbg_state       = state;
 
 // The header probe must finish after logical sector zero and must not trigger
 // a FAT lookup for the file's next cluster before the reader is aborted.
@@ -107,7 +183,12 @@ assign reader_session_file_size = (state == ST_HEADER_START) ?
                                 ((file_size_latched > 32'd512) ? 32'd512 : file_size_latched) :
                                 file_size_latched;
 
-fat32_file_sector_reader u_file_sector_reader (
+// MAX_FILE_CLUSTERS 默认 4096 对 1920x1080(6.2MB) 这类大文件不够：
+// 卡上簇 <= 1KB 时 4096 簇读不完整个文件，会中途报错（表现为该图永远加载不出来）。
+// 上限只是 FAT 链的安全网，真正的终点由 file_size 决定，放宽到 0xFFFF 无副作用。
+fat32_file_sector_reader #(
+    .MAX_FILE_CLUSTERS (16'hFFFF)
+) u_file_sector_reader (
     .clk                    (clk),
     .rst                    (rst),
     .start                  (reader_start),
@@ -165,6 +246,12 @@ always @(posedge clk or posedge rst) begin
         next_stream_sector_index      <= 32'd0;
         pixel_byte_index              <= 2'd0;
         abort_pending                 <= 1'b0;
+        src_row_bytes                 <= 16'd0;
+        src_stride                    <= 16'd0;
+        row_byte_pos                  <= 16'd0;
+        col_pixel                     <= 16'd0;
+        row_index                     <= 16'd0;
+        header_valid                  <= 1'b0;
     end else begin
         done                 <= 1'b0;
         error                <= 1'b0;
@@ -217,6 +304,10 @@ always @(posedge clk or posedge rst) begin
                         stream_byte_count          <= 32'd0;
                         next_stream_sector_index   <= 32'd0;
                         pixel_byte_index           <= 2'd0;
+                        row_byte_pos               <= 16'd0;
+                        col_pixel                  <= 16'd0;
+                        row_index                  <= 16'd0;
+                        header_valid               <= 1'b0;
                         reader_start               <= 1'b1;
                         state                      <= ST_HEADER_START;
                     end
@@ -270,10 +361,12 @@ always @(posedge clk or posedge rst) begin
 
                     if (reader_file_sec_read_end) begin
                         reader_abort <= 1'b1;
-                        if (header_match)
+                        if (header_match) begin
+                            header_valid <= 1'b1;
                             state <= ST_HEADER_ABORT;
-                        else
+                        end else begin
                             state <= ST_LOCAL_ERROR_ABORT;
+                        end
                     end
                 end
 
@@ -291,6 +384,12 @@ always @(posedge clk or posedge rst) begin
                         stream_byte_count <= 32'd0;
                         next_stream_sector_index <= 32'd0;
                         pixel_byte_index <= 2'd0;
+                        // 头已解析完毕，此处锁存行距并复位行/列计数器
+                        src_row_bytes <= hdr_row_bytes;
+                        src_stride    <= hdr_stride;
+                        row_byte_pos  <= 16'd0;
+                        col_pixel     <= 16'd0;
+                        row_index     <= 16'd0;
                         state          <= ST_STREAM_START;
                     end
                 end
@@ -311,7 +410,11 @@ always @(posedge clk or posedge rst) begin
 
                 ST_STREAM_WAIT: begin
                     if (reader_file_sec_data_valid) begin
-                        if (stream_pixel_valid) begin
+                        // 只把「本行的真实像素字节」打包成 24bit 像素；
+                        // 行尾填充字节被跳过，不参与打包也不推进 pixel_byte_index。
+                        // 因为 src_row_bytes = W*3 是 3 的倍数，pixel_byte_index
+                        // 在每行开头必然回到 0，行间不会错位。
+                        if (row_pixel_byte) begin
                             case (pixel_byte_index)
                                 2'd0: bmp_data[7:0]  <= reader_file_sec_data;
                                 2'd1: bmp_data[15:8] <= reader_file_sec_data;
@@ -323,14 +426,34 @@ always @(posedge clk or posedge rst) begin
                             endcase
                             pixel_byte_index <= (pixel_byte_index == 2'd2) ?
                                                 2'd0 : (pixel_byte_index + 2'd1);
+                            // 每凑满一个像素推进列计数；列满则进入下一行
+                            if (pixel_byte_index == 2'd2) begin
+                                if (col_pixel == (src_width - 16'd1)) begin
+                                    col_pixel <= 16'd0;
+                                    row_index <= row_index + 16'd1;
+                                end else begin
+                                    col_pixel <= col_pixel + 16'd1;
+                                end
+                            end
                         end
+
+                        // 行内字节位置推进：走满 stride 后回绕，从而跳过行尾填充
+                        if (stream_pixel_valid) begin
+                            if (row_byte_pos == (src_stride - 16'd1))
+                                row_byte_pos <= 16'd0;
+                            else
+                                row_byte_pos <= row_byte_pos + 16'd1;
+                        end
+
                         stream_byte_count <= stream_byte_count + 32'd1;
                     end
 
                     if (reader_file_sec_read_end) begin
                         if (reader_file_complete) begin
                             busy <= 1'b0;
-                            if (pixel_byte_index == 2'd0) begin
+                            // 结束条件改为「恰好产出了 W*H 个像素」。
+                            // 文件截断/尾部多余数据/行距不匹配都会在这里被抓到。
+                            if (pixels_complete) begin
                                 done  <= 1'b1;
                                 state <= ST_IDLE;
                             end else begin

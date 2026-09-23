@@ -1,9 +1,14 @@
 module image_storage_adapter #(
     parameter [31:0] SCAN_START_SECTOR = 32'd0,
     parameter [31:0] SCAN_MAX_SECTOR   = 32'd131071,
-    parameter [2:0]  SCAN_TARGET_COUNT = 3'd4,
+    parameter [3:0]  SCAN_TARGET_COUNT = 4'd8,
     parameter integer SD_CLK_FREQ_HZ = 100_000_000,
-    parameter integer SD_RESPONSE_TIMEOUT_MS = 250
+    parameter integer SD_RESPONSE_TIMEOUT_MS = 250,
+    // 最小源像素数，透传给 fat32_bmp_loader。见该模块的注释：源码流速率受
+    // SPI 限制（每像素约 96 拍），写侧缩放器每输出像素要 7 拍，所以
+    // 源图必须有 W*H*96 >= 640*480*7，即 W*H >= 22400。这里默认 32000
+    // （约 1.4 倍余量）。做成参数是为了让集成测试能用小图。
+    parameter [31:0] MIN_SRC_PIXELS = 32'd32000
 )(
     input  wire        clk,
     input  wire        rst,
@@ -11,15 +16,34 @@ module image_storage_adapter #(
     input  wire        load_start,
     input  wire        load_abort,
     input  wire        storage_reinit,
-    input  wire [1:0]  target_image_index,
+    input  wire [2:0]  target_image_index,
 
     output wire        storage_ready,
     output reg         scan_done,
-    output reg [2:0]   scan_found_count,
+    output reg [3:0]   scan_found_count,
     output reg         source_done_pulse,
     output reg         source_error_pulse,
     output reg         storage_fault_pulse,
     output reg [3:0]   state_code,
+    // 缩放器输入 FIFO 因反压来不及而丢弃的源像素数（饱和计数，正常恒 0）。
+    // 直接来自 u_image_bilinear_scaler.src_overflow_count，上板把它接到
+    // 数码管/LED 就能一眼判断"是不是被反压丢了像素"。
+    output wire [7:0]  scaler_overflow_count,
+
+    // ---- 上板诊断（全部只读，不参与任何控制流）----
+    // load_diag_state  : fat32_bmp_loader 状态码
+    //                    0=IDLE 1..4=头解析 5=ST_WRITE_WAIT(在等 write_req_ack)
+    //                    6=STREAM_START 7=STREAM_REQUEST 8=STREAM_WAIT
+    //                    9=STREAM_PAUSE 10=LOCAL_ERROR 11=ABORT_WAIT
+    // load_diag_sector : 图像通道已读完的扇区数低 4 位（看它在不在跳）
+    // load_diag_flags  : {write_req_ack, 保留, 缩放器 out_stall(= write_buf afull),
+    //                     缩放器输入 FIFO afull}
+    output wire [3:0]  load_diag_state,
+    output wire [3:0]  load_diag_sector,
+    output wire [3:0]  load_diag_flags,
+    // 每读完一个图像扇区给一个脉冲：给 manager 当"进度喂狗"，
+    // 这样 1920x1080 这种 12151 扇区的大图不会因为总时间超 10s 被掐掉
+    output wire        load_progress_pulse,
 
     output wire        write_req,
     input  wire        write_req_ack,
@@ -58,14 +82,14 @@ reg       scan_error_seen;
 reg       storage_fault_latched;
 reg [24:0] sd_response_watchdog;
 
-reg [31:0] image_cluster0;
-reg [31:0] image_cluster1;
-reg [31:0] image_cluster2;
-reg [31:0] image_cluster3;
-reg [31:0] image_size0;
-reg [31:0] image_size1;
-reg [31:0] image_size2;
-reg [31:0] image_size3;
+// 图片槽位：最多这类 BMP 张数（目录扫描用同一个上限）。
+// 原来是 4 个写死的 image_cluster0..3 / image_size0..3，
+// 卡里第 5 张（后加的 1920x1080）连扫描都进不来 —— 现在改成 8 槽数组。
+localparam integer IMG_SLOT_COUNT = 8;
+
+reg [31:0] image_cluster [0:IMG_SLOT_COUNT-1];
+reg [31:0] image_size    [0:IMG_SLOT_COUNT-1];
+integer    img_i;
 reg [31:0] volume_first_fat_lba;
 reg [31:0] volume_first_data_lba;
 reg [7:0]  volume_sectors_per_cluster;
@@ -78,7 +102,7 @@ wire        directory_error;
 wire        directory_sd_sec_read;
 wire [31:0] directory_sd_sec_read_addr;
 wire        directory_file_found;
-wire [2:0]  directory_file_count;
+wire [3:0]  directory_file_count;
 wire [87:0] directory_file_name;
 wire [31:0] directory_file_first_cluster;
 wire [31:0] directory_file_size;
@@ -118,6 +142,19 @@ wire        scan_grant;
 wire        audio_grant;
 wire        image_grant;
 
+// ---- 写侧双线性缩放器接口（1920x1080 以内的任意 24bit BI_RGB BMP -> 640x480）----
+// 数据通路变成： fat32_bmp_loader -> image_bilinear_scaler -> write_buf -> SDRAM
+// loader 的 write_fifo_afull 改接缩放器的输入缓冲，缩放器的输出反压来自
+// write_buf 的 afull。write_en/write_data 的下游语义完全不变。
+wire [23:0] scaler_dst_data;
+wire        scaler_dst_valid;
+wire        scaler_dst_done;
+wire [1:0]  scaler_error_code;
+wire        scaler_src_afull;
+wire [15:0] loader_src_width;
+wire [15:0] loader_src_height;
+wire        loader_header_valid;
+
 localparam [24:0] SD_RESPONSE_TIMEOUT_CYCLES =
     (SD_CLK_FREQ_HZ / 1000) * SD_RESPONSE_TIMEOUT_MS;
 
@@ -130,8 +167,8 @@ reg [31:0] selected_file_size;
 assign storage_ready = sd_init_done;
 assign core_rst      = rst | storage_reinit;
 assign write_req     = loader_write_req;
-assign write_en      = loader_bmp_data_wr_en;
-assign write_data    = {loader_bmp_data, 8'b0};
+assign write_en      = scaler_dst_valid;
+assign write_data    = {scaler_dst_data, 8'b0};
 assign audio_fifo_wr_en = audio_frame_wr_en;
 assign audio_fifo_wr_data = audio_frame_wr_data;
 assign audio_fifo_rst = core_rst | audio_fifo_clear;
@@ -144,24 +181,8 @@ assign load_owner_active = (state == ST_LOAD_START) ||
                            (state == ST_LOAD_ABORT);
 
 always @* begin
-    case (target_image_index)
-        2'd0: begin
-            selected_file_cluster = image_cluster0;
-            selected_file_size    = image_size0;
-        end
-        2'd1: begin
-            selected_file_cluster = image_cluster1;
-            selected_file_size    = image_size1;
-        end
-        2'd2: begin
-            selected_file_cluster = image_cluster2;
-            selected_file_size    = image_size2;
-        end
-        default: begin
-            selected_file_cluster = image_cluster3;
-            selected_file_size    = image_size3;
-        end
-    endcase
+    selected_file_cluster = image_cluster[target_image_index];
+    selected_file_size    = image_size[target_image_index];
 end
 
 // write_req_ack is generated in ext_mem_clk; the loader consumes it in clk.
@@ -185,7 +206,7 @@ always @(posedge clk or posedge core_rst) begin
         audio_abort                <= 1'b0;
         audio_fifo_clear           <= 1'b0;
         scan_done                  <= 1'b0;
-        scan_found_count           <= 3'd0;
+        scan_found_count           <= 4'd0;
         source_done_pulse          <= 1'b0;
         source_error_pulse         <= 1'b0;
         storage_fault_pulse        <= 1'b0;
@@ -193,14 +214,10 @@ always @(posedge clk or posedge core_rst) begin
         scan_error_seen            <= 1'b0;
         storage_fault_latched      <= 1'b0;
         sd_response_watchdog       <= 25'd0;
-        image_cluster0             <= 32'd0;
-        image_cluster1             <= 32'd0;
-        image_cluster2             <= 32'd0;
-        image_cluster3             <= 32'd0;
-        image_size0                <= 32'd0;
-        image_size1                <= 32'd0;
-        image_size2                <= 32'd0;
-        image_size3                <= 32'd0;
+        for (img_i = 0; img_i < IMG_SLOT_COUNT; img_i = img_i + 1) begin
+            image_cluster[img_i] <= 32'd0;
+            image_size[img_i]    <= 32'd0;
+        end
         volume_first_fat_lba       <= 32'd0;
         volume_first_data_lba      <= 32'd0;
         volume_sectors_per_cluster <= 8'd0;
@@ -233,17 +250,13 @@ always @(posedge clk or posedge core_rst) begin
             audio_fifo_clear           <= 1'b1;
             state                      <= ST_IDLE;
             scan_done                  <= 1'b0;
-            scan_found_count           <= 3'd0;
+            scan_found_count           <= 4'd0;
             scan_error_seen            <= 1'b0;
             state_code                 <= 4'd0;
-            image_cluster0             <= 32'd0;
-            image_cluster1             <= 32'd0;
-            image_cluster2             <= 32'd0;
-            image_cluster3             <= 32'd0;
-            image_size0                <= 32'd0;
-            image_size1                <= 32'd0;
-            image_size2                <= 32'd0;
-            image_size3                <= 32'd0;
+            for (img_i = 0; img_i < IMG_SLOT_COUNT; img_i = img_i + 1) begin
+                image_cluster[img_i] <= 32'd0;
+                image_size[img_i]    <= 32'd0;
+            end
             volume_first_fat_lba       <= 32'd0;
             volume_first_data_lba      <= 32'd0;
             volume_sectors_per_cluster <= 8'd0;
@@ -257,26 +270,9 @@ always @(posedge clk or posedge core_rst) begin
 
             if (scan_owner_active && directory_file_found &&
                 (scan_found_count < SCAN_TARGET_COUNT)) begin
-                case (scan_found_count)
-                    3'd0: begin
-                        image_cluster0 <= directory_file_first_cluster;
-                        image_size0    <= directory_file_size;
-                    end
-                    3'd1: begin
-                        image_cluster1 <= directory_file_first_cluster;
-                        image_size1    <= directory_file_size;
-                    end
-                    3'd2: begin
-                        image_cluster2 <= directory_file_first_cluster;
-                        image_size2    <= directory_file_size;
-                    end
-                    3'd3: begin
-                        image_cluster3 <= directory_file_first_cluster;
-                        image_size3    <= directory_file_size;
-                    end
-                    default: ;
-                endcase
-                scan_found_count <= scan_found_count + 3'd1;
+                image_cluster[scan_found_count[2:0]] <= directory_file_first_cluster;
+                image_size[scan_found_count[2:0]]    <= directory_file_size;
+                scan_found_count <= scan_found_count + 4'd1;
             end
 
             case (state)
@@ -285,16 +281,12 @@ always @(posedge clk or posedge core_rst) begin
 
                     if (scan_start) begin
                         scan_done                  <= 1'b0;
-                        scan_found_count           <= 3'd0;
+                        scan_found_count           <= 4'd0;
                         scan_error_seen            <= 1'b0;
-                        image_cluster0             <= 32'd0;
-                        image_cluster1             <= 32'd0;
-                        image_cluster2             <= 32'd0;
-                        image_cluster3             <= 32'd0;
-                        image_size0                <= 32'd0;
-                        image_size1                <= 32'd0;
-                        image_size2                <= 32'd0;
-                        image_size3                <= 32'd0;
+                        for (img_i = 0; img_i < IMG_SLOT_COUNT; img_i = img_i + 1) begin
+                            image_cluster[img_i] <= 32'd0;
+                            image_size[img_i]    <= 32'd0;
+                        end
                         volume_first_fat_lba       <= 32'd0;
                         volume_first_data_lba      <= 32'd0;
                         volume_sectors_per_cluster <= 8'd0;
@@ -349,7 +341,7 @@ always @(posedge clk or posedge core_rst) begin
                             audio_start       <= 1'b1;
                         end
                     end else begin
-                        scan_found_count <= 3'd0;
+                        scan_found_count <= 4'd0;
                     end
                     audio_fifo_clear <= 1'b1;
                     scan_done <= 1'b1;
@@ -422,7 +414,10 @@ fat32_directory_scan #(
     .bgm_size                  (directory_bgm_size)
 );
 
-fat32_bmp_loader u_fat32_bmp_loader (
+wire [3:0] loader_dbg_state;
+fat32_bmp_loader #(
+    .MIN_SRC_PIXELS(MIN_SRC_PIXELS)
+) u_fat32_bmp_loader (
     .clk                    (clk),
     .rst                    (core_rst),
     .start                  (loader_start),
@@ -432,14 +427,18 @@ fat32_bmp_loader u_fat32_bmp_loader (
     .first_fat_lba          (volume_first_fat_lba),
     .first_data_lba         (volume_first_data_lba),
     .sectors_per_cluster    (volume_sectors_per_cluster),
-    .bmp_width              (16'd640),
-    .bmp_height             (16'd480),
+    .src_width              (loader_src_width),
+    .src_height             (loader_src_height),
+    .header_valid           (loader_header_valid),
+    .dbg_state              (loader_dbg_state),
     .busy                   (loader_busy),
     .done                   (loader_done),
     .error                  (loader_error),
     .write_req              (loader_write_req),
     .write_req_ack          (write_req_ack_sync),
-    .write_fifo_afull       (write_fifo_afull),
+    // 反压来自缩放器的输入缓冲：loader 一个 512 字节扇区 = 171 像素，
+    // 缩放器 FIFO 深 256，能吸收一个完整扇区的突发。
+    .write_fifo_afull       (scaler_src_afull),
     .bmp_data_wr_en         (loader_bmp_data_wr_en),
     .bmp_data               (loader_bmp_data),
     .sd_sec_read            (loader_sd_sec_read),
@@ -448,6 +447,66 @@ fat32_bmp_loader u_fat32_bmp_loader (
     .sd_sec_read_data_valid (image_grant ? sd_sec_read_data_valid : 1'b0),
     .sd_sec_read_end        (image_grant ? sd_sec_read_end : 1'b0)
 );
+
+// ---------------------------------------------------------------------------
+// 上板诊断（只读）。把"卡在哪"引到顶层数码管，避免再靠猜。
+// 注意：这里不驱动任何控制逻辑，删掉本段不影响功能。
+// ---------------------------------------------------------------------------
+
+
+reg [3:0] load_diag_sector_r;
+
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        load_diag_sector_r <= 4'd0;
+    else if (image_grant && sd_sec_read_end)
+        load_diag_sector_r <= load_diag_sector_r + 4'd1;
+end
+
+assign load_diag_state  = loader_dbg_state;
+assign load_diag_sector = load_diag_sector_r;
+assign load_diag_flags  = {write_req_ack_sync, 1'b0, write_fifo_afull, scaler_src_afull};
+assign load_progress_pulse = image_grant && sd_sec_read_end;
+
+// ---------------------------------------------------------------------------
+// 写侧双线性缩放器
+//   把任意 (<=1920x1080) 24bit BI_RGB BMP 的源像素流实时缩成 640x480。
+//   放在 loader 与 write_buf 之间，于是 SDRAM 里永远只存 640x480
+//   （307200 字 = 14.7%，双缓冲后 29.4%），读回路 / 滑动动效 / OSD / HDMI
+//   以及 frame_fifo_write 的 256 字突发、frame_slide_fifo_read 的
+//   FRAME_PIXEL_COUNT=307200 契约全部不需要改动。
+//
+//   为什么不做在读侧：参考框图把缩放器放在读 FIFO 之后，但 1920x1080@32bit
+//   = 2073600 字会占掉 SDRAM 的 98.87%（无法双缓冲），且每显示一帧要读
+//   2073600 字，125MHz 下需要 ~123.4 Mword/s，逼近 SDRAM 上限。写侧缩放
+//   把这些代价全部消掉。
+// ---------------------------------------------------------------------------
+image_bilinear_scaler #(
+    .DST_WIDTH      (16'd640),
+    .DST_HEIGHT     (16'd480),
+    .MAX_SRC_WIDTH  (16'd1920),
+    .MAX_SRC_HEIGHT (16'd1080),
+    .FRAC_BITS      (4'd10),
+    .IN_FIFO_DEPTH  (16'd256)
+) u_image_bilinear_scaler (
+    .clk            (clk),
+    .rst            (core_rst),
+    .start          (loader_start),
+    .src_width      (loader_src_width),
+    .src_height     (loader_src_height),
+    .cfg_valid      (loader_header_valid),
+    .src_data       (loader_bmp_data),
+    .src_valid      (loader_bmp_data_wr_en),
+    .src_afull      (scaler_src_afull),
+    .src_overflow_count (scaler_overflow_count),
+    .out_stall      (write_fifo_afull),
+    .dst_data       (scaler_dst_data),
+    .dst_valid      (scaler_dst_valid),
+    .dst_done       (scaler_dst_done),
+    .error_code     (scaler_error_code)
+);
+// scaler_dst_done / scaler_error_code 当前未参与控制流，留给 M6 的
+// OSD 标注与 7 段数码管显示用（bit0 = 源尺寸非法，bit1 = 输出像素数不符）。
 
 fat32_wav_loader u_fat32_wav_loader (
     .clk                    (clk),

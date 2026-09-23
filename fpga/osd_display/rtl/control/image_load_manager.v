@@ -1,6 +1,7 @@
 module image_load_manager #(
     parameter integer CLK_FREQ_HZ = 100_000_000,
     parameter integer LOAD_TIMEOUT_SECONDS = 10,
+    parameter integer LOAD_ABS_TIMEOUT_SECONDS = 60,
     parameter integer MAX_LOAD_RETRIES = 2,
     parameter integer STORAGE_INIT_TIMEOUT_SECONDS = 10
 )(
@@ -8,11 +9,12 @@ module image_load_manager #(
     input  wire       rst,
     input  wire       storage_ready,
     input  wire       scan_done,
-    input  wire [2:0] scan_found_count,
+    input  wire [3:0] scan_found_count,
     input  wire       source_done_pulse,
     input  wire       source_error_pulse,
     input  wire       storage_fault_pulse,
     input  wire       write_done_pulse,
+    input  wire       load_progress_pulse,
     input  wire       next_request,
     input  wire       auto_request,
 
@@ -20,10 +22,10 @@ module image_load_manager #(
     output reg        load_start,
     output reg        load_abort,
     output reg        storage_reinit,
-    output reg [1:0]  target_image_index,
+    output reg [2:0]  target_image_index,
     output reg [1:0]  write_buffer_index,
     output reg [1:0]  display_buffer_index,
-    output reg [1:0]  current_image_index,
+    output reg [2:0]  current_image_index,
     output reg        display_valid,
     output reg        display_test_pattern,
     output reg [2:0]  state,
@@ -32,7 +34,7 @@ module image_load_manager #(
     output reg        pending_next,
     output reg        source_done_seen,
     output reg        write_done_seen,
-    output reg [2:0]  image_count,
+    output reg [3:0]  image_count,
     output wire       load_in_progress,
     output wire       idle
 );
@@ -55,9 +57,13 @@ localparam [3:0] ERR_SOURCE = 4'd5;
 localparam [31:0] LOAD_TIMEOUT_CYCLES = CLK_FREQ_HZ * LOAD_TIMEOUT_SECONDS;
 localparam [31:0] STORAGE_INIT_TIMEOUT_CYCLES =
     CLK_FREQ_HZ * STORAGE_INIT_TIMEOUT_SECONDS;
+// 绝对上限：即使一直在"有进度"，也不能无限拖
+localparam [31:0] LOAD_ABS_TIMEOUT_CYCLES =
+    CLK_FREQ_HZ * LOAD_ABS_TIMEOUT_SECONDS;
 
-reg [2:0]  skipped_image_count;
+reg [3:0]  skipped_image_count;
 reg [31:0] load_timeout_count;
+reg [31:0] load_abs_count;
 reg [31:0] storage_init_wait_count;
 reg        scan_active_seen;
 reg        resume_next_after_reinit;
@@ -66,17 +72,17 @@ reg        preserve_display_after_reinit;
 assign load_in_progress = (state == ST_LOAD) || (state == ST_VERIFY);
 assign idle             = (state == ST_IDLE);
 
-function [1:0] next_image_index;
-    input [1:0] current;
-    input [2:0] count;
+// 图片索引 0..7，最多 8 张；在 0..count-1 之间循环
+function [2:0] next_image_index;
+    input [2:0] current;
+    input [3:0] count;
+    reg [3:0] nxt;
     begin
-        case (count)
-            3'd0,
-            3'd1: next_image_index = 2'd0;
-            3'd2: next_image_index = (current == 2'd1) ? 2'd0 : current + 2'd1;
-            3'd3: next_image_index = (current == 2'd2) ? 2'd0 : current + 2'd1;
-            default: next_image_index = (current == 2'd3) ? 2'd0 : current + 2'd1;
-        endcase
+        nxt = {1'b0, current} + 4'd1;
+        if ((count == 4'd0) || (nxt >= count))
+            next_image_index = 3'd0;
+        else
+            next_image_index = nxt[2:0];
     end
 endfunction
 
@@ -106,6 +112,7 @@ always @(posedge clk or posedge rst) begin
         image_count         <= 3'd0;
         skipped_image_count <= 3'd0;
         load_timeout_count  <= 32'd0;
+        load_abs_count      <= 32'd0;
         storage_init_wait_count <= 32'd0;
         source_done_seen    <= 1'b0;
         write_done_seen     <= 1'b0;
@@ -127,6 +134,7 @@ always @(posedge clk or posedge rst) begin
             retry_count         <= 2'd0;
             skipped_image_count <= 3'd0;
             load_timeout_count  <= 32'd0;
+            load_abs_count      <= 32'd0;
             source_done_seen    <= 1'b0;
             write_done_seen     <= 1'b0;
             scan_active_seen    <= 1'b0;
@@ -203,6 +211,7 @@ always @(posedge clk or posedge rst) begin
                 ST_LOAD: begin
                     load_start         <= 1'b1;
                     load_timeout_count <= 32'd0;
+                    load_abs_count     <= 32'd0;
                     source_done_seen   <= 1'b0;
                     write_done_seen    <= 1'b0;
                     state              <= ST_VERIFY;
@@ -217,7 +226,8 @@ always @(posedge clk or posedge rst) begin
                     if (source_error_pulse ||
                         (!((source_done_seen || source_done_pulse) &&
                            (write_done_seen || write_done_pulse)) &&
-                         (load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 1'b1)))) begin
+                         ((load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 1'b1)) ||
+                          (load_abs_count    >= (LOAD_ABS_TIMEOUT_CYCLES - 1'b1))))) begin
                         load_abort <= 1'b1;
                         error_code <= source_error_pulse ? ERR_SOURCE : ERR_TIMEOUT;
 
@@ -229,7 +239,7 @@ always @(posedge clk or posedge rst) begin
                             display_test_pattern <= 1'b1;
                             state               <= ST_RECOVER;
                         end else if ((image_count > 3'd1) &&
-                                     ((skipped_image_count + 3'd1) < (image_count - 3'd1))) begin
+                                     (skipped_image_count < (image_count - 4'd1))) begin
                             retry_count         <= 2'd0;
                             skipped_image_count <= skipped_image_count + 3'd1;
                             target_image_index  <= next_image_index(target_image_index, image_count);
@@ -244,7 +254,13 @@ always @(posedge clk or posedge rst) begin
                         (write_done_seen || write_done_pulse)) begin
                         state <= ST_COMMIT;
                     end else begin
-                        load_timeout_count <= load_timeout_count + 32'd1;
+                        // 每读完一个源扇区就把"无进展"计时清零；
+                        // 只有真的卡住（连续 10s 一个扇区都没读完）才判超时。
+                        if (load_progress_pulse)
+                            load_timeout_count <= 32'd0;
+                        else
+                            load_timeout_count <= load_timeout_count + 32'd1;
+                        load_abs_count <= load_abs_count + 32'd1;
                     end
                 end
 

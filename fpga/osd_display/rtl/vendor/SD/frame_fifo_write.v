@@ -81,8 +81,18 @@ reg App_wr_en_d0;
 reg fifo_ready_r;
 wire fifo_ready_now;
 wire into_burst;
+// 2026-09-22 修：这里原本是 `rdusedw > BURST_SIZE`，比写 FIFO 的反压水位差一个。
+//   写 FIFO  wfifo_32_32_512 的 AL_FULL_NUM = 256（frame_read_write.v:175），
+//   生产者（写侧缩放器）严格按 write_fifo_afull 停止 —— 也就是停在 rdusedw == 256，
+//   而原条件要 rdusedw == 257 才肯发突发。于是：
+//       生产者等消费者腾地方，消费者等生产者再来一个字 -> 整帧永远写不完
+//   （板级现象：write_done_seen 恒 0 -> 黑屏；10s 后 ERR_TIMEOUT -> 彩条。
+//     实测 out_stall/afull 恒 1，loader 停在 STREAM_PAUSE。
+//     TB: tests/tb_frame_fifo_write_afull.sv 用真 FSM 复现：rdusedw=256 处死锁）
+//   突发的前提本来就是"FIFO 里已经积够一个整突发"，所以必须是 >= 。
+//   （注意：BURST_SIZE 必须 <= 写 FIFO 的 afull 水位，两者相等时本条件成立。）
 assign fifo_ready_now = ((write_len_latch <= (rdusedw + write_cnt)) ||
-                         (rdusedw > BURST_SIZE));
+                         (rdusedw >= BURST_SIZE));
 assign into_burst = fifo_ready_r && ~App_rd_busy;
 
 assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};

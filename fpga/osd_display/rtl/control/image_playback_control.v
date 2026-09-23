@@ -7,7 +7,7 @@ module image_playback_control #(
     input  wire       key_next,
     input  wire       key_auto,
     input  wire       display_valid,
-    input  wire [2:0] image_count,
+    input  wire [3:0] image_count,
     input  wire       manager_idle,
     output reg        next_request,
     output reg        auto_request,
@@ -50,16 +50,16 @@ always @(posedge clk or posedge rst) begin
         next_request <= 1'b0;
         auto_request <= 1'b0;
 
-        if (key_next_press && manager_idle && (image_count != 3'd0))
+        if (key_next_press && manager_idle && (image_count != 4'd0))
             next_request <= 1'b1;
 
-        if (key_auto_press && (image_count > 3'd1))
+        if (key_auto_press && (image_count > 4'd1))
             auto_play_enabled <= ~auto_play_enabled;
 
         // A button action starts a fresh interval and cannot also emit an auto request.
         if (key_next_press || key_auto_press) begin
             auto_counter <= 32'd0;
-        end else if (auto_play_enabled && display_valid && manager_idle && (image_count > 3'd1)) begin
+        end else if (auto_play_enabled && display_valid && manager_idle && (image_count > 4'd1)) begin
             if (auto_counter >= (AUTO_INTERVAL_CYCLES - 1'b1)) begin
                 auto_request <= 1'b1;
                 auto_counter <= 32'd0;
