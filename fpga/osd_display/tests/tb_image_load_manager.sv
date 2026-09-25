@@ -88,6 +88,8 @@ image_load_manager #(
 
 integer commit_count = 0;
 always @(posedge commit_pulse) commit_count = commit_count + 1;
+integer abort_count = 0;
+always @(posedge load_abort) abort_count = abort_count + 1;
 
 task automatic tick;
     begin
@@ -488,6 +490,67 @@ initial begin
     expect_value(display_buffer_index, 3'd0, "six: wrap hit slot 0");
     repeat (20) tick();
     expect_value(state, 3'd5, "six: wrap hit starts no load");
+
+    // -----------------------------------------------------------------
+    // Board repro: five images, "LOAD 5/5" (preload of image 4 = -1) is
+    // running; next, next are hits, the third next (image 3) misses and
+    // must abort the preload and load 3 in the foreground right away.
+    // -----------------------------------------------------------------
+    reset_dut();
+    commit_count = 0;
+    abort_count = 0;
+    // Keep the no-progress watchdog (4 cycles here) fed while the test waits.
+    load_progress_pulse = 1'b1;
+    storage_ready = 1'b1;
+    finish_scan(4'd5);
+    complete_current_load(1'b1);
+    display_settled = 1'b1;
+    wait_for_state(3'd3, "preempt: preload 1");
+    complete_current_load(1'b1);
+    wait_for_state(3'd3, "preempt: preload 2");
+    complete_current_load(1'b1);
+    wait_for_state(3'd3, "preempt: preload 4 verify");
+    expect_value(target_image_index, 3'd4, "preempt: LOAD 5/5");
+    expect_value(write_buffer_index, 3'd3, "preempt: preload 4 slot 3");
+    repeat (3) tick();
+    next_request = 1'b1; tick(); next_request = 1'b0;
+    repeat (3) tick();
+    expect_value(current_image_index, 3'd1, "preempt: first next hits");
+    next_request = 1'b1; tick(); next_request = 1'b0;
+    repeat (3) tick();
+    expect_value(current_image_index, 3'd2, "preempt: second next hits");
+    expect_value(abort_count, 0, "preempt: hits do not abort");
+    expect_bit(preloading, 1'b1, "preempt: preload still running");
+    next_request = 1'b1; tick(); next_request = 1'b0;
+    expect_value(abort_count, 1, "preempt: miss aborts the preload");
+    expect_bit(preloading, 1'b0, "preempt: preload dropped");
+    wait_for_state(3'd3, "preempt: foreground verify");
+    expect_bit(preloading, 1'b0, "preempt: foreground load");
+    expect_value(target_image_index, 3'd3, "preempt: foreground target 3");
+    expect_value(write_buffer_index, 3'd3, "preempt: reuses aborted slot 3");
+    expect_bit(pending_next, 1'b0, "preempt: nothing left pending");
+    complete_current_load(1'b1);
+    expect_value(current_image_index, 3'd3, "preempt: image 3 shown");
+    expect_value(display_buffer_index, 3'd3, "preempt: slot 3 shown");
+    expect_value(commit_count, 4, "preempt: commits");
+
+    // The aborted image 4 is preloaded again. Once its source is fully
+    // read a miss for it just waits (no abort) and then hits.
+    wait_for_state(3'd3, "preempt: re-preload 4");
+    expect_bit(preloading, 1'b1, "preempt: re-preload is a preload");
+    expect_value(target_image_index, 3'd4, "preempt: re-preload target 4");
+    source_done_pulse = 1'b1; tick(); source_done_pulse = 1'b0;
+    repeat (3) tick();
+    next_request = 1'b1; tick(); next_request = 1'b0;
+    expect_value(abort_count, 1, "preempt: source done, no abort");
+    expect_bit(pending_next, 1'b1, "preempt: request pending");
+    expect_value(current_image_index, 3'd3, "preempt: still on 3");
+    write_done_pulse = 1'b1; tick(); write_done_pulse = 1'b0;
+    repeat (10) tick();
+    expect_value(current_image_index, 3'd4, "preempt: pending hit shows 4");
+    expect_value(commit_count, 5, "preempt: pending hit commits");
+    expect_bit(pending_next, 1'b0, "preempt: pending cleared");
+    load_progress_pulse = 1'b0;
 
     $display("PASS tb_image_load_manager");
     $finish;

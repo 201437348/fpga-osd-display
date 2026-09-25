@@ -54,6 +54,7 @@ module frame_read_write #(
     parameter READ_FIFO_MARKER_WIDTH = 16
 )(
     input mem_clk, input rst, input Sdr_init_done, input Sdr_init_ref_vld, input Sdr_busy,
+    output App_ref_req,
     output App_rd_en, output [20:0] App_rd_addr, input Sdr_rd_en,
     input [31:0] Sdr_rd_dout, input read_clk, input read_req, output read_req_ack,
     output read_finish, input [23:0] read_addr_0, input [23:0] read_addr_1,
@@ -75,7 +76,7 @@ endmodule
 `endif
 
 module sdram(input Clk, input Clk_sft, input Rst, output Sdr_init_done,
-             output Sdr_init_ref_vld, output Sdr_busy, input App_wr_en,
+             output Sdr_init_ref_vld, output Sdr_busy, input App_ref_req, input App_wr_en,
              input [20:0] App_wr_addr, input [3:0] App_wr_dm, input [31:0] App_wr_din,
              input App_rd_en, input [20:0] App_rd_addr, output Sdr_rd_en,
              output [31:0] Sdr_rd_dout);

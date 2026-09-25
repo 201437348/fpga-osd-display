@@ -1,4 +1,4 @@
 force
 tan20
-18484
+12784
 D:\fpga\project\fpga\osd_display\.lock.f

@@ -73,6 +73,7 @@ reg[2:0]                            write_addr_index_d1;
 reg[3:0]                            state;                       //state machine
 reg [ADDR_BITS - 1:0]	 App_wr_addr_r;
 reg [15:0]                            wr_x;                       // current x position in one input row
+reg                                   wr_x_last;                  // registered (wr_x == VFLIP_LINE_LAST_X), keeps the compare off the address path
 
 reg [BURST_BITS - 1:0]				burst_cnt;
 wire								wr_burst_finish;
@@ -148,6 +149,7 @@ begin
 		App_wr_addr_r <= ZERO[ADDR_BITS - 1:0];
 		App_wr_en_d0 <= 1'b0;
 		wr_x <= 16'd0;
+		wr_x_last <= (VFLIP_LINE_LAST_X == 16'd0);
 	end
 	else begin
 	
@@ -161,6 +163,7 @@ begin
 		if(state == S_ACK)
 			begin
 				wr_x <= 16'd0;
+				wr_x_last <= (VFLIP_LINE_LAST_X == 16'd0);
 				if(write_addr_index_d1 == 3'd0)
 					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_0 + VFLIP_FIRST_ADDR_OFFSET) : write_addr_0;
 				else if(write_addr_index_d1 == 3'd1)
@@ -178,14 +181,16 @@ begin
 			begin
 				if(WRITE_V_FLIP)
 				begin
-					if(wr_x == VFLIP_LINE_LAST_X)
+					if(wr_x_last)
 					begin
 						wr_x <= 16'd0;
+						wr_x_last <= (VFLIP_LINE_LAST_X == 16'd0);
 						App_wr_addr_r <= App_wr_addr_r - VFLIP_LINE_JUMP;
 					end
 					else
 					begin
 						wr_x <= wr_x + 1'b1;
+						wr_x_last <= (wr_x == VFLIP_LINE_LAST_X - 16'd1);
 						App_wr_addr_r <= App_wr_addr_r + 1'b1;
 					end
 				end

@@ -23,7 +23,13 @@ module frame_read_write
 	parameter FIXED_READ_BURST_ENABLE = 0,
 	parameter READ_FIFO_MARKER_ENABLE = 0,
 	parameter READ_FIFO_MARKER_START  = 0,
-	parameter READ_FIFO_MARKER_WIDTH  = 16
+	parameter READ_FIFO_MARKER_WIDTH  = 16,
+	// Background scrub read every SCRUB_INTERVAL mem_clk cycles (0 = off).
+	parameter SCRUB_INTERVAL         = 512,
+	parameter SCRUB_READS            = 4,     // reads per scrub, same address (like a chunk preroll)
+	parameter SCRUB_GUARD            = 16,    // idle cycles before issuing and after the last return
+	// Issue an SDRAM AUTO REFRESH (App_ref_req) in every 2nd scrub window (0 = off).
+	parameter REFRESH_ENABLE         = 1
 )
 (
 	input                            rst,
@@ -31,6 +37,7 @@ module frame_read_write
 	input                            Sdr_init_done,
 	input                            Sdr_init_ref_vld,
 	input                            Sdr_busy,
+	output reg                       App_ref_req,       // 1-cycle refresh request to sdr_as_ram
 
 	output                           App_rd_en,
 	output [ADDR_BITS - 1:0]         App_rd_addr,
@@ -171,8 +178,168 @@ end
 
 assign read_fifo_underflow_count_per_frame = read_fifo_underflow_count_frame_r;
 
-assign App_wr_busy = O_wr_busy;
-assign App_rd_busy = O_rd_busy;
+// ---------------------------------------------------------------------------
+// Background scrub reads (software refresh).
+// The controller's auto refresh is unusable here (enabling it corrupts the
+// display), so SDRAM rows are kept alive by ACTIVATE instead: every
+// SCRUB_INTERVAL cycles the next {row, bank} (col 0) is read. 8192 bank-rows
+// * 512 cycles = 33.5 ms per sweep at 125 MHz, inside the 64 ms retention.
+// The controller returns data for an address two commands late, so a lone
+// read is not guaranteed to touch its own row and its return may land after
+// the schedulers resume. The scrub therefore mimics a chunk preroll:
+//   hold both schedulers -> SCRUB_GUARD idle cycles -> SCRUB_READS reads of
+//   the same address -> wait for all returns -> SCRUB_GUARD more cycles with
+//   Sdr_rd_en still masked from the read scheduler -> release.
+//
+// Controller auto refresh: global_def.v's SELF_REFRESH_INTERVAL expands to
+// 64000000/1000000000/125000000/2**11 = 0 (no parentheses), so sdr_init_ref
+// never raises its own refresh request. Instead of fixing the interval (the
+// controller would then refresh at arbitrary times, colliding with the write
+// scheduler that does not look at Sdr_busy), sdram.v sets
+// self_refresh_open = 0 and the refresh is requested here, inside the scrub
+// hold window where both schedulers are known idle:
+//   ... scrub reads -> guard -> App_ref_req pulse -> wait for
+//   Sdr_init_ref_vld (refresh commands on the bus, ~20 cycles) to rise and
+//   fall -> SCRUB_GUARD cycles -> release.
+// Every 2nd window: ~1100 cycles apart = ~7000 refreshes per 64 ms (spec 4096).
+// ---------------------------------------------------------------------------
+localparam [2:0] SC_COUNT = 3'd0;
+localparam [2:0] SC_HOLD  = 3'd1;
+localparam [2:0] SC_ISSUE = 3'd2;
+localparam [2:0] SC_WAIT  = 3'd3;
+localparam [2:0] SC_GUARD = 3'd4;
+localparam [2:0] SC_REF   = 3'd5;
+localparam [2:0] SC_RWAIT = 3'd6;
+localparam [2:0] SC_RGRD  = 3'd7;
+
+reg  [2:0]             scrub_state;
+reg  [15:0]            scrub_timer;
+reg  [7:0]             scrub_wait_cnt;
+reg  [3:0]             scrub_issue_cnt;
+reg  [3:0]             scrub_ret_cnt;
+reg  [12:0]            scrub_row_bank;       // {row[10:0], bank[1:0]}
+reg                    scrub_hold;           // registered: blocks both schedulers
+reg                    scrub_sel;            // scrub owns the read address / return
+reg                    ref_seen;             // Sdr_init_ref_vld went high after App_ref_req
+wire                   sched_rd_en;
+wire [ADDR_BITS - 1:0] sched_rd_addr;
+wire                   scrub_idle_now = !O_rd_busy && !O_wr_busy && !App_wr_en && !Sdr_busy;
+// Same command-side backpressure rule as the read scheduler.
+wire                   scrub_en = (scrub_state == SC_ISSUE) && !Sdr_busy;
+
+always @(posedge mem_clk or posedge rst) begin
+	if (rst) begin
+		scrub_state     <= SC_COUNT;
+		scrub_timer     <= 16'd0;
+		scrub_wait_cnt  <= 8'd0;
+		scrub_issue_cnt <= 4'd0;
+		scrub_ret_cnt   <= 4'd0;
+		scrub_row_bank  <= 13'd0;
+		scrub_hold      <= 1'b0;
+		scrub_sel       <= 1'b0;
+		ref_seen        <= 1'b0;
+		App_ref_req     <= 1'b0;
+	end else begin
+		App_ref_req <= 1'b0;
+		case (scrub_state)
+			SC_COUNT: begin
+				if ((SCRUB_INTERVAL != 0) && Sdr_init_done) begin
+					if (scrub_timer >= SCRUB_INTERVAL - 1) begin
+						scrub_timer    <= 16'd0;
+						scrub_wait_cnt <= 8'd0;
+						scrub_hold     <= 1'b1;
+						scrub_state    <= SC_HOLD;
+					end else begin
+						scrub_timer <= scrub_timer + 16'd1;
+					end
+				end
+			end
+			// scrub_hold has been visible to both schedulers since this state
+			// was entered, so once both report idle neither can start. Require
+			// SCRUB_GUARD consecutive idle cycles before the first read.
+			SC_HOLD: begin
+				if (!scrub_idle_now) begin
+					scrub_wait_cnt <= 8'd0;
+				end else if (scrub_wait_cnt >= SCRUB_GUARD) begin
+					scrub_wait_cnt  <= 8'd0;
+					scrub_issue_cnt <= 4'd0;
+					scrub_ret_cnt   <= 4'd0;
+					scrub_sel       <= 1'b1;
+					scrub_state     <= SC_ISSUE;
+				end else begin
+					scrub_wait_cnt <= scrub_wait_cnt + 8'd1;
+				end
+			end
+			SC_ISSUE: begin
+				if (Sdr_rd_en)
+					scrub_ret_cnt <= scrub_ret_cnt + 4'd1;
+				if (scrub_en) begin
+					scrub_issue_cnt <= scrub_issue_cnt + 4'd1;
+					if (scrub_issue_cnt == SCRUB_READS - 1)
+						scrub_state <= SC_WAIT;
+				end
+			end
+			SC_WAIT: begin
+				scrub_wait_cnt <= scrub_wait_cnt + 8'd1;
+				if (Sdr_rd_en)
+					scrub_ret_cnt <= scrub_ret_cnt + 4'd1;
+				if ((scrub_ret_cnt + Sdr_rd_en >= SCRUB_READS) || (scrub_wait_cnt == 8'hFF)) begin
+					scrub_wait_cnt <= 8'd0;
+					scrub_state    <= SC_GUARD;
+				end
+			end
+			// Late or extra returns are still masked here.
+			SC_GUARD: begin
+				scrub_wait_cnt <= scrub_wait_cnt + 8'd1;
+				if (scrub_wait_cnt >= SCRUB_GUARD) begin
+					scrub_row_bank <= scrub_row_bank + 13'd1;
+					scrub_sel      <= 1'b0;
+					scrub_wait_cnt <= 8'd0;
+					if ((REFRESH_ENABLE != 0) && scrub_row_bank[0]) begin
+						scrub_state <= SC_REF;
+					end else begin
+						scrub_hold  <= 1'b0;
+						scrub_state <= SC_COUNT;
+					end
+				end
+			end
+			// Schedulers are still held (scrub_hold) and idle for > SCRUB_GUARD cycles.
+			SC_REF: begin
+				App_ref_req    <= 1'b1;
+				ref_seen       <= 1'b0;
+				scrub_wait_cnt <= 8'd0;
+				scrub_state    <= SC_RWAIT;
+			end
+			// Wait for the refresh commands to go on and off the bus. Timeout
+			// keeps the display alive if the controller never shows them.
+			SC_RWAIT: begin
+				scrub_wait_cnt <= scrub_wait_cnt + 8'd1;
+				if (Sdr_init_ref_vld)
+					ref_seen <= 1'b1;
+				if ((ref_seen && !Sdr_init_ref_vld && !Sdr_busy) ||
+				    (!ref_seen && !Sdr_init_ref_vld && (scrub_wait_cnt == 8'd63)) ||
+				    (scrub_wait_cnt == 8'hFF)) begin
+					scrub_wait_cnt <= 8'd0;
+					scrub_state    <= SC_RGRD;
+				end
+			end
+			SC_RGRD: begin
+				scrub_wait_cnt <= scrub_wait_cnt + 8'd1;
+				if (scrub_wait_cnt >= SCRUB_GUARD) begin
+					scrub_hold  <= 1'b0;
+					scrub_state <= SC_COUNT;
+				end
+			end
+			default: scrub_state <= SC_COUNT;
+		endcase
+	end
+end
+
+assign App_rd_en   = sched_rd_en | scrub_en;
+assign App_rd_addr = scrub_sel ? {scrub_row_bank, 8'd0} : sched_rd_addr;
+
+assign App_wr_busy = O_wr_busy | scrub_hold;   // seen by the read scheduler
+assign App_rd_busy = O_rd_busy | scrub_hold;   // seen by the write scheduler
 assign App_wr_dm = 4'b0000;
 
 wfifo_32_32_512 #(
@@ -264,7 +431,7 @@ frame_slide_fifo_read #(
 	.Sdr_init_done    (Sdr_init_done),
 	.Sdr_busy         (Sdr_busy),
 	.App_wr_busy      (App_wr_busy),
-	.Sdr_rd_en        (Sdr_rd_en),
+	.Sdr_rd_en        (Sdr_rd_en & ~scrub_sel),
 	.Sdr_rd_dout      (Sdr_rd_dout),
 	.read_req         (read_req),
 	.read_req_ack     (read_req_ack),
@@ -283,8 +450,8 @@ frame_slide_fifo_read #(
 	.wrusedw          (wrusedw),
 	.fifo_write_en    (read_fifo_write_en),
 	.fifo_write_data  (slide_fifo_write_data),
-	.App_rd_en        (App_rd_en),
-	.App_rd_addr      (App_rd_addr),
+	.App_rd_en        (sched_rd_en),
+	.App_rd_addr      (sched_rd_addr),
 	.read_busy        (O_rd_busy),
 	.read_fault       (read_fault)
 );

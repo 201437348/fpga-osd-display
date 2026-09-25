@@ -42,6 +42,7 @@ parameter BUF5_ADDR     = FRAME_PIXELS * 5;
 wire Sdr_init_done;
 wire Sdr_init_ref_vld;
 wire Sdr_busy;
+wire App_ref_req;
 
 wire sd_card_clk;
 wire ext_mem_clk;
@@ -935,6 +936,7 @@ frame_read_write #(
     .Sdr_init_done     (Sdr_init_done),
     .Sdr_init_ref_vld  (Sdr_init_ref_vld),
     .Sdr_busy          (Sdr_busy),
+    .App_ref_req       (App_ref_req),
 
     .App_rd_en         (App_rd_en),
     .App_rd_addr       (App_rd_addr),
@@ -993,6 +995,7 @@ sdram U3(
     .Sdr_init_done     (Sdr_init_done),
     .Sdr_init_ref_vld  (Sdr_init_ref_vld),
     .Sdr_busy          (Sdr_busy),
+    .App_ref_req       (App_ref_req),
     .App_wr_en         (App_wr_en),
     .App_wr_addr       (App_wr_addr),
     .App_wr_dm         (App_wr_dm),

@@ -81,6 +81,10 @@ reg [2:0] state;
 reg       directory_start;
 reg       loader_start;
 reg       loader_abort;
+// manager 发 load_abort 后几拍就发下一个 load_start（中止预加载 / 超时重试），
+// 这时本模块还在 ST_LOAD_ABORT 等 loader 收尾，只在 ST_IDLE 接收的话脉冲会丢，
+// manager 只能在 VERIFY 里等 10s 超时。先锁存，回到 ST_IDLE 再执行。
+reg       load_start_pending;
 reg       audio_start;
 reg       audio_abort;
 reg       audio_fifo_clear;
@@ -261,6 +265,7 @@ always @(posedge clk or posedge core_rst) begin
         directory_start            <= 1'b0;
         loader_start               <= 1'b0;
         loader_abort               <= 1'b0;
+        load_start_pending         <= 1'b0;
         audio_start                <= 1'b0;
         audio_abort                <= 1'b0;
         audio_fifo_clear           <= 1'b0;
@@ -304,7 +309,13 @@ always @(posedge clk or posedge core_rst) begin
             end
         end
 
+        if (load_start && (state != ST_IDLE))
+            load_start_pending <= 1'b1;
+        else if (load_abort)
+            load_start_pending <= 1'b0;
+
         if (!sd_init_done) begin
+            load_start_pending         <= 1'b0;
             audio_abort                <= 1'b1;
             audio_fifo_clear           <= 1'b1;
             state                      <= ST_IDLE;
@@ -354,7 +365,8 @@ always @(posedge clk or posedge core_rst) begin
                         audio_fifo_clear           <= 1'b1;
                         directory_start            <= 1'b1;
                         state                      <= ST_SCAN_START;
-                    end else if (load_start) begin
+                    end else if (load_start || load_start_pending) begin
+                        load_start_pending <= 1'b0;
                         if (selected_ok_q) begin
                             loader_start <= 1'b1;
                             state        <= ST_LOAD_START;
@@ -405,7 +417,12 @@ always @(posedge clk or posedge core_rst) begin
 
                 ST_LOAD_START: begin
                     state_code <= 4'd3;
-                    if (loader_error) begin
+                    if (load_abort) begin
+                        // loader 刚收到 start 还没拉 busy 时来的 abort 也要转发，
+                        // 否则 abort 被吞掉，这张会整张读完
+                        loader_abort <= 1'b1;
+                        state        <= ST_LOAD_ABORT;
+                    end else if (loader_error) begin
                         source_error_pulse <= 1'b1;
                         state              <= ST_IDLE;
                     end else if (loader_busy) begin

@@ -315,6 +315,16 @@ reg [2:0] state_d2;
 wire      state_held  = (state_d == state);                  // 已在当前状态停留至少一拍
 wire      state_held2 = state_held && (state_d2 == state);   // 至少两拍（预加载候选多一级寄存）
 
+// 预加载进行中的切换请求（本拍新请求优先于挂起的请求）。命中缓存立即切换；
+// 未命中且预加载的源数据还没读完，就中止预加载、改为前台加载目标图，
+// 不再等一张大图（6MB 要好几秒）读完才响应。源数据已读完只剩写尾时照旧挂起：
+// 马上就完，而且中止它可能让旧帧的 write_finish 混进下一次加载。
+wire      pl_req      = preloading && (request || pending_next);
+wire      pl_req_prev = request ? (prev_request && !fwd_request) : pending_prev;
+wire      pl_req_hit  = pl_req_prev ? prev_hit_q : next_hit_q;
+wire      pl_preempt  = pl_req && !pl_req_hit &&
+                        !source_done_seen && !source_done_pulse && !source_error_pulse;
+
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         target_hit_q              <= 1'b0;
@@ -525,29 +535,33 @@ always @(posedge clk or posedge rst) begin
                     if (write_done_pulse)
                         write_done_seen <= 1'b1;
 
-                    // 预加载进行中来了切换请求：下一张已缓存就立即切过去（预加载
-                    // 继续写它自己的槽，不受影响）；否则挂起到预加载结束。
-                    if (preloading && fwd_request) begin
-                        if (next_hit_q) begin
-                            display_buffer_index <= next_slot_q;
-                            current_image_index  <= next_of_current_q;
-                            commit_pulse         <= 1'b1;
-                        end else begin
-                            pending_next <= 1'b1;
-                            pending_prev <= 1'b0;
-                        end
-                    end else if (preloading && prev_request) begin
-                        if (prev_hit_q) begin
-                            display_buffer_index <= prev_slot_q;
-                            current_image_index  <= prev_of_current_q;
-                            commit_pulse         <= 1'b1;
-                        end else begin
-                            pending_next <= 1'b1;
-                            pending_prev <= 1'b1;
-                        end
+                    // 预加载进行中来了切换请求：目标已缓存就立即切过去（预加载
+                    // 继续写它自己的槽，不受影响）；未命中则中止预加载改为前台加载
+                    // （pl_preempt），源已读完的话挂起到预加载结束。
+                    if (pl_req && pl_req_hit) begin
+                        display_buffer_index <= pl_req_prev ? prev_slot_q : next_slot_q;
+                        current_image_index  <= pl_req_prev ? prev_of_current_q : next_of_current_q;
+                        commit_pulse         <= 1'b1;
+                        pending_next         <= 1'b0;
+                        pending_prev         <= 1'b0;
+                    end else if (pl_req && !pl_preempt) begin
+                        pending_next <= 1'b1;
+                        pending_prev <= pl_req_prev;
                     end
 
-                    if (source_error_pulse ||
+                    if (pl_preempt) begin
+                        // 被中止的槽在 ST_SELECT 已标成 invalid，写了一半的数据不会被显示；
+                        // adapter 会把紧跟着的 load_start 锁存到 abort 收尾完成再执行。
+                        load_abort          <= 1'b1;
+                        preloading          <= 1'b0;
+                        target_image_index  <= pl_req_prev ? prev_of_current_q : next_of_current_q;
+                        load_dir_prev       <= pl_req_prev;
+                        pending_next        <= 1'b0;
+                        pending_prev        <= 1'b0;
+                        retry_count         <= 2'd0;
+                        skipped_image_count <= 3'd0;
+                        state               <= ST_SELECT;
+                    end else if (source_error_pulse ||
                         (!((source_done_seen || source_done_pulse) &&
                            (write_done_seen || write_done_pulse)) &&
                          ((load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 1'b1)) ||
