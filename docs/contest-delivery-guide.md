@@ -90,7 +90,7 @@ TF 卡必须使用 FAT32 文件系统，媒体文件放在根目录。
 
 ## 追溯资料
 
-- 研发与板测连续记录：[osd-display-migration.md](osd-display-migration.md)
-- 项目路线和历史诊断：[project-roadmap.md](project-roadmap.md)
+- 研发与板测连续记录：[history/migration.md](history/migration.md)
+- 项目路线：[roadmap.md](roadmap.md)；历史诊断流水账：[history/board-log.md](history/board-log.md)
 - 音频优化设计：[2026-09-08-optimized-tf-wav-hdmi-audio-design.md](superpowers/specs/2026-09-08-optimized-tf-wav-hdmi-audio-design.md)
 - TF 热拔插恢复设计：[2026-09-08-tf-hot-removal-auto-audio-recovery-design.md](superpowers/specs/2026-09-08-tf-hot-removal-auto-audio-recovery-design.md)

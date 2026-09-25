@@ -120,6 +120,14 @@ reg [15:0] col_pixel;       // 当前行内已产出的像素数，0..W-1
 reg [15:0] row_index;       // 已产出的源行数，0..H-1
 
 wire header_match;
+// 时序（100 MHz）：头字节先打一拍再按下标写字段，把状态译码从字段寄存器的
+// ce 路径上拿掉；header_match（含 W*H 乘法）也打一拍。头校验在整个扇区
+// 读完（read_end）时才看结果，最后一个字段（第 33 字节）早在约 480 拍前
+// 就已写好，晚两拍没有影响。
+reg        hdr_cap_valid;
+reg [9:0]  hdr_cap_index;
+reg [7:0]  hdr_cap_data;
+reg        header_match_r;
 wire stream_pixel_valid;
 wire row_pixel_byte;
 wire pixels_complete;
@@ -143,7 +151,11 @@ wire src_h_ok = (header_height[31:16] == 16'd0) &&
 // 注意显式补零到 32 位再做乘法 —— 16bit*16bit 在 Verilog 里会按 16 位截断，
 // 而 1920*1080 = 2073600 需要 21 位。
 wire [31:0] src_pixels = {16'd0, header_width[15:0]} * {16'd0, header_height[15:0]};
-wire src_pixels_ok = (src_pixels >= MIN_SRC_PIXELS);
+// 乘法 + 比较打一拍（时序）；header_match 本身再打一拍成 header_match_r，
+// 都只在 read_end（最后字段写入后约 480 拍）才被采用。
+reg src_pixels_ok;
+always @(posedge clk)
+    src_pixels_ok <= (src_pixels >= MIN_SRC_PIXELS);
 
 // BMP 24bpp 行距：每行字节数向上取整到 4 的倍数
 //   src_row_bytes = W*3          （真正的像素字节数，W<=1920 -> <=5760，16 bit 足够）
@@ -252,6 +264,10 @@ always @(posedge clk or posedge rst) begin
         col_pixel                     <= 16'd0;
         row_index                     <= 16'd0;
         header_valid                  <= 1'b0;
+        hdr_cap_valid                 <= 1'b0;
+        hdr_cap_index                 <= 10'd0;
+        hdr_cap_data                  <= 8'd0;
+        header_match_r                <= 1'b0;
     end else begin
         done                 <= 1'b0;
         error                <= 1'b0;
@@ -259,6 +275,38 @@ always @(posedge clk or posedge rst) begin
         reader_abort         <= 1'b0;
         reader_file_sec_read <= 1'b0;
         bmp_data_wr_en       <= 1'b0;
+        hdr_cap_valid        <= 1'b0;
+        header_match_r       <= header_match;
+
+        if (hdr_cap_valid) begin
+            case (hdr_cap_index)
+                10'd0:  header_0 <= hdr_cap_data;
+                10'd1:  header_1 <= hdr_cap_data;
+                10'd2:  header_file_len[7:0] <= hdr_cap_data;
+                10'd3:  header_file_len[15:8] <= hdr_cap_data;
+                10'd4:  header_file_len[23:16] <= hdr_cap_data;
+                10'd5:  header_file_len[31:24] <= hdr_cap_data;
+                10'd10: pixel_offset[7:0] <= hdr_cap_data;
+                10'd11: pixel_offset[15:8] <= hdr_cap_data;
+                10'd12: pixel_offset[23:16] <= hdr_cap_data;
+                10'd13: pixel_offset[31:24] <= hdr_cap_data;
+                10'd18: header_width[7:0] <= hdr_cap_data;
+                10'd19: header_width[15:8] <= hdr_cap_data;
+                10'd20: header_width[23:16] <= hdr_cap_data;
+                10'd21: header_width[31:24] <= hdr_cap_data;
+                10'd22: header_height[7:0] <= hdr_cap_data;
+                10'd23: header_height[15:8] <= hdr_cap_data;
+                10'd24: header_height[23:16] <= hdr_cap_data;
+                10'd25: header_height[31:24] <= hdr_cap_data;
+                10'd28: bit_count[7:0] <= hdr_cap_data;
+                10'd29: bit_count[15:8] <= hdr_cap_data;
+                10'd30: compression[7:0] <= hdr_cap_data;
+                10'd31: compression[15:8] <= hdr_cap_data;
+                10'd32: compression[23:16] <= hdr_cap_data;
+                10'd33: compression[31:24] <= hdr_cap_data;
+                default: ;
+            endcase
+        end
 
         if ((abort) && (state != ST_IDLE))
             abort_pending <= 1'b1;
@@ -329,39 +377,15 @@ always @(posedge clk or posedge rst) begin
 
                 ST_HEADER_WAIT: begin
                     if (reader_file_sec_data_valid) begin
-                        case (header_byte_index)
-                            10'd0:  header_0 <= reader_file_sec_data;
-                            10'd1:  header_1 <= reader_file_sec_data;
-                            10'd2:  header_file_len[7:0] <= reader_file_sec_data;
-                            10'd3:  header_file_len[15:8] <= reader_file_sec_data;
-                            10'd4:  header_file_len[23:16] <= reader_file_sec_data;
-                            10'd5:  header_file_len[31:24] <= reader_file_sec_data;
-                            10'd10: pixel_offset[7:0] <= reader_file_sec_data;
-                            10'd11: pixel_offset[15:8] <= reader_file_sec_data;
-                            10'd12: pixel_offset[23:16] <= reader_file_sec_data;
-                            10'd13: pixel_offset[31:24] <= reader_file_sec_data;
-                            10'd18: header_width[7:0] <= reader_file_sec_data;
-                            10'd19: header_width[15:8] <= reader_file_sec_data;
-                            10'd20: header_width[23:16] <= reader_file_sec_data;
-                            10'd21: header_width[31:24] <= reader_file_sec_data;
-                            10'd22: header_height[7:0] <= reader_file_sec_data;
-                            10'd23: header_height[15:8] <= reader_file_sec_data;
-                            10'd24: header_height[23:16] <= reader_file_sec_data;
-                            10'd25: header_height[31:24] <= reader_file_sec_data;
-                            10'd28: bit_count[7:0] <= reader_file_sec_data;
-                            10'd29: bit_count[15:8] <= reader_file_sec_data;
-                            10'd30: compression[7:0] <= reader_file_sec_data;
-                            10'd31: compression[15:8] <= reader_file_sec_data;
-                            10'd32: compression[23:16] <= reader_file_sec_data;
-                            10'd33: compression[31:24] <= reader_file_sec_data;
-                            default: ;
-                        endcase
+                        hdr_cap_valid     <= 1'b1;
+                        hdr_cap_index     <= header_byte_index;
+                        hdr_cap_data      <= reader_file_sec_data;
                         header_byte_index <= header_byte_index + 10'd1;
                     end
 
                     if (reader_file_sec_read_end) begin
                         reader_abort <= 1'b1;
-                        if (header_match) begin
+                        if (header_match_r) begin
                             header_valid <= 1'b1;
                             state <= ST_HEADER_ABORT;
                         end else begin

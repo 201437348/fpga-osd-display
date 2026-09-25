@@ -373,6 +373,64 @@ task automatic make_extensible_pcm_wav;
     end
 endtask
 
+// 24-bit data chunk 长度边界：长度必须能被 6 整除，且不能超过文件剩余字节。
+// 覆盖 chunk_size_mod3 逐字节累积与 file_bytes_left 比较（时序优化改写处）。
+task automatic run_data_size_case;
+    input [31:0] data_size;
+    input [31:0] fsize;
+    input        expect_ok;
+    input [255:0] name;
+    integer index;
+    integer waited;
+    begin
+        // 上一个用例可能在扇区中途报错：等 SD 模型把残余字节吐完再复位
+        @(negedge clk);
+        abort = 1'b1;
+        @(negedge clk);
+        abort = 1'b0;
+        repeat (3) @(posedge clk);
+        while (serving || end_pending || request_complete)
+            @(posedge clk);
+        @(negedge clk);
+        rst = 1'b1;
+        repeat (2) @(posedge clk);
+        @(negedge clk);
+        rst = 1'b0;
+        repeat (2) @(posedge clk);
+        clear_disk();
+        clear_observations();
+        make_extensible_pcm_wav();
+        put_file_le32(90, data_size);
+        for (index = 0; index < 48; index = index + 1)
+            put_file_byte(94 + index, 8'h10 + index);
+        file_size = fsize;
+        $display("TEST data size %0d, file %0d (%0s)", data_size, fsize, name);
+        start_loader();
+        waited = 0;
+        while ((frame_count < 8) && !error_seen && (waited < 200000)) begin
+            @(posedge clk);
+            waited = waited + 1;
+        end
+        #1;
+        if (expect_ok) begin
+            expect_bit(error_seen, 1'b0, name);
+            expect_value(frame_count >= 8, 1, name);
+            // 第 1 帧 = 字节 94..99 的左/右高 16 位
+            expect_frame(0, 16'h1211, 16'h1514, name);
+        end else begin
+            expect_bit(error_seen, 1'b1, name);
+            expect_value(frame_count, 32'd0, name);
+        end
+        @(negedge clk);
+        abort = 1'b1;
+        @(negedge clk);
+        abort = 1'b0;
+        repeat (3) @(posedge clk);
+        while (serving || end_pending || request_complete)
+            @(posedge clk);
+    end
+endtask
+
 task automatic start_loader;
     begin
         @(negedge clk);
@@ -485,6 +543,14 @@ initial begin
     @(posedge error);
     #1;
     expect_value(frame_count, 32'd0, "invalid WAV emits no PCM frames");
+
+    run_data_size_case(32'd42, 32'd136, 1'b1, "42 bytes accepted (exactly fills file)");
+    run_data_size_case(32'd40, 32'd136, 1'b0, "40 bytes rejected (not multiple of 6)");
+    run_data_size_case(32'd41, 32'd136, 1'b0, "41 bytes rejected (odd)");
+    run_data_size_case(32'd0,  32'd136, 1'b0, "0 bytes rejected");
+    run_data_size_case(32'd48, 32'd136, 1'b0, "48 bytes rejected (exceeds file)");
+    run_data_size_case(32'd36, 32'd136, 1'b1, "36 bytes accepted (shorter than file)");
+    run_data_size_case(32'h01000002, 32'd136, 1'b0, "huge size rejected (top byte set)");
 
     $display("PASS tb_fat32_wav_loader");
     $finish;

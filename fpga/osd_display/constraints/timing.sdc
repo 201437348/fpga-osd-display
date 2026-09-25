@@ -55,6 +55,25 @@ set_clock_groups -exclusive \
     -group [get_clocks {hdmi_5x_clk}]
 
 
+# ------------------------------------------------------------
+# 5. 片内 SDRAM 相移时钟（第六讲 media_player_promax_top.sdc 同款处理）
+#    clkc[2] 只驱动 EG_PHY_SDRAM_2M_32 的采样时钟 Clk_sft，SDRAM 硬核自带
+#    IO 时序窗口；把 DQ 转发路径当普通 fabric setup 路径分析会产生固定的
+#    伪违例（原报告 ext_mem_clk <-> clkc[2] 的 -6.565 / -2.964 ns）。
+# ------------------------------------------------------------
+rename_clock -name {ext_mem_clk_sft} -source [get_ports {clk}] -master_clock {clk} [get_pins {sys_pll_m0/pll_inst.clkc[2]}]
+set_false_path -from [get_clocks {ext_mem_clk}]     -to [get_clocks {ext_mem_clk_sft}]
+set_false_path -from [get_clocks {ext_mem_clk_sft}] -to [get_clocks {ext_mem_clk}]
+
+# ------------------------------------------------------------
+# 5b. 复位
+#    rst_n 是按键异步输入；rst_all_reg 在 clk(50M) 域产生，单时钟域模块
+#    已经改用 top.v 里各域的两级同步复位（rst_sd/rst_mem/rst_vid），
+#    剩下的跨多时钟模块（frame_read_write、音频 FIFO、HDMI PHY）只在
+#    上电时释放一次，之后长期空闲，不需要按跨域数据路径分析。
+# ------------------------------------------------------------
+set_false_path -from [get_ports {rst_n}]
+set_false_path -from [get_regs {rst_all_reg*}]
 
 # ------------------------------------------------------------
 # 6. 可选：如果你的 frame_read_write 内部异步 FIFO 已经完全处理好了跨域，

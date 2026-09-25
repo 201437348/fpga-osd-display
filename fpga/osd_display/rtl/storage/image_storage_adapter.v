@@ -29,6 +29,12 @@ module image_storage_adapter #(
     // 直接来自 u_image_bilinear_scaler.src_overflow_count，上板把它接到
     // 数码管/LED 就能一眼判断"是不是被反压丢了像素"。
     output wire [7:0]  scaler_overflow_count,
+    // 当前**正在显示**的图片信息（source_done_pulse 时锁存，给 OSD 信息行用）
+    // shown_scale_x100 = 缩放比 x100（例：33 -> 0.33，106 -> 1.06）
+    output reg [15:0]  shown_img_width,
+    output reg [15:0]  shown_img_height,
+    output reg [15:0]  shown_scale_x100,
+    output reg         shown_info_pulse,
 
     // ---- 上板诊断（全部只读，不参与任何控制流）----
     // load_diag_state  : fat32_bmp_loader 状态码
@@ -154,12 +160,51 @@ wire        scaler_src_afull;
 wire [15:0] loader_src_width;
 wire [15:0] loader_src_height;
 wire        loader_header_valid;
+wire [15:0] scaler_img_width;
+wire [15:0] scaler_img_height;
+wire [15:0] scaler_scale_x100;
+wire        scaler_info_valid;
 
 localparam [24:0] SD_RESPONSE_TIMEOUT_CYCLES =
     (SD_CLK_FREQ_HZ / 1000) * SD_RESPONSE_TIMEOUT_MS;
 
 reg write_req_ack_meta;
 reg write_req_ack_sync;
+
+// ---------------------------------------------------------------------------
+// 写通道就绪门控
+// frame_fifo_write 的握手：req 高 -> ack 高且**持续清空 write_buf**
+// -> loader 撤 req -> 写模块释放清空并拉低 ack。
+// 缩放器在 header_valid 后几十拍就能开始输出（上黑边不依赖源像素），
+// 若此时写通道还没握手完，像素会被 FIFO 清空吃掉 -> 帧写不满 307200
+// -> write_done 永远不来 -> 板上卡在加载中（1920x1080 实测复现）。
+// 所以必须等到 ack 先高后低（清空已释放）才放行缩放器输出。
+// ---------------------------------------------------------------------------
+reg  write_ack_seen;
+reg  write_granted;
+// 时序（100 MHz）：afull 是异步 FIFO 里指针相减再比较的组合输出，直接进缩放器
+// 状态机是 -1.37ns 的违例路径，这里先打一拍。FIFO 深 512、afull 阈值 256，
+// 晚一拍最多多写 1 个字，余量充足。
+reg  write_fifo_afull_q;
+always @(posedge clk or posedge core_rst) begin
+    if (core_rst) write_fifo_afull_q <= 1'b1;
+    else          write_fifo_afull_q <= write_fifo_afull;
+end
+wire scaler_out_stall = write_fifo_afull_q || !write_granted;
+
+always @(posedge clk or posedge core_rst) begin
+    if (core_rst) begin
+        write_ack_seen <= 1'b0;
+        write_granted  <= 1'b0;
+    end else if (loader_start) begin
+        write_ack_seen <= 1'b0;
+        write_granted  <= 1'b0;
+    end else if (write_req_ack_sync) begin
+        write_ack_seen <= 1'b1;
+    end else if (write_ack_seen) begin
+        write_granted  <= 1'b1;
+    end
+end
 
 reg [31:0] selected_file_cluster;
 reg [31:0] selected_file_size;
@@ -183,6 +228,20 @@ assign load_owner_active = (state == ST_LOAD_START) ||
 always @* begin
     selected_file_cluster = image_cluster[target_image_index];
     selected_file_size    = image_size[target_image_index];
+end
+
+// 时序（100 MHz）：8 选 1 的 32 位簇号/大小再做比较，原来直接进 loader_start。
+// 管理器改 target_image_index 后至少隔两拍才发 load_start（ST_SELECT 先空等一拍），
+// 所以这里打一拍的检查结果在 load_start 时已对应当前 target。
+reg selected_ok_q;
+always @(posedge clk or posedge core_rst) begin
+    if (core_rst)
+        selected_ok_q <= 1'b0;
+    else
+        selected_ok_q <= ({1'b0, target_image_index} < scan_found_count) &&
+                         (selected_file_cluster >= 32'd2) &&
+                         (selected_file_size != 32'd0) &&
+                         (volume_sectors_per_cluster != 8'd0);
 end
 
 // write_req_ack is generated in ext_mem_clk; the loader consumes it in clk.
@@ -283,10 +342,9 @@ always @(posedge clk or posedge core_rst) begin
                         scan_done                  <= 1'b0;
                         scan_found_count           <= 4'd0;
                         scan_error_seen            <= 1'b0;
-                        for (img_i = 0; img_i < IMG_SLOT_COUNT; img_i = img_i + 1) begin
-                            image_cluster[img_i] <= 32'd0;
-                            image_size[img_i]    <= 32'd0;
-                        end
+                        // 不再清 image_cluster/image_size（8x2x32 位，清零的使能路径
+                        // 扇出很大，-0.55ns）：scan_found_count 已清零，扫描时按序重写，
+                        // selected_ok_q 要求 target < scan_found_count，旧条目不会被用到。
                         volume_first_fat_lba       <= 32'd0;
                         volume_first_data_lba      <= 32'd0;
                         volume_sectors_per_cluster <= 8'd0;
@@ -297,10 +355,7 @@ always @(posedge clk or posedge core_rst) begin
                         directory_start            <= 1'b1;
                         state                      <= ST_SCAN_START;
                     end else if (load_start) begin
-                        if ((target_image_index < scan_found_count) &&
-                            (selected_file_cluster >= 32'd2) &&
-                            (selected_file_size != 32'd0) &&
-                            (volume_sectors_per_cluster != 8'd0)) begin
+                        if (selected_ok_q) begin
                             loader_start <= 1'b1;
                             state        <= ST_LOAD_START;
                         end else begin
@@ -499,12 +554,34 @@ image_bilinear_scaler #(
     .src_valid      (loader_bmp_data_wr_en),
     .src_afull      (scaler_src_afull),
     .src_overflow_count (scaler_overflow_count),
-    .out_stall      (write_fifo_afull),
+    .out_stall      (scaler_out_stall),
     .dst_data       (scaler_dst_data),
     .dst_valid      (scaler_dst_valid),
     .dst_done       (scaler_dst_done),
-    .error_code     (scaler_error_code)
+    .error_code     (scaler_error_code),
+    .img_width      (scaler_img_width),
+    .img_height     (scaler_img_height),
+    .scale_x100     (scaler_scale_x100),
+    .info_valid     (scaler_info_valid)
 );
+
+// 加载完成（新图开始显示）时锁存源尺寸和缩放比
+always @(posedge clk) begin
+    if (core_rst) begin
+        shown_img_width  <= 16'd0;
+        shown_img_height <= 16'd0;
+        shown_scale_x100 <= 16'd0;
+        shown_info_pulse <= 1'b0;
+    end else begin
+        shown_info_pulse <= 1'b0;
+        if (source_done_pulse && scaler_info_valid) begin
+            shown_img_width  <= loader_src_width;
+            shown_img_height <= loader_src_height;
+            shown_scale_x100 <= scaler_scale_x100;
+            shown_info_pulse <= 1'b1;
+        end
+    end
+end
 // scaler_dst_done / scaler_error_code 当前未参与控制流，留给 M6 的
 // OSD 标注与 7 段数码管显示用（bit0 = 源尺寸非法，bit1 = 输出像素数不符）。
 

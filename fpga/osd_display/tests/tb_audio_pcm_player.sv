@@ -29,6 +29,7 @@ audio_pcm_player #(
     .PREFILL_FRAMES(10'd2)
 ) dut (
     .clk(clk),
+    .volume(4'd8),
     .rst(rst),
     .enable(enable),
     .fifo_empty(fifo_empty),

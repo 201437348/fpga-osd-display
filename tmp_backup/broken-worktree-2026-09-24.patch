@@ -1,0 +1,3353 @@
+diff --git a/docs/contest-delivery-guide.md b/docs/contest-delivery-guide.md
+index ef91829..4bbd48e 100644
+--- a/docs/contest-delivery-guide.md
++++ b/docs/contest-delivery-guide.md
+@@ -90,7 +90,7 @@ TF 卡必须使用 FAT32 文件系统，媒体文件放在根目录。
+ 
+ ## 追溯资料
+ 
+-- 研发与板测连续记录：[osd-display-migration.md](osd-display-migration.md)
+-- 项目路线和历史诊断：[project-roadmap.md](project-roadmap.md)
++- 研发与板测连续记录：[history/migration.md](history/migration.md)
++- 项目路线：[roadmap.md](roadmap.md)；历史诊断流水账：[history/board-log.md](history/board-log.md)
+ - 音频优化设计：[2026-09-08-optimized-tf-wav-hdmi-audio-design.md](superpowers/specs/2026-09-08-optimized-tf-wav-hdmi-audio-design.md)
+ - TF 热拔插恢复设计：[2026-09-08-tf-hot-removal-auto-audio-recovery-design.md](superpowers/specs/2026-09-08-tf-hot-removal-auto-audio-recovery-design.md)
+diff --git a/docs/new-features-usage.md b/docs/new-features-usage.md
+index ea2c6c8..3c40a03 100644
+--- a/docs/new-features-usage.md
++++ b/docs/new-features-usage.md
+@@ -46,17 +46,27 @@
+ 
+ ### 1.3 怎么放图
+ 
+-- 工程是**按物理扇区扫描**找 `BM` 文件头（不是真正走 FAT32 目录），
+-  扫描范围是前 `131072` 个扇区 = **前 64 MiB**。所以图片必须位于卡的前
+-  64 MiB 内，并且数据**连续存放**。
++- 工程走的是**真正的 FAT32 根目录枚举**（`fat32_directory_scan`），
++  不是按物理扇区盲扫。文件数据按 **FAT 簇链**读取
++  （`fat32_file_sector_reader`，`MAX_FILE_CLUSTERS = 0xFFFF`），
++  所以**文件碎片化不影响**，也没有"必须在前 64 MiB 内"的限制。
++- **文件名必须是 8.3 短名且扩展名为 `BMP`**（匹配条件为短名最后三字节
++  等于 `'B''M''P'`）。Windows 创建的长文件名会生成大写 8.3 别名，
++  一般能匹配；但最稳妥是直接命名成 `A1.BMP` … `A8.BMP`。
++- 只扫描**根目录**（`MAX_ROOT_DIR_CLUSTERS = 64`）。
+ - 图片数量上限从 4 张提高到 **8 张**（`SCAN_TARGET_COUNT = 8`，
+-  索引位宽同步从 2 位扩到 3 位）。
++  索引位宽同步从 2 位扩到 3 位）；取目录顺序里的前 8 个。
++- 音频文件必须严格命名为 `BGM.WAV`。
+ - 换图/轮播仍用原来的按键，行为不变。
+ 
+ ---
+ 
+ ## 2. 亮度/对比度菜单怎么用
+ 
++> **完整版见 [亮度/对比度调节与全部按键使用手册](brightness-contrast-and-keys-guide.md)**
++> （含 KEY1/KEY2/KEY3 全部按键行为、逐步操作场景、陷阱与排查表）。
++> 下面只保留速查内容。
++
+ ### 2.1 硬件
+ 
+ | 器件 | 引脚 | 作用 |
+diff --git a/docs/osd-display-migration.md b/docs/osd-display-migration.md
+index bde4998..7b3baea 100644
+--- a/docs/osd-display-migration.md
++++ b/docs/osd-display-migration.md
+@@ -1,1393 +1,6 @@
+-# Formal Video Baseline Migration
++# 本文件已迁移（勿在此继续编辑）
+ 
+-Date: 2026-09-13
+-Current status: line-buffer horizontal transition board-validated; stable baseline frozen
++> This file was moved on 2026-09-24. The migration record now lives at
++> [`docs/history/migration.md`](history/migration.md).
+ 
+-## Migration boundary
+-
+-`fpga/osd_display` is an independent TD 6.2.1 project for the formal video
+-baseline. The diagnostic project at `fpga/tf_hdmi_diag` remains unchanged as a
+-phase-0 reference. The official resource package is not modified.
+-
+-The first migration copy contains every HDL, IP and constraint referenced by
+-the June pure-video `.al` project, including files marked `AutoExcluded` by TD.
+-The project top is `rtl/top/top.v`; its current behavior is the validated
+-10-second timeout baseline. Generated `_Runs`, logs and programming artifacts
+-are excluded by the repository rules.
+-
+-The IPC files also require their generated support files to remain beside the
+-IPC: both FIFO `.tcl` files and the `sys_pll.vhd` / `video_pll.vhd` companions
+-are included, even though the active build selects the Verilog implementations.
+-
+-Two vendor include paths had to be adapted to the new local directory layout:
+-
+-- `rtl/vendor/include/sdr_init_ref.enc.v` now includes `global_def.v` from its
+-  own include directory.
+-- `rtl/vendor/SD/sdram.v` now includes `../include/global_def.v`.
+-
+-The adapted file hashes and the pre-adaptation source hashes are recorded in
+-`fpga/osd_display/vendor-manifest.sha256`.
+-
+-## Tested project-owned boundary
+-
+-`rtl/control/image_load_manager.v` is a standalone control boundary for the
+-next migration step. It provides:
+-
+-- explicit reset, scan, load, verify, commit, idle and recovery states;
+-- a ten-second parameterized load guard;
+-- up to two retries per image;
+-- test-pattern fallback after repeated first-image failure;
+-- previous-frame retention when a later image fails;
+-- inactive-buffer selection for atomic frame commits;
+-- storage-loss recovery without invalidating an already displayed frame.
+-
+-It is intentionally not connected to the migrated top until the functionally
+-equivalent TD build and board test have passed.
+-
+-## Verification status
+-
+-`tests/tb_image_load_manager.sv` passes with shortened timeout parameters in
+-Icarus Verilog. TD `syn_1`/`phy_1`, JTAG equivalence, configuration-Flash cold
+-starts, SDRAM timing review and the 30-minute automatic-play test are pending
+-hardware/tool execution. A full top-level Icarus compile is not a valid
+-replacement for TD: the migrated design contains vendor-encrypted HDMI/SDRAM
+-wrappers and Anlogic primitives that Icarus cannot parse or elaborate. The
+-project-owned control boundary is therefore tested separately, while the
+-functionally equivalent top is reserved for TD validation.
+-
+-### TD 6.2.1 migration build
+-
+-On 2026-09-03, TD 6.2.1 completed `syn_1` and `phy_1` for
+-`osd_display.al`; bitgen completed at 16:40:25. The two bit locations below
+-have the same SHA256:
+-
+-```text
+-05ca4640de35fee1f58a5d7889c58da3175029d0be588300fb5017fb15919a4d
+-osd_display_Runs/best_result/osd_display.bit
+-osd_display_Runs/phy_1/osd_display.bit
+-```
+-
+-Final implementation resources were 3538 LUT, 3113 registers, 14 BRAM9K,
+-2 PLL and 2 global clocks. IPC load errors are resolved. Final routed timing
+-was `SWNS=-6.565ns`, `STNS=-296.897ns`, `HWNS=0.000ns` and `HTNS=0.000ns`.
+-The remaining critical warnings are inherited from the diagnostic baseline:
+-both requested `U3/sdram` locations are not honored, and the phase-shifted
+-`U3/u2_ram/SDRAM_CLK` uses one local routing segment. The negative SDRAM
+-timing must be investigated before this baseline can be accepted as timed.
+-
+-The next acceptance operation is JTAG-only equivalence testing. Do not write
+-configuration Flash until JTAG behavior, reset, manual switching and automatic
+-play have passed.
+-
+-### JTAG equivalence result
+-
+-JTAG testing of the migration bit completed successfully on 2026-09-03 with
+-the established board, HDMI connection and TF card containing four official
+-BMP images. First image display, `KEY1` user reset, `KEY2` manual switching
+-and `KEY4` automatic-play control all behaved correctly.
+-
+-The first image appeared about 22 seconds after power-on. The diagnostic
+-baseline exhibits the same delay. `LOAD_TIMEOUT_SECONDS=10` is only the guard
+-that starts after an image load has begun; it is not a boot-to-picture delay.
+-The observed 22 seconds include TF initialization, physical-sector scanning
+-and first-frame transfer. No startup-time optimization is part of this
+-reliability-baseline acceptance step.
+-
+-Next: program only the FPGA configuration Flash, perform three power-off cold
+-starts with the same TF card and HDMI setup, and record the first-image result
+-and approximate display time for each start.
+-
+-### Configuration Flash cold-start result
+-
+-The configuration-Flash image was programmed from the validated migration
+-bitstream. Three power-off cold starts completed successfully with the same
+-board, TF card and HDMI setup. Each boot displayed the first image after about
+-22 seconds, matching the JTAG and diagnostic-baseline result.
+-
+-The next board acceptance operation is a 30-minute automatic-play run. Enable
+-automatic play with `KEY4` only after the first image is visible; verify that
+-images continue to switch, the HDMI output stays locked, and `KEY2` / `KEY4`
+-remain responsive near the end of the run.
+-
+-### Automatic-play result
+-
+-The 30-minute automatic-play run completed successfully. HDMI output remained
+-stable, images continued to switch, and the manual/automatic-play controls
+-remained responsive. The migration-equivalence baseline is therefore accepted
+-for normal TF-card operation. The next implementation boundary is the tested
+-image-load recovery manager, followed by fault-injection board tests and the
+-separate SDRAM timing review.
+-
+-### Recovery-control integration status
+-
+-The recovery controller is now connected in `rtl/top/top.v` without changing
+-the TF/BMP reader, frame FIFO, SDRAM interface or HDMI transport path. The
+-new top-level control boundary uses `image_storage_adapter` for the vendor
+-reader, `image_load_manager` for scan/load/commit/retry control, and
+-`image_playback_control` for `KEY2` manual switching and `KEY4` automatic
+-play. The SDRAM write-finish event crosses back to the manager through a
+-synchronized toggle. Manager display state and buffer selection are
+-synchronized into the video clock domain before they select output pixels.
+-
+-Project-owned simulations passed on 2026-09-03:
+-
+-- `tb_image_load_manager`: first-frame commit, retry, skip, previous-frame
+-  retention, storage loss and fallback behavior.
+-- `tb_image_storage_adapter`: final scan-sector capture, stale scan-complete
+-  rejection, source busy-to-ready completion and abort suppression.
+-- `tb_image_playback_control`: button debounce, manual next, automatic play
+-  and automatic-request suppression during an auto-play toggle.
+-- A top-level syntax/elaboration check passed using local black boxes for the
+-  encrypted vendor IP. It checks project-owned ports and connections only; it
+-  is not a substitute for TD.
+-
+-This integration is not yet TD-built or board-validated. The required next
+-operation is a TD `syn_1`, `phy_1` and bitgen build from the root
+-`osd_display.al`, followed by JTAG-only normal-card equivalence testing.
+-Do not overwrite configuration Flash with this integration build before first
+-image display, `KEY1` reset, `KEY2` manual next and `KEY4` automatic play all
+-pass. Fault injection and the separate SDRAM timing review remain pending.
+-
+-### Recovery-control and FIFO-throttle board result
+-
+-The integrated recovery path and sector-based write-FIFO throttle have now
+-passed TD build and board validation. With no TF card present at boot, the
+-design displays the colour-bar fallback. If a valid image is already shown,
+-removing the TF card and requesting the next image retains that image. After
+-the card is reinserted and initialization completes, manual switching and
+-automatic play recover normally.
+-
+-The short-interval button cases were also retested. Request coalescing,
+-recovery-state convergence and sector throttling removed the observed long
+-`341100` retry and the `321100` wait condition. First-image display, manual
+-switching, automatic play and TF removal/reinsertion recovery all passed on
+-the established board, card, four-BMP and HDMI setup.
+-
+-### SDRAM timing review and pending clock-derate experiment
+-
+-The routed `SWNS=-6.565ns` is a real SDRAM hard-macro DQ timing violation,
+-not a path to suppress. The worst path is from `ext_mem_clk` to the
+-180-degree `sys_pll_m0/pll_inst.clkc[2]` DQ domain; the reverse direction is
+-`-2.908ns`. The official 2026-06-05 `lab_ex4_tf` routed report has the same
+-path groups and the same `-6.565ns` worst slack. This establishes that the
+-issue predates this project's recovery controller and FIFO changes.
+-
+-The approved experiment changes only `sys_pll` C1/C2 from 125 MHz (0/180
+-degrees) to 41.667 MHz (0/180 degrees). The generated Verilog and active IPC
+-now use divide-by-24, with phase taps 23 and 11 respectively. The 100 MHz SD
+-clock, 25 MHz video clock, 125 MHz HDMI serial clock, RTL and constraints are
+-unchanged. This source change is awaiting a TD build and JTAG-only board
+-test; configuration Flash must not be programmed. Passing requires
+-non-negative setup slack in both DQ directions plus normal first image,
+-manual/close-spaced switching, automatic play and TF-card recovery. Rollback
+-is C1/C2 divide-by-8 with phase taps 7 and 3.
+-
+-### Clock-derate result: rejected
+-
+-The 41.667 MHz TD build completed on 2026-09-04. Routed timing was
+-`SWNS=-1.526ns`, `STNS=-7.172ns`, `HWNS=0.037ns` and `HTNS=0.000ns`. The
+-specific SDRAM DQ groups passed: `ext_mem_clk -> clkc[2]` was `+4.983ns` and
+-`clkc[2] -> ext_mem_clk` was `+1.435ns`. Remaining negative paths are the
+-`rst_all` release path from `clk` to `ext_mem_clk` (`-0.823ns`) and the
+-asynchronous-FIFO-clear path from `ext_mem_clk` to `sd_card_clk` (`-1.526ns`).
+-
+-JTAG functional validation rejects the 41.667 MHz version. First image and
+-ordinary manual switching work, but automatic playback repeatedly reaches
+-`341100` for about ten seconds before `341002` and a retry eventually switches
+-the image. The digits mean the BMP source completed but the SDRAM full-frame
+-write completion was never observed; error `2` confirms the ten-second load
+-timeout. The same timeout can occur on a single manual request after TF-card
+-removal and reinsertion, so it is not an auto-play button issue. The reduced
+-clock cannot complete all write-frame transactions reliably. Do not program
+-this build to configuration Flash; retain the accepted 125 MHz Flash image
+-and restore the experiment's divide-by-8 PLL parameters before other timing
+-closure work. On 2026-09-04 the workspace IPC and generated Verilog were
+-restored to C1/C2 divide-by-8 with phase taps 7 and 3; TD and JTAG rollback
+-verification then passed. The 15:17 routed report is `SWNS=-6.565ns`,
+-`STNS=-299.804ns`, `HWNS=0.011ns` and `HTNS=0.000ns`; the DQ groups are
+-`-2.908ns` from `ext_mem_clk` to `clkc[2]` and `-6.565ns` in reverse. The
+-JTAG bit SHA256 is
+-`ad7ed0cdf25b65593158fa4af513758625fdefe1d183d7260805b6d8bb8702b9`.
+-The established automatic-play and TF-card recovery behavior returned with
+-no `341100` timeout. This bit was not written to configuration Flash.
+-
+-### Session handoff
+-
+-This session is complete. The recovery controller, TF-card fallback and
+-reinsertion behavior, close-spaced button handling, and sector-based
+-write-FIFO throttling are board-validated. The configuration Flash remains
+-on the previously accepted 125 MHz baseline; the clock-derate experiment has
+-not been programmed to Flash.
+-
+-The next work must not be another blind SDRAM-frequency experiment. Keep the
+-accepted 125 MHz JTAG and Flash baselines unchanged while separately designing
+-the `rst_all` release crossing, the `ext_mem_clk -> sd_card_clk` FIFO-clear
+-protocol and a throughput-preserving solution for the 125 MHz SDRAM DQ paths.
+-
+-### Reset-release synchronization experiment: reverted
+-
+-On 2026-09-04, a three-stage asynchronous-assertion/synchronous-release reset
+-wrapper was added for `sd_card_clk`, `ext_mem_clk` and `video_clk`. The local
+-tests, TD build and bit generation passed. Routed timing was `SWNS=-6.565ns`,
+-`STNS=-300.403ns`, `HWNS=0.011ns`, `HTNS=0.000ns`; the project-owned
+-`clk -> ext_mem_clk` reset path became positive at `+0.494ns`. The existing
+-`ext_mem_clk -> sd_card_clk` FIFO-clear crossing remained negative at
+-`-1.124ns`.
+-
+-JTAG validation failed acceptance: after the first image, repeated manual
+-requests and some TF remove/reinsert recovery cases frequently entered
+-`341100` for about ten seconds, then `341002` and retry. The code means the
+-BMP source completed but the SDRAM full-frame write completion did not return.
+-The stable 125 MHz rollback behavior was not preserved. The changed source
+-could have altered placement/routing and exposed the pending FIFO-clear issue,
+-so this result does not prove the reset wrapper alone is the root cause.
+-
+-The reset wrapper, its top-level connections and both TD project-list entries
+-were removed. Its generated bitstream hash was
+-`608F9430C264611843FC6D1D26761290F0155580AFDD48736C0D072EC39C3011`; do not
+-program it to configuration Flash. The current source is restored to the
+-pre-experiment reset topology. Rebuild it in TD and JTAG-test the established
+-normal-card sequence before taking the next timing-closure step.
+-
+-The rollback rebuild and JTAG retest then passed. TD bit generation completed
+-at 16:04 on 2026-09-04 with routed timing `SWNS=-6.565ns`,
+-`STNS=-299.804ns`, `HWNS=0.011ns` and `HTNS=0.000ns`. The rebuilt JTAG bit is
+-`osd_display_Runs/phy_1/osd_display.bit`, SHA256
+-`32F292C2C1E2E7DFC9174598F3718349F87540F80D01A5629436B2CEB749ACB4`.
+-Board behavior returned to the pre-experiment 125 MHz baseline. This bit is
+-accepted only as the current JTAG baseline; configuration Flash was not
+-updated.
+-
+-### OSD v1: visual validation passed; storage stability remains unresolved
+-
+-On 2026-09-04, work moved to a visible feature that is isolated from the
+-unresolved SDRAM and CDC timing debt. `rtl/video/video_osd_overlay.v` adds an
+-always-visible OSD entirely in the 25 MHz `video_clk` domain. It is inserted
+-after image/fallback selection and before the existing RGB-to-AXIS converter.
+-It has a dark-blue top bar with `OSD DISPLAY` and a dark-blue bottom bar with
+-one of `WAIT TF`, `FALLBACK`, `IMAGE B0`, or `IMAGE B1`. The selected status
+-uses only the video-domain-safe display state, so the TF, SDRAM, FIFO, clock,
+-reset, button, CDC and encrypted HDMI paths are unchanged.
+-
+-The OSD module is registered in both `osd_display.al` project lists. Icarus
+-unit tests passed for OSD transparency, bar background, title glyph, all
+-status colours and buffer indication. The existing image-load manager,
+-playback control, BMP throttle and storage-adapter tests also passed, as did a
+-top-level syntax/connection check using vendor stubs.
+-
+-The TD build and JTAG board test then completed. The OSD remains visible
+-during first-image display, manual next, automatic playback, TF removal and
+-TF reinsertion. Its bottom status is correct in those cases, including the
+-intentional retained-image `IMAGE B0`/`IMAGE B1` status after card removal and
+-the `FALLBACK` status when the fallback colour pattern is displayed.
+-
+-This confirms the OSD itself, but it does not create a stable new playback
+-baseline. Manual next has intermittent `341100` timeouts; automatic playback
+-and post-reinsertion loading show the same timeout at a lower rate. The
+-timeout still means that the BMP source completed while the SDRAM full-frame
+-write completion did not return before the ten-second protection limit. The
+-OSD has no connection to that control path other than changing the overall
+-implementation placement.
+-
+-The 16:44 routed report for this build is `SWNS=-6.565ns`,
+-`STNS=-294.223ns`, `HWNS=+0.004ns` and `HTNS=0.000ns`; bit SHA256 is
+-`F8C1754F9332C7B89BB122DC683783E80078784F781B4788251D655073876077`.
+-The worst path remains SDRAM DQ input timing, from
+-`sys_pll_m0/pll_inst.clkc[2]` through `U3/sdram.dq[*]` to the
+-`ext_mem_clk` capture registers, at `-6.565ns`. The opposite DQ direction is
+-`-2.829ns`, slightly better than the accepted baseline's `-2.908ns`; therefore
+-the report does not support claiming that OSD worsened the worst setup path.
+-The total hold margin did fall from `+0.011ns` to `+0.004ns`, which leaves
+-essentially no implementation margin.
+-
+-The report also confirms the separate FIFO-clear crossing: the
+-`ext_mem_clk`-registered
+-`frame_read_write_m0/frame_fifo_write_m0/fifo_aclr` signal combinationally
+-reaches `image_storage_adapter_m0/u_bmp_read` state logic in the
+-`sd_card_clk` domain with `-0.974ns` setup slack. This is the concrete path to
+-use when reviewing Anlogic asynchronous-FIFO clear/reset guidance; it must not
+-be dismissed as a harmless timing-report artefact without checking the IP's
+-documented reset protocol.
+-
+-Keep the OSD source for further work, but do not program this bit to
+-configuration Flash and do not treat it as a stable replacement for the
+-accepted 125 MHz JTAG baseline. The next technical task is not another blind
+-feature or frequency change: obtain Anlogic documentation or a verified
+-reference for `EG_PHY_SDRAM_2M_32`/the generated SDRAM hard macro, its
+-PLL-phase and DQ timing requirements, and the asynchronous FIFO reset/clear
+-requirements. Those two boundaries must be understood before layout-sensitive
+-playback reliability can be claimed.
+-
+-### Official FIFO/SDRAM evidence and approved acknowledgement CDC repair
+-
+-On 2026-09-04, the official IPUG012 Soft FIFO manual and APUG011 high
+-performance SDRAM reference were reviewed. The generated project FIFO RTL
+-matches IPUG012's asynchronous-assertion, per-clock synchronous-release reset
+-mode: both FIFO instances include independent read- and write-clock release
+-registers. IPUG012 specifies release after four local clock cycles and warns
+-not to disable its generated Gray-pointer CDC timing constraints. Therefore
+-the routed net name `fifo_aclr` is not evidence that the FIFO reset protocol
+-needs to be replaced; neither the FIFO IP nor its clock constraints will be
+-changed in this step.
+-
+-The review instead found a concrete, independent CDC defect. `write_req`
+-crosses from the SD reader into `ext_mem_clk` through three registers in
+-`frame_fifo_write`, but its reverse `write_req_ack` was sampled directly by
+-the SD-clocked `bmp_read` state machine. Synthesis can merge that register
+-with `fifo_aclr`, explaining the routed report's `fifo_aclr` name at the
+-reader endpoint. The approved repair adds a two-stage synchronizer in
+-`image_storage_adapter` and connects only the synchronized level to
+-`bmp_read`. The request/acknowledgement remains a level handshake, so the
+-extra two SD-clock cycles cannot lose the acknowledgement.
+-
+-APUG011 also confirms the separate SDRAM limitation: actual board frequency
+-and phase may cause a one-cycle SDRAM data error and must be adjusted for the
+-hardware; transactions must respect SDRAM busy/refresh state. This repair does
+-not claim to close the existing SDRAM DQ timing violations. It is a bounded
+-CDC correction to be built and tested by JTAG only before further SDRAM work.
+-
+-Implementation is now present in `rtl/storage/image_storage_adapter.v`.
+-`bmp_read` receives `write_req_ack_sync`, the second of two SD-clocked
+-registers, instead of the raw acknowledgement. The adapter test now checks
+-both edges of that two-clock propagation. On 2026-09-04, the adapter,
+-load-manager, playback-control, BMP-throttle and OSD tests all passed in
+-Icarus, and a top-level port/connection elaboration using vendor black boxes
+-passed. TD `syn_1`, `phy_1`, bit generation, routed-report review and JTAG
+-board validation are still required; configuration Flash must remain unchanged.
+-
+-### Acknowledgement CDC implementation build
+-
+-TD `syn_1`, `phy_1` and bit generation completed at 17:38 on 2026-09-04 for
+-the acknowledgement CDC source. The generated JTAG bit is
+-`osd_display_Runs/phy_1/osd_display.bit`, SHA256
+-`F077F5A5746C6C85E63C64B868A44AC772D6EE733E3A981B673D976497CD4C60`.
+-Routed timing is `SWNS=-6.565ns`, `STNS=-292.832ns`, `HWNS=+0.011ns` and
+-`HTNS=0.000ns`; it does not regress the known worst SDRAM DQ setup path.
+-
+-The report confirms the intended CDC topology. The memory-side net that TD
+-still names `fifo_aclr` now ends at
+-`image_storage_adapter_m0/write_req_ack_meta_reg_syn_5`, the first stage of
+-the new SD-clock synchronizer, with `+1.132ns` setup and `+0.252ns` hold
+-slack. It no longer ends in `image_storage_adapter_m0/u_bmp_read` state
+-logic. The DQ direction from the SDRAM hard macro into `ext_mem_clk` remains
+-at `-6.565ns` and the reverse DQ direction remains at `-2.908ns`; neither is
+-changed or accepted by this CDC repair.
+-
+-Next: JTAG-only board validation of first image, repeated manual next,
+-close-spaced manual requests, automatic play, and TF removal/reinsertion.
+-Do not program configuration Flash with this bit.
+-
+-### Acknowledgement CDC first JTAG board result
+-
+-The acknowledgement CDC bit was JTAG-programmed and exercised on 2026-09-04.
+-First image display was normal. Repeated single manual-next requests issued as
+-soon as the preceding image completed did not produce a timeout. Multiple
+-manual-next pairs with approximately 0.5 seconds between the two presses also
+-completed normally. Automatic play completed multiple switch groups with no
+-`341100` timeout.
+-
+-TF removal/reinsertion retained the established recovery trace:
+-`341000`, then `341002`, then `540003`; after reinsertion and the next request
+-it showed `100003` and recovered to normal image operation. This is expected
+-recovery behavior, not a regression. The first JTAG run therefore passes the
+-targeted functional checks. It is not yet a configuration-Flash acceptance:
+-the remaining SDRAM DQ setup violation requires extended stress testing and
+-separate timing work.
+-
+-Extended JTAG stress then completed without any `341100` occurrence: 30
+-successive single manual-next operations, 20 manual double-press groups with
+-about 0.5 seconds between presses, 30 minutes of automatic play, and three
+-complete TF removal/reinsertion recovery cycles all passed. The two-flop
+-`write_req_ack` synchronizer is therefore accepted as the fix for the observed
+-intermittent acknowledgement CDC failure. The configuration Flash remains
+-unchanged because the independent hard-SDRAM DQ setup violations remain
+-negative; this source placement must not be represented as timing-closed.
+-
+-### C2 explicit global-clock route experiment: rejected and reverted
+-
+-On 2026-09-04, one controlled routing experiment inserted an explicit
+-`EG_LOGIC_BUFG` after the existing 125 MHz, 180-degree `sys_pll` C2 output and
+-before the unchanged SDRAM shifted-clock input. C1/C2 frequency and PLL phase
+-parameters, all protocol RTL, constraints, FIFO IP, OSD, and board settings
+-were unchanged.
+-
+-The 19:20 TD build proved that the route request took effect: TD retained
+-`sys_pll_m0/bufg_sdram_clk_sft`, identified `U3/u2_ram/SDRAM_CLK` as
+-BUFG-driven, and reported that all clock nets avoided local routing resources.
+-This removed the earlier local-route critical warning, but it did not improve
+-the real SDRAM interface. The DQ setup path from `ext_mem_clk` to C2 worsened
+-from `-2.908 ns` to `-2.964 ns`; the reverse C2-to-`ext_mem_clk` path worsened
+-from `-6.565 ns` to `-6.692 ns`. Final global timing was `SWNS=-6.692 ns`,
+-`STNS=-298.147 ns`, `HWNS=+0.012 ns`, and `HTNS=0.000 ns`.
+-
+-The inserted global buffer therefore adds harmful C2 insertion delay for this
+-hard-SDRAM path. The source was restored to the direct PLL-C2 connection and
+-matches the accepted CDC baseline again. The rejected bit SHA256 is
+-`3D5E2797E9B534F319DF68BF1F7B6628F98438F0362CFAB8FC607F1BED82ECCE`; do not
+-download it through JTAG or write it to configuration Flash. The local-route
+-warning is consequently an observation to retain, not a sufficient reason to
+-insert a generic BUFG.
+-
+-### SDRAM hard-macro audit: completed, placement is not user-editable
+-
+-The restored direct-C2 source was rebuilt on 2026-09-04 without programming
+-JTAG or configuration Flash. TD 6.2.168116 reports `SWNS=-6.565ns`,
+-`STNS=-292.832ns`, `HWNS=+0.011ns`, and `HTNS=0.000ns`. The two known SDRAM
+-DQ setup directions remain `-2.908ns` from `ext_mem_clk` to C2 and
+-`-6.565ns` from C2 to `ext_mem_clk`; this is the accepted acknowledgement-CDC
+-source, not a new timing result. The audit-only output bit SHA256 is
+-`21EFB4E31E9126737717D73197C90F39A01DEC16185D81D3123B163B168B4651`.
+-Its function was not board-tested, so it must not be downloaded or treated as
+-the board-validated `F077...4C60` CDC bit.
+-
+-The audit has resolved the confusing `PHY-7002` messages. TD first rejects
+-the imported `U3/sdram` initial coordinates `(12,12)` and later `(164,288)`,
+-but the final routed timing report places the actual hard-IP clock and DQ pins
+-at `x020y036`. The two rejected coordinates are not final locations.
+-
+-The report path also establishes the direct-C2 topology: PLL
+-`sys_pll_m0/pll_inst.clkc[2]` drives `U3/u2_ram/SDRAM_CLK` (fanout one), then
+-an internal pin at `x040y041`, then `clk0`, and finally `U3/sdram.clk` at
+-`x020y036`. TD explicitly reports that this net is routed on the clock mesh
+-but contains one local-routing segment. Thus the earlier local-route warning
+-is real, but the rejected explicit BUFG experiment already proved that
+-forcing a global buffer worsens both DQ setup directions.
+-
+-TD cannot safely expose more detail for this encrypted hard macro in the
+-current tool/device combination. The Tcl query
+-`report_cells U3/sdram -pin_loc -connection` immediately terminates TD, and
+-the implementation log says `report_clock_utilization` is unsupported for
+-`EG4S20BG256`. Do not rerun those Tcl commands. `constraints/pin.adc` has no
+-`U3/sdram` location, and no supported user constraint syntax or legal-site
+-map has been found. Do not guess or add a manual coordinate.
+-
+-The next SDRAM physical step, only if timing closure is required, is to obtain
+-from Anlogic a TD 6.2-compatible `EG_PHY_SDRAM_2M_32` reference/generated
+-wrapper for EG4S20BG256, including its legal hard-macro placement and C2 clock
+-topology. Until then, retain the board-validated direct-C2 CDC baseline and
+-do not attempt another frequency, phase, BUFG, or placement experiment.
+-
+-### Official-source cross-check: the SDRAM warnings are baseline behaviour
+-
+-On 2026-09-04, the official competition source at
+-`HX4S20_Contest_202606/赛题源码/anlogic_example/anlogic_example/lab_ex4_tf`
+-was checked against this project. Its completed `phy_1` run contains the same
+-two `PHY-7002` messages for `U3/sdram` initial locations `(12,12)` and
+-`(164,288)`, the same `PHY-5079` local-routing warning for PLL C2 to
+-`U3/u2_ram/SDRAM_CLK` (`Clock/Fanout 0/1`, `LocalWireNum 1`), and the same
+-worst C2-to-`ext_mem_clk` SDRAM DQ setup slack of `-6.565ns`.
+-
+-The current `rtl/vendor/SD/sdram.v` has the same hardware-macro topology as
+-the competition original: `sdr_as_ram` receives direct C1/C2 clocks and
+-instantiates `EG_PHY_SDRAM_2M_32` without any macro placement constraint.
+-The current `sdr_as_ram.enc.v` and `sdr_wrrd.enc.v` are byte-identical to the
+-competition originals. APUG011 independently provides the same BG256 hard
+-macro and direct C2 reference topology, with no SDRAM location in its ADC.
+-
+-These three observations establish that `PHY-7002`, the single C2 local wire,
+-and the reported DQ setup violation are present in the official baseline.
+-They must remain visible in timing reports, but they are not evidence that
+-this project needs a manual SDRAM placement, explicit C2 BUFG, or a replacement
+-wrapper. The board-validated direct-C2 acknowledgement-CDC baseline is the
+-correct design state. The prepared vendor question is not to be sent for these
+-warnings alone; retain it only if formal SDRAM timing closure becomes a separate
+-requirement.
+-
+-### FAT32 fragmented-BMP integration: RTL simulation complete, hardware not yet built
+-
+-On 2026-09-04, the active image source was changed from raw consecutive SD
+-sectors to FAT32 root-directory metadata and file-cluster chains. The vendor
+-`bmp_read.v` remains unchanged as a reference. The live path now uses these
+-project-owned modules in the SD-card clock domain:
+-
+-- `fat32_directory_scan.v` discovers up to four root-directory 8.3 BMP files
+-  and exports the validated FAT/data LBAs and sectors-per-cluster value;
+-- `fat32_file_sector_reader.v` maps sequential logical file sectors through
+-  the selected FAT32 cluster chain;
+-- `fat32_bmp_loader.v` validates a BMP header then streams logical sectors to
+-  the existing frame-write interface;
+-- `image_storage_adapter.v` owns the physical SD request, selects exactly one
+-  scanner or loader request source, caches the four file records, and retains
+-  the two-register write-acknowledgement synchronizer.
+-
+-The loader deliberately reads logical sector zero twice. The first pass parses
+-the BMP header without emitting pixels. It releases that completed reader
+-session, waits for the SDRAM frame-write acknowledgement, then starts a fresh
+-reader session from sector zero for pixel output. This avoids relying on the
+-acknowledgement arriving before the first sector's pixel bytes and needs no
+-new 512-byte buffer. FAT lookup sectors remain internal to the file reader.
+-
+-`image_load_manager.v` now receives `source_error_pulse`. An invalid BMP
+-header or damaged FAT chain aborts and retries immediately with diagnostic
+-code `5`; it no longer waits for the ten-second source timeout. Normal source
+-completion and SDRAM write completion are still both required before a frame
+-is committed. No physical-card removal detection was added, so the accepted
+-retained-frame hot-removal behavior and no-card cold-boot fallback remain
+-unchanged.
+-
+-The TD project file `osd_display.al` includes all three FAT32 source files.
+-The new tests `tb_fat32_bmp_loader.sv` and
+-`tb_fat32_image_storage_adapter.sv` passed in Icarus, as did the directory
+-scanner, file-sector reader, adapter, load-manager, playback-control,
+-BMP-throttle, and OSD regressions. The end-to-end adapter test uses real
+-scanner/reader/loader RTL and verifies raw SD request order
+-`0, 1, 3, 6, 6, 2, 20`: MBR, boot sector, root directory, header probe,
+-sector-zero data pass, FAT lookup, and the fragmented successor cluster.
+-A top-level Icarus elaboration using only the existing vendor black boxes also
+-passed.
+-
+-No TD `syn_1`, `phy_1`, bit generation, JTAG download, or configuration-Flash
+-write has been performed for this FAT32 integration. The next action is a TD
+-GUI synthesis and physical build. Before downloading, inspect that new source
+-files are present in the project and compare routed timing against the accepted
+-official baseline. Use JTAG only for the first board validation; do not write
+-configuration Flash until cold-boot and playback tests pass.
+-
+-### WAV/PCM HDMI background audio: RTL integration complete, board test pending
+-
+-On 2026-09-07, continuous background audio was added without changing the
+-SDRAM, video timing, frame-buffer, image-load manager, or existing recovery
+-behavior. The project reads one root-directory FAT32 file named exactly
+-`BGM.WAV` (8.3 entry `BGM     WAV`). It accepts only RIFF/WAVE PCM format 1,
+-48 kHz, stereo, 24-bit little-endian audio with a six-byte block alignment and
+-288000-byte-per-second rate. The track loops independently of image changes.
+-Missing, malformed, or unavailable audio produces zero PCM samples and does
+-not change image display or fallback behavior.
+-
+-`fat32_directory_scan.v` now continues past the fourth BMP file to discover
+-the BGM entry. `fat32_wav_loader.v` uses its own FAT32 file-sector reader, so
+-fragmented WAV cluster chains are supported. It validates RIFF chunks,
+-handles odd-byte chunk padding, checks complete stereo frames, preserves PCM
+-byte order, and restarts its file-chain reader at the data-chunk end. Its
+-write side feeds a 48-bit x 2048-frame generated asynchronous FIFO. The FIFO
+-crosses from `sd_card_clk` to `video_clk`; playback starts after 1024 frames,
+-refills below 512 frames, and pauses refills at 1536 frames. FIFO underflow
+-remains silent and retries refill rather than terminating the track.
+-
+-The one physical SD sector interface is now owned by
+-`sd_sector_arbiter.v`. It gives directory scanning first priority, audio
+-refill second, and image loading third, while holding any active sector grant
+-until the requester releases it and inserting a low-request handoff cycle.
+-No requester can preempt a sector already being transferred.
+-
+-`audio_pcm_player.v` generates 48 kHz enables directly from the 25 MHz video
+-clock using a fractional accumulator. It sends 24-bit PCM and silence during
+-prefill/underflow to the existing HDMI transmitter. `hdmi_audio_acr.v` emits
+-the official-style ACR cadence with `N=6144`. The HDMI transmitter remains
+-configured for `48K`; its formerly hardwired-zero PCM and ACR inputs are now
+-connected to this audio chain. Audible data is gated by video-domain
+-`display_valid`, so a first image commits before playback starts.
+-
+-The TD project list includes the new storage and audio RTL. Icarus simulations
+-passed for directory BGM discovery after four BMP entries, fragmented and
+-padded WAV parsing, PCM frame order across a sector boundary, looping,
+-invalid-format silence, arbitration priority/non-preemption, FIFO prefill and
+-underflow silence, ACR cadence, the end-to-end adapter path with BGM plus a
+-fragmented BMP load, and all existing image/OSD regressions. A top-level
+-project-owned structural elaboration with vendor blocks treated as black boxes
+-also passed.
+-
+-TD `syn_1`, `phy_1`, JTAG and Flash operations have not been run for this
+-audio integration. The next acceptance step is a TD GUI build followed by a
+-JTAG-only board test using a FAT32 TF card that contains the established BMP
+-files plus a compliant `BGM.WAV`. Confirm first-image display, continuous
+-audible loop, manual next, automatic play, TF removal/reinsertion, and silent
+-operation with no or invalid `BGM.WAV`. Do not write configuration Flash until
+-those JTAG checks pass.
+-
+-#### Official WAV compatibility update
+-
+-The official 2026 competition `lab_ex5_i2s` source contains
+-`src/user_source/hdl_source/python/1.wav`. It is 48 kHz, stereo, 24-bit PCM,
+-six-byte block-aligned and 288000 bytes/s, but is wrapped as the standard
+-`WAVE_FORMAT_EXTENSIBLE` container (`format=0xFFFE`) rather than the simpler
+-format-1 PCM header. Its sub-format GUID is the standard PCM GUID
+-`00000001-0000-0010-8000-00AA00389B71`, so it carries the same sample bytes
+-required by this project.
+-
+-On 2026-09-08 `fat32_wav_loader.v` was extended to accept only this explicit
+-extensible PCM form in addition to ordinary PCM format 1. It still rejects
+-compressed, floating-point, or other sub-format GUIDs. The official-style
+-40-byte `fmt ` chunk, `LIST/INFO` metadata, PCM byte order and looping were
+-added to `tb_fat32_wav_loader.sv` and passed, alongside the original PCM,
+-fragmentation, padding and invalid-format cases. The end-to-end FAT32 adapter,
+-PCM player, ACR and top-level structural regressions also passed. To use the
+-official file, copy it to the FAT32 TF root and rename it exactly `BGM.WAV`.
+-
+-#### Resource-optimized WAV media contract
+-
+-On 2026-09-08 the background-audio path was optimized for the final contest
+-demonstration. The recommended TF root file remains `BGM.WAV`, but its
+-required export format is now **RIFF/WAVE, signed PCM, 48000 Hz, stereo,
+-16-bit, little-endian**. This preserves the official HDMI 48 kHz transport and
+-`N=6144` ACR configuration while reducing TF bandwidth from 288000 to 192000
+-bytes/s.
+-
+-Audio is stored in a project-owned 32-bit x 1024-frame asynchronous FIFO
+-(left/right 16-bit samples), rather than the previous 48-bit x 2048-frame
+-FIFO. Playback begins with 512 frames, refills at or below 256 frames, and
+-stops a refill at 768 frames. The capacity is 21.33 ms at 48 kHz and lowers
+-estimated audio FIFO use from about 11 to about 4 BRAM9K blocks. At the HDMI
+-boundary, `audio_pcm_player.v` left-justifies each 16-bit channel by appending
+-eight zero LSBs to the transmitter's unchanged 24-bit PCM interface. This
+-matches the official I2S receiver's high-bit extraction; a plain sign
+-extension would attenuate the signal by 48 dB.
+-
+-For compatibility with the official `lab_ex5_i2s` 24-bit extensible sample,
+-the loader still accepts its exact PCM GUID and format. It intentionally drops
+-each 24-bit channel's least significant eight bits before putting the remaining
+-16 bits into the optimized FIFO. This makes the compatibility path safe but
+-not the recommended final media contract.
+-
+-Icarus passed the updated 16-bit padded/fragmented/looping WAV parser test,
+-the official 24-bit compatibility test with explicit truncation checks, the
+-negative-sample left-alignment PCM player test, the real FAT32 adapter test
+-with BGM and a fragmented BMP, the existing adapter test, the HDMI ACR test,
+-the sector-arbiter test, and structural top-level elaboration. TD `syn_1` and
+-`phy_1` completed on 2026-09-08 for this optimized version. Final utilization
+-is 8728/19600 LUTs (44.53%), 6255/19600 registers (31.91%), 24/64 BRAM9K
+-(37.50%), and 10/29 DSP blocks. The `u_audio_async_fifo` instance uses four
+-BRAM9K blocks, matching the optimization target. Final setup WNS is -6.565 ns
+-and hold WNS is +0.003 ns, with no hold failures; this is consistent with the
+-accepted project's existing setup-timing baseline. The next user action is
+-JTAG-only audio, manual-change, auto-play, TF removal, and TF reinsertion
+-checks using a suitable `BGM.WAV`.
+-
+-#### HDMI PCM left-alignment correction
+-
+-The first optimized board test produced audible but extremely quiet sound even
+-with display volume at maximum. The source file and HDMI audio cadence were
+-therefore working. The cause was the 16-bit-to-24-bit conversion: the player
+-had sign-extended samples into bits [15:0], while the HDMI transmitter path
+-uses the high sample bits, as shown by the official I2S receiver.
+-
+-On 2026-09-08 `audio_pcm_player.v` was corrected to drive
+-`{sample[15:0], 8'b0}` for both channels. This left-justifies each 16-bit PCM
+-sample, removes the 48 dB attenuation, and changes neither BRAM, DSP, clocks,
+-nor the `BGM.WAV` export format. The player test now checks positive and
+-negative left-aligned samples; it passed, as did post-fix top-level structural
+-elaboration. Re-run TD `syn_1` and `phy_1`, then JTAG-download and verify
+-volume before broader image and recovery checks.
+-
+-#### TF hot-removal automatic audio recovery
+-
+-Board testing after the HDMI volume fix established a separate TF recovery
+-gap. Immediate, ten-second, and long TF removal all silenced audio, but the
+-vendor SD core retained `sd_init_done`; the OSD therefore remained `IMAGE` or
+-`LOAD`, never entered `WAIT TF`, and reinsertion alone did not restart audio.
+-The previous user workaround was an image button press that eventually caused
+-the established failed-load recovery sequence (`341...`, then `540003`, then
+-a second press), at which point both image switching and BGM restarted. This
+-showed that the card and audio data were valid, but hot removal was invisible
+-to the existing control path.
+-
+-The board constraints expose no TF card-detect input, and the vendor SPI SD
+-controller has no missing-card transaction timeout. The project therefore now
+-adds a liveness watchdog at the single physical SD sector interface. An active
+-sector request resets a 250 ms timer on every returned byte or sector-end
+-pulse. A request with no progress for the complete interval emits exactly one
+-`storage_fault_pulse`; normal data flow cannot trip it. `image_load_manager`
+-uses that pulse to reset the SD adapter and audio FIFO, retain the current
+-SDRAM frame/buffer/image index, and enter the existing reset-wait path.
+-
+-After reinsertion, normal SD initialization makes the OSD report `SCAN`; the
+-directory scan refreshes BMP and BGM metadata, and the WAV loader pre-fills
+-audio from the beginning. In this display-preserving hot-removal path the
+-manager returns to idle after scanning rather than loading image 1 or changing
+-the currently shown frame. With no card, the retained frame remains visible,
+-audio is silent, and the OSD reports `WAIT TF`; no key press is required.
+-
+-Icarus passed a dedicated liveness-watchdog test (normal returned bytes do not
+-fault; a stuck granted request faults once only), a display-preserving
+-manager-recovery test, the existing adapter test, the real FAT32
+-adapter/BGM/fragmented-BMP test, the PCM player test, and a post-change
+-top-level structural elaboration. TD `syn_1`, `phy_1`, and JTAG board testing
+-then passed on 2026-09-08. Immediate reinsertion, ten-second removal, and
+-one-minute removal all transitioned to `WAIT TF` on removal, retained the old
+-image, and automatically restored the same image plus BGM from its beginning
+-after reinsertion, without any key press.
+-
+-The `SCAN` state is intentionally entered after reinsertion, but it is often
+-not visible on the OSD. With the current small root directory and high-speed
+-SPI data path, metadata scanning completes in less than one 60 Hz video frame
+-(about 16.7 ms), so the renderer samples `WAIT TF` and then the final `IMAGE`
+-state. A visually observable `SCAN` label is not an acceptance requirement;
+-the automatic image-preserving BGM recovery is the acceptance result.
+-
+-#### Long BGM.WAV FAT32 cluster-chain correction
+-
+-On 2026-09-08, board endurance testing found that an otherwise valid
+-multi-minute BGM stopped after about 1 minute 26 seconds. The cause was not
+-the WAV parser, HDMI PCM path, FIFO, or SD hot-removal logic. The shared FAT32
+-file-sector reader defaults to a 4096-cluster traversal bound as a corruption
+-guard. On a normally formatted card with 4 KiB clusters this limits a file to
+-about 16 MiB. The recommended 48 kHz stereo 16-bit PCM stream consumes exactly
+-192000 bytes/s, so that bound ends playback after about 87 seconds, matching
+-the observed symptom.
+-
+-`fat32_wav_loader.v` now overrides only its reader instance to use the full
+-65535-cluster bounded chain. The BMP client retains the original 4096-cluster
+-default. The limit remains finite, so a malformed circular FAT chain still
+-terminates with an audio-only error rather than reading indefinitely. Icarus
+-passed the existing padded/fragmented 16-bit WAV loop, official 24-bit
+-extensible compatibility, and invalid-format regressions. A new
+-`tb_fat32_wav_long_file_reader.sv` also passed a 4097-cluster chain, crossing
+-the former cutoff without error and completing all 4097 sectors. The next user
+-action is TD GUI `syn_1` and `phy_1`, JTAG download, then verify the entire
+-track plays beyond the previous 1:26 stop point and loops cleanly. Do not use
+-TD command-line tools or modify configuration Flash for this check.
+-
+-#### Final integrated board acceptance
+-
+-The long-track acceptance subsequently passed on the target board. A valid
+-five-and-a-half-minute `BGM.WAV` played from beginning to end and immediately
+-restarted from the beginning, confirming that the former approximately-1:26
+-cutoff is gone. The final integrated endurance check also passed: automatic
+-picture playback and HDMI music remained normal, manual image changes worked,
+-and TF removal/reinsertion retained the displayed image, then automatically
+-restored image switching and music without any recovery key sequence. The
+-user additionally observed that recovery after reinsertion is now immediate
+-in normal use.
+-
+-The project has therefore moved from feature implementation to contest
+-delivery. The operational media contract and a short live demonstration
+-sequence are recorded in `docs/contest-delivery-guide.md`.
+-
+-#### Stable Flash baseline and objective-review transition
+-
+-The accepted integrated image was subsequently written to the configuration
+-Flash and passed its board retest. It is now the stable, recoverable baseline
+-for further work. New features must first be compiled and board-tested through
+-JTAG; the configuration Flash is updated only after their regression checks
+-pass.
+-
+-This establishes functional stability, not final contest completeness. The
+-initial roadmap emphasized making the inherited TF/SDRAM/HDMI examples
+-reliable and adding the required HDMI audio path. Before any further RTL work,
+-the next phase is to review the official competition requirements against the
+-verified implementation, produce a score-oriented gap matrix, and replace the
+-early development roadmap with a focused final-objective plan. The stable RTL
+-is frozen during that review.
+-
+-#### Contest-presentation enhancements and current transition handoff
+-
+-The official contest analysis was reviewed after the stable audio/video
+-baseline. The implementation already covers the essential media-player path:
+-FAT32 TF-card image playback, retained-frame recovery on TF removal and
+-reinsertion, automatic/manual image changes, HDMI PCM background music, and
+-live OSD state. The remaining work is presentation-oriented rather than basic
+-bring-up. The selected order is to finish a stable image transition first,
+-then continue with scrolling OSD presentation work and later consider scaling
+-and optional audio visualization. Energy bars/waveforms remain a late optional
+-feature because they should not risk the verified playback path.
+-
+-The display used for board testing was also changed from an inexpensive 1080p
+-panel to a portable 2K/144 Hz HDMI monitor with built-in speakers. With the
+-same validated design, first-image presentation is now normally visible in
+-about one second (at most a few seconds) rather than the earlier roughly
+-22-second observation. Image playback, BGM, automatic playback, OSD, and TF
+-hot-removal recovery remained normal on that monitor. This is an observed
+-display/handshake difference, not a claimed RTL boot-time optimization.
+-
+-The first presentation transition candidate was a diagonal crossfade. Board
+-observation found that its initial implementation was not acceptable: the old
+-image appeared to disappear abruptly, the new image emerged in visibly coarse
+-blocks, the motion was too fast, and transition-only corruption appeared as
+-small flashing rectangles plus a diagonal line. The original dark red accent
+-also competed with the intended fade. Slow-motion phone video confirmed that
+-a mathematical blend existed, but the naked-eye result was still discontinuous
+-and unsuitable for the final advertisement-style display.
+-
+-Investigation identified two independent contributors. First, the transition
+-reads the old and new SDRAM frames through separate FIFOs; a route change made
+-before all requested SDRAM return words arrived can send delayed data into the
+-wrong FIFO and cause transition-only corruption. Second, sixteen alpha levels
+-at 60 Hz complete in about 0.28 seconds, so each 6.25% brightness change is
+-visibly stepped. The full reasoning and fallback are recorded in
+-`docs/superpowers/specs/2026-09-09-dual-frame-return-routing-design.md` and
+-`docs/superpowers/specs/2026-09-09-smooth-crossfade-stability-design.md`.
+-
+-On 2026-09-09 the working tree was updated, but this revision is **not yet TD
+-compiled or board accepted**. `frame_dual_fifo_read.v` now keeps a selected
+-old/new route until the actual `Sdr_rd_en` return count completes the whole
+-request, including delayed returns. `frame_read_write.v` now uses 128-word
+-display-read bursts while preserving the 256-word write bursts. The transition
+-controller and top-level alpha interface now use 0--64 alpha steps (about
+-1.08 seconds at 60 Hz) instead of 16 levels. The blender now divides by 64,
+-moves the diagonal in roughly 18-pixel increments, and replaces the dark red
+-stripe with a narrow, non-wrapping soft-white accent. Focused Icarus tests for
+-the transition controller, blender, and dual-FIFO reader passed, as did
+-top-level Icarus elaboration. The only observed elaboration warning is the
+-pre-existing `rdusedw` 9-bit-to-10-bit zero-extension warning.
+-
+-The immediate next action in a new conversation is therefore narrowly scoped:
+-run TD `syn_1`, `phy_1`, and bitstream generation; JTAG-download only; then
+-test at least ten `KEY2` transitions, several `KEY4` automatic cycles, audio
+-continuity, OSD stability, and one TF removal/reinsertion. Do not update
+-configuration Flash unless all checks pass. If any transition-only blocks,
+-stripes, tearing, or clearly stepped/stiff motion remain, stop extending the
+-dual-frame transition and replace it with a single-frame fade-through-white
+-design; that fallback preserves a deliberate old-image exit and new-image
+-entrance without simultaneous old/new SDRAM reads.
+-
+-The user prefers the assistant to select the best technical option directly
+-and to pause only when board testing or a real blocker requires user action.
+-All further feature work must use JTAG first; the previously accepted Flash
+-image remains the recovery baseline.
+-
+-#### Single-frame fallback after the second board result
+-
+-The user subsequently compiled and JTAG-tested the 0--64 dual-frame revision.
+-The fade itself was substantially smoother, but its roughly 1.08-second
+-duration felt too long and transition-only corruption remained visible. The
+-soft-white diagonal was also too pale to read as an intentional effect and
+-could be mistaken for uncorrected video tearing. This result triggered the
+-documented fallback; no further dual-frame scheduling complexity will be
+-added.
+-
+-The working tree now contains a single-frame warm-white transition, but this
+-revision is **not yet TD compiled or board accepted**. `frame_read_write.v`
+-has been restored to the board-proven single read FIFO and `frame_fifo_read`
+-scheduler, including removal of the dual-read compatibility ports. Neither
+-the old FIFO nor `frame_dual_fifo_read` is instantiated. The buffer changes
+-only at a fully covered video-frame boundary, removing simultaneous old/new
+-SDRAM reads from the production path.
+-
+-The new sequence uses 16 fade-out and 16 fade-in frames, for about 0.53 seconds
+-at 60 Hz. Its fade levels follow the symmetric ease curve
+-`0,1,2,4,7,11,16,23,32,41,48,53,57,60,62,63,64` in each direction. A separate
+-0--64 sweep position advances monotonically across all 32 frames, so the
+-diagonal never reverses during fade-in. The accent is now a 40-pixel warm-gold
+-band targeting `#FFD166`, with a stronger 16-pixel core and direction-aware
+-channel interpolation that cannot wrap. The OSD remains composited after the
+-effect and is therefore unaffected.
+-
+-Focused controller, blender, retained dual-reader, and OSD simulations pass.
+-The full top-level elaboration also passes with the real single-frame reader
+-and generated FIFO sources; only the existing FIFO width-padding and vendor
+-RAM dangling-port warnings remain. The implementation is documented in
+-`docs/superpowers/specs/2026-09-09-single-frame-warm-white-transition-design.md`
+-and `docs/superpowers/plans/2026-09-09-single-frame-warm-white-transition.md`.
+-
+-The next action is TD `syn_1`, `phy_1`, and bitstream generation followed by
+-JTAG-only validation. Test at least ten `KEY2` transitions, several `KEY4`
+-automatic cycles, continuous audio, stable OSD, and one TF removal/reinsertion.
+-Do not update configuration Flash until the transition has no blocks, tearing,
+-black frames, HDMI loss, or ambiguous pale diagonal artifacts.
+-
+-#### Pure crossfade selected after the single-frame board result
+-
+-The user compiled and tested the single-frame warm-white revision. It removed
+-the transition corruption completely and its roughly 0.53-second duration was
+-accepted, but the visible result was rejected: it looked like a basic fade plus
+-yellow brightness modulation and a yellow diagonal bar. The diagonal could be
+-mistaken for uncorrected tearing.
+-
+-After comparing the second visual candidates, the user explicitly requested a
+-true old-image-transparent/new-image-visible crossfade with no flash or other
+-decoration. This necessarily supersedes the earlier dual-read fallback. The
+-working tree now contains that implementation, but it is **not yet TD compiled
+-or board accepted**.
+-
+-The controller locks old and new buffer indexes for 32 mixed frames and uses
+-the eased alpha sequence
+-`0,1,2,3,4,5,7,9,11,13,15,17,20,23,26,29,32,35,38,41,44,47,49,51,53,55,57,59,60,61,62,63`.
+-The next frame is exact new-image output. The blender performs only complementary
+-RGB weighting; all warm-white, gold, diagonal, and coordinate logic has been
+-removed. OSD remains after the blender.
+-
+-The dual reader now uses 64-word bursts and two 1024-word asynchronous FIFOs.
+-It prioritizes the lower eligible FIFO watermark and holds the selected return
+-route until all real `Sdr_rd_en` words for the burst arrive. Top-level wiring
+-explicitly sends the committed target buffer to the new FIFO and the current
+-display buffer to the old FIFO. The write path and media subsystems are unchanged.
+-
+-Review exposed a request-metadata race absent from the earlier idealized test.
+-The video read request reaches the memory domain before the controller updates
+-dual mode and the target index; the old scheduler could therefore start the
+-first transition frame as a single read and leave the old FIFO empty. The ACK
+-state now performs a final atomic metadata capture on the first synchronized
+-request-low cycle before issuing any address. A regression first reproduced
+-the old 8-command result where 16 paired commands were required, then passed
+-after this correction.
+-
+-Controller, blender, scheduler, real dual-FIFO wrapper, and OSD simulations pass.
+-The wrapper-level test returns distinguishable old/new pixel sequences through
+-the generated FIFO implementation, applies mode/index with the real late-update
+-timing, and confirms aligned, correctly routed output.
+-Top-level Icarus elaboration with the real frame wrapper also passes. Only the
+-existing write-FIFO level padding and 24-to-21-bit address constant warnings
+-remain.
+-
+-The next action is TD `syn_1`, `phy_1`, and bitstream generation followed by
+-JTAG-only validation. Test at least ten `KEY2` transitions, several `KEY4`
+-automatic cycles, continuous audio, stable OSD, and one TF removal/reinsertion.
+-Do not update configuration Flash until there is no transition corruption,
+-tearing, black frame, or HDMI loss.
+-
+-#### Read-margin diagnostic after pure-crossfade board failure
+-
+-The pure 32-frame crossfade passed visual review in the latest JTAG test, but
+-transition-only corruption remained.  The 19:57 implementation confirms that
+-the two configured 1024-word read FIFOs were each synthesized into three
+-BRAM9K blocks.  Its resources are 9445 LUTs, 6475 registers, 28 BRAM9Ks and
+-13 DSPs.  Routed timing remains `SWNS=-6.565ns`, `STNS=-410.468ns`,
+-`HWNS=+0.004ns`; the inherited SDRAM DQ path is still the worst path.
+-
+-The working tree now contains a JTAG-only read-margin and diagnostic revision.
+-The accepted blend, alpha curve, duration, 64-word bursts, and 125 MHz 0/180
+-degree SDRAM clocks are unchanged.  Both display-read FIFOs are enlarged to
+-4096 32-bit words.  After `display_valid`, pixel reads against an empty new or
+-old FIFO latch fault bits 0 or 1.  The scheduler latches bit 2 if another frame
+-request arrives before the previous frame's required read commands complete.
+-
+-The three sticky bits are synchronized to the board-clock domain and override
+-the final seven-segment digit only when nonzero: `1` is new-FIFO underflow,
+-`2` is old-FIFO underflow, `3` is both underflows, and `4` is a frame-read
+-overrun; combined faults display `5` through `7`.  With no read fault, the
+-existing media error digit remains unchanged.  `KEY1` reset clears the sticky
+-code.
+-
+-All five focused simulations pass, including explicit underflow and scheduler
+-overrun cases.  Top-level elaboration passes both with the frame wrapper stub
+-and with the real dual FIFOs and scheduler.  Only the pre-existing write-FIFO
+-level padding and 24-to-21-bit address warnings remain.
+-
+-Next, rebuild `syn_1`, `phy_1`, and the bitstream in TD 6.2.1 and use JTAG
+-only.  Reset once with `KEY1`, exercise at least ten manual transitions and
+-several automatic cycles, and record the final digit immediately after any
+-corruption.  A nonzero code identifies a continuity/throughput failure.  If
+-corruption remains with code zero, stop changing FIFO depth or scheduling and
+-treat the unresolved SDRAM DQ sampling path as the leading cause.  Do not
+-program configuration Flash before a clean full regression.
+-
+-#### Matched 62.5 MHz SDRAM experiment after zero-code corruption
+-
+-The 4096-word diagnostic revision was built and tested on hardware.  Pixel
+-corruption remains, but the last diagnostic digit stays at zero.  Neither
+-display FIFO was read empty and no frame-read request overtook an unfinished
+-frame, so further FIFO enlargement and scheduler tuning are no longer
+-justified.  The leading cause is now SDRAM DQ sampling under the dual-frame
+-read duty cycle; the latest 125 MHz build still reports `SWNS=-6.565ns` on the
+-inherited DQ path.
+-
+-Review also corrected the interpretation of the earlier 41.667 MHz failure.
+-That experiment changed the PLL without changing the active
+-`SDR_CLK_PERIOD=1000000000/125000000` definition.  Its refresh counter
+-therefore ran at roughly three times the intended physical interval.  The
+-observed `341100 -> 341002` write timeout was not a clean test of a matched
+-lower-frequency controller.
+-
+-The workspace now contains a controlled 62.5 MHz revision.  C1 and C2 use
+-divide-by-16 and phase taps 15/7 for 0/180 degrees, while C0 remains 100 MHz.
+-The active period definition is updated to `1000000000/62500000`, preserving
+-the physical refresh cadence.  The accepted 32-frame pure RGB blend, 64-word
+-bursts, 4096-word FIFOs, diagnostics, storage, audio, and OSD logic are
+-unchanged.
+-
+-Mechanical PLL/IPC/refresh checks pass.  All five focused simulations pass,
+-and the real dual-FIFO top-level elaboration passes with only the pre-existing
+-FIFO level-padding and address-width warnings.  Next, rebuild `syn_1`, `phy_1`,
+-and bitstream in TD 6.2.1.  Record routed timing and JTAG-test first-image
+-writing before repeated manual and automatic transitions.  Also check audio,
+-OSD, TF recovery, and the last diagnostic digit.  Do not program configuration
+-Flash unless the full test is clean.
+-
+-#### 62.5 MHz result and final phase-balanced experiment
+-
+-The matched 62.5 MHz revision completed TD and JTAG testing.  Image writes no
+-longer produced `341100` or `341002`, validating the corrected refresh timebase,
+-but transition corruption remained.  The 20:52 bitstream SHA256 is
+-`9F877864246163AD14F0B5863EBE6DC4527D9FF8277F8C3F9A26ACB760A0AB33`.
+-TD reported `SWNS=-3.766ns`, `STNS=-189.381ns`, and `HWNS=+0.004ns`.
+-The global worst path is now unrelated 100 MHz FAT32/WAV logic, while the
+-hard-SDRAM DQ write and read setup groups are `+1.092ns` and `-2.565ns`.
+-The read direction still has all 32 endpoints failing, consistent with the
+-board result.  Reject this bitstream for final use.
+-
+-The final dual-frame experiment uses C1/C2 at 50 MHz, with C1 at zero degrees
+-and C2 at 144 degrees (`DIV=20`, `CPHASE=19/7`).  This keeps C2's absolute
+-rising-edge offset at the measured 8 ns position.  The write budget therefore
+-retains its positive 62.5 MHz result, while the following C1 edge moves four
+-nanoseconds later; expected DQ setup is approximately `+1.092ns` write and
+-`+1.435ns` read.  The active period macro is matched to 50 MHz so refresh stays
+-near 31.24 us.
+-
+-No transition or media RTL changes.  The next TD build must show both DQ setup
+-groups non-negative before JTAG testing.  A nonzero last digit identifies
+-insufficient 50 MHz dual-read throughput; corruption with a zero digit rejects
+-the hard-macro dual-frame path despite timing.  Either failure triggers the
+-board-proven single-frame fallback, with no further frequency experiments and
+-no configuration-Flash update.
+-
+-Source verification confirms C0 is unchanged, C2 retains an 8 ns absolute
+-offset, the refresh interval is 31.24 us, and average dual-frame reads consume
+-73.728% of the theoretical 50 MHz one-word-per-cycle bandwidth.  All five
+-focused Icarus tests pass, and real dual-FIFO top-level elaboration passes with
+-only the existing FIFO-padding and 24-to-21-bit address warnings.  TD timing
+-and JTAG board validation are the only remaining steps for this revision.
+-
+-The first 50 MHz build at 21:08 did not implement that intended phase.  The
+-source incorrectly used C2 `CPHASE=11`; TD reported the actual derived clock
+-as phase 216 with a 12 ns rising edge.  Consequently DQ write setup increased
+-to `+5.130ns`, while DQ read setup stayed exactly `-2.565ns`.  Hardware loaded
+-images without `341100/341002` but still corrupted transitions.  The invalid
+-bitstream SHA256 is
+-`8CB458E71F0E6591678A66610A65FE91A49066B24102C777413E1C6AC65B5B8B`.
+-
+-The corrected source uses C2 `CPHASE=7`, which is the primitive setting for an
+-8 ns / 144-degree rising edge at 50 MHz.  Do not accept the next build unless
+-TD itself reports phase 144 and both DQ setup groups are non-negative.
+-
+-Post-correction source checks, all five focused Icarus tests, and real
+-dual-FIFO top-level elaboration pass.  Only the established FIFO-padding and
+-address-width warnings remain.  The 21:08 bitstream cannot be reused; a full
+-new TD build is required.
+-
+-#### Final rollback to the board-proven single-frame transition
+-
+-The dual-frame path is now rejected.  Hardware continued to corrupt the
+-transition without `341100/341002`, and the user requested the exact version
+-that had already passed board testing before the later crossfade experiments.
+-No further dual-reader, FIFO-depth, SDRAM-frequency, or PLL-phase experiments
+-are planned.
+-
+-The source rollback is complete.  `sys_pll` C1/C2 are restored to the accepted
+-125 MHz, 0/180-degree configuration (`DIV=8`, `CPHASE=7/3`), and
+-`SDR_CLK_PERIOD` again matches 125 MHz.  Production `frame_read_write` once
+-again contains one 512-word read FIFO and `frame_fifo_read`; the top reads only
+-`active_buffer_index`.  The old-image path, second FIFO, dual scheduler ports,
+-and seven-segment read-fault override are absent.  The historical dual-reader
+-source and standalone test remain excluded from production synthesis.
+-
+-The restored visual behavior is the previously accepted 16-frame fade to
+-warm white, buffer switch only under full cover, and 16-frame fade back to the
+-new image, approximately 0.53 seconds total at 60 Hz.  The warm-gold diagonal
+-accent is restored with the same single-frame implementation.  Audio, FAT32,
+-TF recovery, OSD, image writes, and vertical-flip behavior are unchanged.
+-
+-The controller, blender, OSD, and retained historical scheduler simulations
+-pass.  Both stubbed and real single-FIFO top-level elaboration pass, with only
+-the established FIFO-width padding and 24-to-21-bit address warnings.  Status
+-is source-complete and TD/JTAG-pending.  The user's workflow is correct: keep
+-TD open, Reset Runs, rebuild `syn_1`, `phy_1`, and bitstream, then program by
+-JTAG.  Do not reuse a dual-frame or 50/62.5 MHz bitstream, and do not update
+-configuration Flash before this rollback passes on hardware.
+-
+-The first post-rollback synthesis attempt failed during design read at 21:54.
+-TD reported `HDL-8007` for `video_transition_controller`,
+-`video_transition_blender`, and `frame_read_write`.  All three source files
+-were present; TD had removed their paths from its in-memory project when the
+-files were briefly replaced, then overwrote the repaired `.al` manifest while
+-closing.  This was a project-manifest failure, not an RTL or user-workflow
+-failure.
+-
+-With TD fully stopped, the manifest has now been repaired again.  Each missing
+-module is registered exactly once, `frame_fifo_read`, `frame_fifo_write`, and
+-the read-FIFO IP are enabled, and historical `frame_dual_fifo_read` remains
+-excluded.  Manifest assertions and real single-FIFO top-level elaboration
+-pass.  Reopen the project, Reset Runs, and rebuild normally.
+-
+-#### Line-buffer horizontal push transition
+-
+-The production transition now implements the contest's line-buffer sliding
+-option on top of the board-proven 125 MHz single-output-FIFO baseline. The new
+-frame enters from the right while the old frame exits to the left. The
+-warm-white/gold filter, diagonal sweep, and flash are absent from the active
+-pixel path; OSD remains a fixed final overlay.
+-
+-The controller advances over 28 frame intervals, about 0.47 seconds at 60 Hz,
+-using the exact position table
+-`0,2,9,20,35,54,76,100,127,156,187,219,252,286,320,354,388,421,453,484,513,540,564,586,605,620,631,638,640`.
+-It locks old/new buffer indexes for the complete transition and changes the
+-active buffer only at position 640. The first committed image remains direct.
+-
+-The memory-domain scheduler serializes old and new line segments through one
+-512-word asynchronous output FIFO. Normal positions require exactly 640 reads
+-per line. Positions 16 through 624 add a 32-pixel overlap cache and linear RGB
+-feather, for at most 672 reads while still emitting exactly 640 pixels. Read
+-chunks contain at most 128 commands, and segment routing changes only after the
+-same number of real `Sdr_rd_en` returns has arrived. Existing write priority and
+-`frame_fifo_write` behavior are unchanged. An overtaking frame request latches
+-a fault, cancels the slide without changing the active buffer, and holds the
+-playback interlock until reset.
+-
+-The controller test checks every position plus direct-first-frame, locked
+-indexes, endpoint handoff, and fault hold. The scheduler test uses an 8x2 frame,
+-a four-pixel feather, and gapped SDRAM returns to verify addresses, ordering,
+-mixing, endpoints, steady current-frame reads, output counts, and overrun
+-detection. Controller, scheduler, OSD, image manager, and storage adapter tests
+-all pass. Real-wrapper top-level elaboration passes with only established FIFO
+-padding, address-width, and timescale warnings. The manifest enables exactly
+-one `frame_slide_fifo_read` and excludes historical `frame_fifo_read`,
+-`frame_dual_fifo_read`, and `video_transition_blender` sources.
+-
+-SDRAM remains at the accepted C1/C2 125 MHz, 0/180-degree configuration
+-(`DIV=8`, `CPHASE=7/3`) with the matching
+-`SDR_CLK_PERIOD=1000000000/125000000`. Status is source-complete and
+-TD/JTAG-pending. Rebuild `syn_1`, `phy_1`, and bitstream from reset runs, then
+-JTAG-test at least ten manual transitions, several automatic cycles, continuous
+-audio, fixed OSD, and one TF removal/reinsertion. Any corruption, black band,
+-row displacement, HDMI loss, or load timeout rejects the build; do not program
+-configuration Flash before the complete board test passes.
+-
+-#### Board test result: transition-boundary corruption, underflow diagnostic added
+-
+-The first board test of the line-buffer slide still shows corruption during
+-the transition: a vertical yellow line at the moving old/new boundary, with a
+-red tint added when the source image contains red content. The line tracks
+-`slide_position` and only appears while a transition is active.
+-
+-`video_delay.read_en` (the video-side consumer of the read FIFO) has no
+-empty-flag gating — `assign read_en = de_d[18];` pulls from the FIFO purely on
+-display timing, regardless of whether the memory-side producer has actually
+-written that word yet. The slide scheduler's only cross-buffer address jump
+-per line (`old_base+608` direct/cache region to `new_base+0` blend region)
+-lands exactly at the screen boundary; if that jump costs extra SDRAM latency,
+-the producer can momentarily fall behind the fixed-rate consumer there,
+-causing a genuine FIFO underflow whose stale/undefined `dout` would show up as
+-exactly this kind of boundary-localized, image-content-dependent artifact.
+-This is the same underflow failure mode `crossfade-read-margin-diagnostics`
+-found for the earlier dual-frame design, just triggered by a different access
+-pattern.
+-
+-To confirm or rule this out before changing any margin/depth parameters,
+-`frame_read_write.v` now connects the previously-unused `empty_flag` output of
+-`read_buf` and latches a new sticky `read_fifo_underflow_seen` whenever
+-`read_en` and that empty flag are asserted together. `top.v` synchronizes it
+-into the `sd_card_clk` domain (mirroring the existing `transition_busy_sd_sync`
+-pattern) and overrides the last 7-segment digit (`seg_digit_x`, otherwise
+-`error_code`) with `F` when it latches — `error_code` only uses 0-5, so `F`
+-cannot be confused with an existing load-manager error.
+-
+-A new focused test, `tb_frame_read_write_underflow.sv`, exercises the latch
+-directly (write-before-read never trips it; reading while empty trips it and
+-it stays sticky through subsequent normal activity until reset) using minimal
+-local behavioral stand-ins for the vendor FIFOs and the write/read schedulers,
+-since the generated FIFO IP sources are not checked into this repository.
+-Controller and scheduler regressions (`tb_video_transition_controller`,
+-`tb_frame_slide_fifo_read`) still pass unchanged.
+-
+-Status: diagnostic only, simulation-verified, board-unverified. This does not
+-fix the corruption. Next board test: rebuild in TD and watch the last digit
+-during a transition. If `F` lights up, the underflow hypothesis is confirmed
+-and the next step is increasing read-FIFO depth/margin (or prefetching the
+-boundary-crossing segment earlier) rather than guessing at parameters blind.
+-If `F` never lights up, the corruption has a different cause and the search
+-continues elsewhere (e.g. clock constraints, OSD compositing timing).
+-
+-#### Diagnostic false-positive: gated the latch on display_valid
+-
+-The first board run of the diagnostic showed `F` from power-on onward,
+-including but not limited to transitions — not useful, since it never
+-distinguished "underflowed once at boot" from "underflowed again during a
+-transition." Root cause: `video_delay.read_en` pulses on every active video
+-line unconditionally, including before `Sdr_init_done` and the very first
+-committed frame, when `frame_slide_fifo_read` is still sitting in `S_IDLE`
+-and has written nothing to the FIFO yet. That startup-window emptiness is
+-harmless — before the first commit, `display_valid` is low and the display
+-mux outputs black/test-pattern instead of `read_data` — but the sticky latch
+-had no way to tell it apart from a later, visually-real underflow, so it
+-tripped once at boot and stayed stuck forever.
+-
+-`frame_read_write` now takes a new `display_valid` input and only latches
+-`read_fifo_underflow_seen` when `display_valid && read_en && read_fifo_empty`.
+-`top.v` connects the same `display_valid` wire already used for the video
+-output mux (video_clk domain, matching `read_clk`), so the flag now only
+-reflects underflows that happen while a real committed image is actually on
+-screen — which stays true throughout a transition, since `display_valid`
+-does not drop during the slide. `tb_frame_read_write_underflow.sv` gained a
+-case proving pre-first-frame empty reads no longer trip the latch, alongside
+-the existing post-commit latch/sticky/reset cases. All four focused
+-simulations (controller, scheduler, this diagnostic test, and the stub-path
+-top elaboration) still pass.
+-
+-Status remains diagnostic only, simulation-verified, board-unverified. Next
+-board test: rebuild and watch the last digit specifically from first-image
+-display onward, including during transitions.
+-
+-#### Board result: underflow trips on the very first frame, no transition needed
+-
+-The gated diagnostic was rebuilt and tested. Result: the digit reads `0`
+-throughout power-on, then flips to `F` the instant the first image is
+-displayed — with zero key presses, i.e. before any slide transition has ever
+-been triggered. This rules out the working theory that the underflow is
+-specific to the transition's one cross-buffer address jump (old-cache to
+-new-blend). Whatever is causing it is present in the ordinary steady
+-(`slide_active=0`, `p=0`) display path too, at least once, right at
+-first-frame start.
+-
+-Because the previous diagnostic was a single sticky bit, it could not
+-distinguish "underflowed once, right at startup, then recovered" from
+-"underflows continuously on every line/frame thereafter." Given `read_en`
+-(`video_delay.read_en`) stays high for an entire active video line rather
+-than pulsing once, a single stalled line could otherwise look identical to
+-one brief hiccup. `frame_read_write` now exposes a 4-bit saturating
+-`read_fifo_underflow_count` instead: it edge-detects the gated condition
+-(`display_valid && read_en && read_fifo_empty`) so one continuous empty
+-stretch counts as one episode, increments once per distinct episode, and
+-saturates at `4'hF` (does not wrap). `top.v` double-registers the whole
+-4-bit bus into the `sd_card_clk` domain (matching the existing
+-`disp_buf_idx_video_sync`/`osd_status_video_sync` pattern already used for
+-multi-bit diagnostic buses in this file — acceptable for a board-diagnostic
+-value that changes at most a few times per second) and displays it directly
+-on `seg_digit_x` in place of `error_code` whenever it is nonzero.
+-
+-`tb_frame_read_write_underflow.sv` was rewritten for counter semantics:
+-pre-first-frame empty reads still don't count; two isolated empty pulses
+-count as two separate episodes; a 20-cycle held-empty stretch (modeling a
+-whole stalled video line) counts as exactly one episode, not twenty; the
+-counter saturates at `4'hF` under sustained repeated episodes; and only
+-reset clears it. Controller, scheduler, and stub-path top elaboration
+-regressions are unaffected.
+-
+-Status remains diagnostic only, simulation-verified, board-unverified. Next
+-board test: watch the actual count value (not just zero/nonzero) from
+-first-image display onward. If it lands on a small number and stops
+-climbing during ordinary steady playback (no transition triggered), that
+-points to a one-time startup/cold-SDRAM-access hiccup, cosmetically harmless
+-on its own — and the transition-time visible artifact would need a separate
+-explanation (or the same underlying margin issue made visible by the
+-sustained per-frame boundary jump). If the count keeps climbing during
+-ordinary steady playback with no transition ever triggered, the new
+-`frame_slide_fifo_read` scheduler has a general throughput/margin regression
+-relative to the previous direct frame reader, independent of the slide
+-address jump, and that regression — not the transition boundary specifically
+-— is the priority to fix next.
+-
+-#### Board result: saturates within half a second of first display, steady playback, no transition
+-
+-Rebuilt and tested again. Result: the digit reads `0` through power-on, then
+-climbs rapidly to `F` within well under a second of the first image
+-appearing — with no key press, no transition ever triggered. Because the
+-counter was still forever-sticky (only cleared by global reset), it could
+-not distinguish "saturated once, early, then recovered" from "saturates
+-this fast on every single frame, continuously." That ambiguity motivated a
+-deeper simulation investigation before changing the diagnostic further.
+-
+-**Simulation investigation.** Built a scratch integration testbench (not
+-part of the tracked suite) instantiating the real `video_timing_data`,
+-`video_delay`, `frame_read_write`, and `frame_slide_fifo_read` at their real
+-clock ratio (25MHz video / 125MHz mem, matching `video_pll.v`/`sys_pll.v`),
+-with an idealized best-case SDRAM stand-in (fixed 4-cycle latency, accepts a
+-new command every cycle, no busy stalls, zero write-side contention) and a
+-`display_valid` that only turns on after several real video frames have
+-already elapsed — modeling a realistic TF-card load delay rather than an
+-instant one, specifically to rule out the earlier cold-start-before-first-
+-real-`read_req` artifact.
+-
+-Finding: even in ordinary steady playback (`slide_active=0`, `p=0`, no
+-transition ever triggered, addressing pattern identical to the pre-slide
+-direct frame reader), the read FIFO underflows repeatedly, roughly 426
+-distinct episodes per frame, indefinitely — not a one-time startup
+-transient. Tracing the scheduler's internal state at the moment of
+-underflow showed it consistently sitting in `S_IDLE` with `row_index=479`
+-(the last row) and the FIFO completely empty, while the video side's `de`
+-is still active mid-frame needing more lines. Root cause: `read_req` fires
+-once per frame (on the vsync edge); once triggered, the scheduler's
+-admission control (`wrusedw < FIFO_START_LEVEL`) only bounds *instantaneous*
+-FIFO occupancy to at most ~512 words ahead of consumption — it has no
+-mechanism pacing *cumulative* production against the video's actual
+-per-frame consumption rate. Under fast/idealized memory timing, the
+-scheduler can finish writing an entire frame's 307,200 words in a small
+-fraction of the ~15.36ms the video side needs to actually display all 480
+-active lines, then sits idle for the remainder of that frame with nothing
+-left to feed — exactly matching the "climbs to saturation almost instantly,
+-independent of any transition" board symptom.
+-
+-Important caveat: this exact admission-control pattern (`FIFO_DEPTH=512`,
+-`BURST_SIZE=128`, `wrusedw < FIFO_DEPTH-BURST_SIZE`) also exists unchanged
+-in the previous, board-proven `frame_fifo_read.v`, and in steady mode
+-(`p=0`) `frame_slide_fifo_read` issues the identical single 640-word
+-contiguous burst per row with no extra address jumps — so this is not a
+-regression introduced by the slide address-jump logic specifically. Real
+-SDRAM (with actual row-activate/precharge/refresh overhead this idealized
+-model ignores entirely) is almost certainly slower than the idealized
+-stand-in, so the *exact* frequency (426/frame) measured in simulation likely
+-overstates what the real board experiences. But the board's own timing
+-(saturates in well under a second, independent of any transition) matches
+-the *mechanism* closely enough that this is treated as the leading
+-explanation rather than a simulation artifact.
+-
+-**Diagnostic upgraded to per-frame, non-sticky.** A forever-sticky counter
+-can only ever say "has this happened at least once since power-on" — it
+-cannot show whether the same high count recurs every frame (a chronic
+-per-frame throughput problem, matching the simulation finding) or only
+-appears for the first frame or two (a one-time transient). `frame_read_write`
+-now exposes `read_fifo_underflow_count_per_frame`: a running episode counter
+-(edge-detected on the gated underflow condition, saturating at `4'hF`) that
+-snapshots its value into a stable output register on every frame boundary
+-(`read_req`'s rising edge, already in the `read_clk` domain) and restarts at
+-0 for the new frame. The displayed value therefore holds steady for a full
+-~16.8ms and updates once per frame, rather than flickering mid-frame or
+-staying pinned forever after one early saturation. `top.v`'s existing
+-double-register sync and `seg_digit_x` override are unchanged in structure,
+-just renamed to match. `tb_frame_read_write_underflow.sv` was rewritten to
+-drive explicit frame boundaries and verify: mid-frame episodes don't move
+-the displayed value early; the displayed value updates to the *previous*
+-frame's tally only at the next boundary; saturation within one frame is
+-independent of the display; and a subsequent clean frame brings the
+-displayed value back to 0 (proving it is a snapshot, not a sticky latch).
+-Controller and scheduler regressions are unaffected.
+-
+-Status remains diagnostic only, simulation-verified, board-unverified. Next
+-board test: watch the digit over several seconds of steady playback with no
+-transition triggered. If it settles at 0 (or a small, non-recurring value)
+-after the first frame or two, the startup-transient theory holds and the
+-transition-time artifact needs separate investigation. If it keeps reading
+-a high value (very plausibly `F`, given simulation) on every single frame
+-indefinitely, that confirms the scheduler has no real per-frame pacing
+-margin and the fix is to add explicit rate limiting to
+-`frame_slide_fifo_read` (e.g. bound how many rows it may complete ahead of
+-the video's actual real-time line position, not just bound instantaneous
+-FIFO occupancy) rather than continuing to treat this as transition-specific.
+-
+-## Final horizontal-transition baseline (2026-09-13)
+-
+-The diagnostic sequence continued past the per-frame underflow experiment.
+-Solid-color, address-pattern, phase-color, FIFO-uniform, and SDRAM-uniform
+-builds separated the fixed physical-left-edge artifact from the moving
+-old/new-image boundary artifact. The final hardware result did not require a
+-deeper FIFO, an SDRAM clock change, or video-rate pacing.
+-
+-The accepted read path discards four preroll responses before every visible
+-address chunk and issues each payload as a complete fixed 128-word burst.
+-Surplus tail responses are drained before the scheduler changes address
+-segments. `video_delay.v` consumes the FIFO `valid` signal through a four-entry
+-video-domain alignment queue, and the read FIFO remains
+-`SHOW_AHEAD_EN=0 + OUTREG` so it continues to use BRAM.
+-
+-The production top selects this exact configuration:
+-
+-```verilog
+-.WRITE_BUFFER_SOLID_DIAGNOSTIC(0),
+-.SLIDE_FEATHER_ENABLE(0),
+-.SLIDE_FIFO_UNIFORM_DIAGNOSTIC(0),
+-.SLIDE_SDRAM_UNIFORM_DIAGNOSTIC(0),
+-.SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC(0),
+-.SLIDE_PHASE_COLOR_DIAGNOSTIC(0),
+-.READ_CHUNK_PREROLL_WORDS(4),
+-.FIXED_READ_BURST_ENABLE(1),
+-```
+-
+-Focused stale-return and fixed-burst tests, a 640x480 full-frame test, seven
+-slide positions with pixel-exact multiframe checking, FIFO/video-delay/AXIS/
+-OSD/underflow/marker/write diagnostics, real and stub top elaboration, and
+-both TD project-list parses pass. The completed refresh-stall/depth records
+-show zero underflow, dropped commands, and scheduler stalls; the worst
+-`stall=16, depth=512` case completed 24 frames. `git diff --check` also passes.
+-
+-TD synthesis, place/route, bitstream generation, and JTAG board acceptance are
+-complete. Real-image manual transitions and automatic playback no longer show
+-either the fixed left-edge color line or the moving boundary line. Stable
+-display, OSD, audio, controls, and TF-card removal/reinsertion recovery also
+-pass. This feather-disabled build is the formal development and competition
+-baseline for subsequent stages.
+-
+-Feathering is retired from the plan. With complete fixed bursts, its two extra
+-32-pixel segments per row caused incomplete frames, severe horizontal and
+-vertical ghosting, a failed transition, and a blocked next-image key on real
+-hardware. Restoring `SLIDE_FEATHER_ENABLE=0` restored correct behavior.
+-Sixteen-word preroll was also rejected after producing almost no improvement
+-over four words. Do not reopen SDRAM frequency/phase, FIFO-depth, preroll, or
+-feather experiments while beginning the image-scaling stage.
++完整文档索引见 [`docs/README.md`](README.md)。
+\ No newline at end of file
+diff --git a/docs/project-roadmap.md b/docs/project-roadmap.md
+index 2074363..acf3517 100644
+--- a/docs/project-roadmap.md
++++ b/docs/project-roadmap.md
+@@ -1,806 +1,11 @@
+-﻿# OSD 多图层交互式商显系统：项目路线与上板记录
++# 本文件已拆分（勿在此继续编辑）
+ 
+-更新日期：2026-09-13
+-当前阶段：阶段 6 已完成并通过上板验收；准备进入阶段 7 图片缩放
+-目标平台：康芯 HX4S20C，安路 EG4S20BG256
++> 原 `project-roadmap.md` 在文档整理时（2026-09-24）已拆分为：
+ 
+-## 1. 项目目标
++| 去这里 | 内容 |
++| --- | --- |
++| [`docs/roadmap.md`](roadmap.md) | 项目路线：目标、资源审查、风险、阶段划分、当前状态 |
++| [`docs/history/board-log.md`](history/board-log.md) | 上板调试流水账（原 §5–§7） |
++| [`docs/history/migration.md`](history/migration.md) | 英文迁移记录（原 `osd-display-migration.md`） |
+ 
+-作品面向数字广告牌和商业展示终端，在不使用外部处理器的前提下，由 FPGA 完成 TF 卡文件读取、图片解析、SDRAM 帧缓存、HDMI 音视频输出和按键交互。
+-
+-计划实现的主要功能：
+-
+-- FAT32 文件系统解析和 BMP 图片读取；
+-- SDRAM 双帧缓存及稳定的图片轮播；
+-- HDMI 640x480@60Hz 视频输出；
+-- OSD 菜单、文字和参数信息叠加；
+-- 按键调节亮度、对比度、音量、静音和播放状态；
+-- 动态滚动字幕和图片转场；
+-- 不同分辨率图片的缩放，先实现最近邻，再升级双线性插值；
+-- 48kHz PCM WAV 播放及 HDMI 音频输出；
+-- 异常图片或音频文件的超时恢复和静音保护；
+-- 时间和资源允许时增加音频波形或简化频谱显示。
+-
+-其中 HDMI 音频属于 2026 赛题基础评分项，不作为最后才考虑的附加功能。
+-
+-## 2. 2026 资源包审查结论
+-
+-资源包位置：`D:\HX4S20_Contest_202606`
+-
+-### 2.1 可复用内容
+-
+-`lab_ex4_tf` 提供：
+-
+-- TF 卡 SPI 扇区读取；
+-- 640x480、24 位、非压缩 BMP 检测；
+-- SDRAM 双帧缓存；
+-- HDMI 640x480@60Hz 输出；
+-- 最多 4 张图片的手动切换和自动轮播；
+-- PLL 连续稳定约 20ms 后释放复位；
+-- 图片加载超时和部分跨时钟完成信号保护。
+-
+-`lab_ex5_i2s` 提供：
+-
+-- 48kHz、24 位双声道 PCM 到 HDMI IP 的接口；
+-- I2S 测试音发生器和 I2S 接收模块；
+-- HDMI ACR 参数生成，示例使用 `N=6144`；
+-- HDMI 音视频合流和输出连接方式。
+-
+-通用 `31_hdmi_tx_display_B` 例程可用于验证 HDMI_B 接口和显示器，不依赖 TF 卡。
+-
+-### 2.2 不能直接当成成品的部分
+-
+-- 当前图片例程不是真正的 FAT32 解析，而是扫描物理扇区寻找 `BM` 文件头；
+-- 扫描范围默认为前 131072 个扇区，即前 64MiB；
+-- 最多记录 4 张图片，并假定图片数据连续存放；
+-- 只支持固定的 640x480、RGB24、非压缩 BMP；
+-- 没有 OSD、亮度、对比度、字幕、转场或图片缩放；
+-- 音频例程只播放 FPGA 内部生成的测试音，没有从 TF 卡解析和播放 WAV；
+-- 通用 `18_sd_card_audio` 实际只是 SD 卡扇区读写验证，不能直接播放音频；
+-- 例程文档和工程名称存在复制错误，功能判断必须以源码、仿真和上板结果为准。
+-- 资源包保留了多个时期的 `.bit` 和 `_Runs` 目录；`best_result` 只表示某次构建保存的结果，不保证与所在目录的当前 `.al` 工程对应。选择 bitstream 时必须核对工程名、生成时间和构建报告。
+-
+-已确认的混合产物：
+-
+-- `31_hdmi_tx_display_B\prj\hdmi_tx_display.bit` 是 2022 年旧文件；2025 年重新构建且已上板通过的是 `hdmi_tx_display_Runs\best_result\hdmi_tx_display.bit`；
+-- `lab_ex4_tf\src\td_project` 当前只有 `lab_ex5_i2s_v1.0.al`，但同时残留 `HDMI1.4b_Transmitter_v1.0_Runs`；
+-- 上述残留目录中的 2026-04-24 bit 与独立 `lab_ex5_i2s` 音视频例程的 bit 哈希完全相同，不能当作当前纯视频工程的构建结果；
+-- 当前纯视频工程对应的 2026-06-05 bit 位于 `lab_ex5_i2s_v1.0_Runs\best_result`，其 `best_result` 与 `phy_1` 文件哈希相同。
+-
+-### 2.3 底座选择
+-
+-正式项目以 `lab_ex4_tf` 为可靠性底座，只从 `lab_ex5_i2s` 移植音频 PLL、测试音、I2S 接收、ACR 和 HDMI 音频接口。
+-
+-不整体采用 `lab_ex5_i2s`，因为它的统一复位只检查音频 PLL，缺少 `lab_ex4_tf` 中的系统/视频 PLL 稳定等待，并删除了部分图片加载超时保护。
+-
+-## 3. 已知资源与风险
+-
+-- 芯片资源：19600 LUT、19600 寄存器、4 个 PLL，片内集成 2M x 32bit SDRAM；
+-- 640x480 RGB888 在例程中按每像素 32 位存储，一帧约 1.23MB，双缓冲约 2.46MB；
+-- 视频例程约使用 18% LUT、16% 寄存器、22% BRAM 和 2 个 PLL；
+-- 加入测试音后约使用 20% LUT、19% 寄存器、31% BRAM 和 3 个 PLL；
+-- LUT 余量较充足，但 BRAM、最后一个 PLL、SDRAM 带宽和 TF 卡仲裁需要提前规划；
+-- 官方现有布局布线报告的最差建立时间裕量约为 `-6.6ns`，可能混有未正确约束的跨时钟路径，但必须审查，不能直接忽略；
+-- 双线性插值、完整 FAT32 和 TF 卡 WAV 流播放是本项目难度最高的部分，必须分阶段验证。
+-
+-## 4. 总体实施阶段
+-
+-| 阶段 | 目标 | 验收标准 |
+-| --- | --- | --- |
+-| 0 | 官方例程复现 | 彩条、TF 图片、按键轮播和 HDMI 测试音分别通过 |
+-| 1 | 建立干净工程 | 以可靠视频底座接入测试音，音视频同时稳定运行 |
+-| 2 | 建立测试体系 | 自研模块先通过 Icarus Verilog 单元测试再接入顶层 |
+-| 3 | FAT32 和 BMP | 能按目录项及簇链读取文件，不依赖物理连续存储 |
+-| 4 | OSD 和按键交互 | 菜单及参数信息稳定叠加，不影响 HDMI 连续输出 |
+-| 5 | 图像参数调节 | 亮度、对比度可调，极值计算正确且不溢出 |
+-| 6 | 商显效果 | 滚动字幕和至少一种转场稳定运行，无撕裂 |
+-| 7 | 图片缩放 | 先完成最近邻，再完成双线性插值并做像素对比测试 |
+-| 8 | TF 卡 WAV 播放 | 48kHz PCM WAV 连续播放，无明显断音或爆音 |
+-| 9 | 音画联动 | 图片、音乐、暂停、音量和 OSD 状态一致 |
+-| 10 | 可选冲刺 | 音频波形或简化频谱叠加，不破坏基础功能 |
+-| 11 | 工程验收 | 多显示器、异常文件和长时间运行测试通过 |
+-
+-## 5. 当前任务：阶段 0 官方例程上板验收
+-
+-这一阶段不修改正式项目代码。先下载官方预编译 bitstream 验证硬件，再从源码重新编译，区分硬件问题和工具链问题。
+-
+-### 5.1 准备物品
+-
+-- HX4S20C 开发板和 USB 下载线；
+-- HDMI 线，连接开发板 `HDMI_B`；
+-- 支持 HDMI 输入的显示器或电视；
+-- 验证音频时使用带扬声器的显示设备，或准备 HDMI 音频转接设备；
+-- TF 卡和读卡器。
+-
+-### 5.2 TF 卡准备
+-
+-1. 先备份卡内原有文件；
+-2. 在 Windows 属性中确认 TF 卡容量和文件系统；
+-3. 文件系统必须为 FAT32，不能使用 exFAT；
+-4. 为复现当前纯视频 bit，初次测试向根目录放入**恰好 4 张**官方 `.bmp` 图片，不复制 PNG；该版本固定等待找到 4 张合格图片，少于 4 张时会继续扫描前 64MiB，期间保持黑屏；
+-5. 官方图片目录：
+-   `D:\HX4S20_Contest_202606\7_lab_ex_2026_nosoft\aaa\lab_ex4_tf\doc\TF卡图片`
+-
+-暂时不要运行 `sync_to_sd.py`。该脚本会破坏旧 BMP 文件头、删除目标盘中的全部可见文件，再写入新图片。只有备份完成并确认准确盘符后才能使用。
+-
+-### 5.3 测试 A：HDMI_B 彩条
+-
+-预编译文件：
+-
+-`D:\HX4S20_Contest_202606\2_Example\DEMO_TD6.2.1\DEMO\31_hdmi_tx_display_B\prj\hdmi_tx_display_Runs\best_result\hdmi_tx_display.bit`
+-
+-不要使用同一 `prj` 目录下 2022 年的 `hdmi_tx_display.bit`。它与 2025 年 `best_result` 的长度和哈希均不同，上板结果已确认旧文件黑屏、`best_result` 正常。
+-
+-操作：
+-
+-1. 开发板连接下载线；
+-2. HDMI 线接入 `HDMI_B` 和显示器；
+-3. 显示器切换到对应 HDMI 输入；
+-4. 使用 TD Programmer 下载上述 bitstream；
+-5. 观察画面至少 2 分钟。
+-
+-通过标准：显示器能够识别信号，彩条稳定，无反复黑屏、闪烁或明显错位。
+-
+-### 5.4 测试 B：TF 卡图片轮播
+-
+-预编译文件：
+-
+-`D:\HX4S20_Contest_202606\7_lab_ex_2026_nosoft\aaa\lab_ex4_tf\src\td_project\lab_ex5_i2s_v1.0_Runs\best_result\lab_ex5_i2s_v1.0.bit`
+-
+-注意：虽然文件名包含 `lab_ex5_i2s`，它位于 `lab_ex4_tf` 目录，是当前 `.al` 对应的纯视频版本。不要用同级残留的 `HDMI1.4b_Transmitter_v1.0_Runs` 来代替它。
+-
+-操作：
+-
+-1. 断电后插入准备好的 TF 卡；
+-2. 下载上述 bitstream；
+-3. 将板上 `SW6` 拨上，接通数码管而不是双色 LED；
+-4. 下载后至少等待 2 分钟，记录数码管状态码和显示器是“有 HDMI 信号但画面全黑”还是提示“无信号”；
+-5. 按板上 `KEY2`，检查是否切换到下一张图片；
+-6. 按板上 `KEY4`，检查是否启用或关闭自动轮播；
+-7. 连续运行至少 10 分钟。
+-
+-按键命名容易混淆：HDL 端口 `rst_n/key1/key2` 分别约束到板载 `KEY1/KEY2/KEY4`，所以板载 `KEY1` 是复位、`KEY2` 是下一张、`KEY4` 是自动轮播。
+-
+-数码管状态码：`0` 表示 SD 尚未初始化或链路被复位；`1` 表示空闲；`2` 表示扫描或读取图片头；`3` 表示等待写 FIFO；`4` 表示传输图片数据。只有一位显示状态码，其余位熄灭是正常现象。
+-
+-#### 5.4.1 2026-06-05 纯视频 bit 黑屏诊断
+-
+-已确认 TF 卡中恰好有 4 张官方 BMP。`SW6` 拨上后数码管可以正常显示。下载六月纯视频 bit 时，显示器由“无信号”变为“已识别 HDMI 信号但画面全黑”，状态码上电后为 `2`，一段时间后变为并停留在 `1`。
+-
+-由此可以排除 HDMI 物理接口完全失效、系统始终处于复位以及数码管损坏。四月可显示版本和六月纯视频版本的 SD 读取、BMP 识别、帧缓存、SDRAM 模块文件完全相同；六月版本在图像控制通路中新增了 `100_000_000` 个 100MHz 时钟周期，即约 1 秒的整帧加载超时。
+-
+-首图若未在 1 秒内同时满足“BMP 源数据发送完毕”和“SDRAM 整帧写入完成”，代码会触发 `load_abort`。该信号会清除底层 `scan_done`，但上层 `scan_kicked` 仍保持为 1，系统不会重新扫描或重试，最终回到状态码 `1` 并永久保持黑屏。这是已确认的代码缺陷，但尚不能断定首次黑屏一定由它触发。
+-
+-后续将同一六月版写入配置 Flash，在重新配置/断电保持的启动方式下按板载 `KEY1` 复位，状态码再次由 `2` 变为 `1` 后图片正常显示，手动和自动轮播也正常。随后完成单变量复测：第一次将板卡断电约 10 秒再由 Flash 启动时，状态码为 `2 -> 4 -> 1` 且画面正常；临时 JTAG 下载六月 bit 后，同样为 `2 -> 4 -> 1`，但画面黑屏，按 `KEY1` 重新运行仍然黑屏；再次把六月版本写入配置 Flash 后立即运行以及断电重启也都保持黑屏。
+-
+-因此，先前那一次 Flash 冷启动成功不能继续作为“六月 bit 稳定通过”的证据。可能性最高的是当时配置 Flash 实际仍装有此前可显示的四月构建，后来才被六月构建真正覆盖；另一种可能是六月构建存在 SDRAM 启动或时序敏感问题。状态码 `4` 只表示 BMP 数据源正在读取，状态码回到 `1` 只表示 `bmp_read` 已空闲，两者都不能证明 SDRAM 整帧写入完成或 `display_valid` 已置位。
+-
+-当前故障边界已经收敛为：BMP 扇区扫描成功，图片数据读取进入加载阶段，HDMI 时序正常，但“SDRAM 写帧完成 -> 跨时钟同步 -> 显示缓冲区提交”未得到可见确认，或 SDRAM 读回数据无效。第一轮采用六位数码管被动诊断，分别锁存首图加载、源读取完成、SDRAM 写帧完成、显示提交和加载超时；暂不修改视频数据路径。
+-
+-最终连续 A/B 验证结果：保持开发板、TF 卡、图片、HDMI 线和显示器不变，JTAG 临时下载 2026-04-24 bit 可以正常显示，随后下载 2026-06-05 bit 稳定复现黑屏。因此阶段 0 将四月 bit 记为通过、六月 bit 记为失败，故障归属六月构建或其新增逻辑，不再归因于板卡、TF 卡或下载方式。
+-
+-板上两个看似“复位”的按键用途不同：
+-
+-- `KEY1` 接普通 FPGA IO `A2`。当前例程将它约束为低有效 `rst_n`，只复位用户逻辑并重新启动 TF 扫描；其他工程可以把它定义成不同功能。
+-- `CONFIG` 接 FPGA 专用配置引脚 `PROGRAM_B`（`T2`）。按下后会重新配置 FPGA，并从板载 W25Q16 配置 Flash 重新加载启动镜像；它不是普通用户按键。若 JTAG 临时下载的设计与 Flash 中的设计不同，按 `CONFIG` 会切换回 Flash 中的设计。
+-- 板上另有 W25Q64 用户 SPI Flash，不要与保存 FPGA 启动镜像的 W25Q16 配置 Flash 混淆。
+-
+-通过标准：首图能正常加载，手动和自动切图有效，切换期间无死机和持续花屏。
+-
+-### 5.5 测试 C：HDMI 图片和测试音
+-
+-预编译文件：
+-
+-`D:\HX4S20_Contest_202606\7_lab_ex_2026_nosoft\aaa\lab_ex5_i2s\src\td_project\HDMI1.4b_Transmitter_v1.0_Runs\best_result\HDMI1.4b_Transmitter_v1.0.bit`
+-
+-操作：
+-
+-1. 先将显示器音量调低；
+-2. 保持 TF 卡和 HDMI_B 正确连接；
+-3. 下载上述 bitstream；
+-4. 检查图片显示、按键轮播和内部测试音；
+-5. 连续运行至少 10 分钟。
+-
+-通过标准：图片功能不退化，显示设备能持续播放测试音，无反复静音或异常爆音。
+-
+-### 5.6 测试 D：从源码重新编译
+-
+-预编译文件全部通过后，再分别使用 TD 6.2.1 打开以下工程，执行综合、布局布线、生成 bitstream 和下载：
+-
+-- 彩条：`31_hdmi_tx_display_B\prj\hdmi_tx_display.al`
+-- 纯视频：`lab_ex4_tf\src\td_project\lab_ex5_i2s_v1.0.al`
+-- 音视频：`lab_ex5_i2s\src\td_project\HDMI1.4b_Transmitter_v1.0.al`
+-
+-通过标准：三个工程均能完成构建，自己生成的 bitstream 与预编译版本表现一致。保存所有错误、警告、资源占用和时序报告，后续逐项分析。
+-
+-#### 5.6.1 六月纯视频源码基线
+-
+-已在 `D:\fpga\project\fpga\tf_hdmi_diag` 建立干净工作副本。副本包含 55 个 `user_source` 文件和 4 个 `td_project` 工程/IP 文件，不包含 `_Runs`、日志或历史 bitstream。全部复制文件与官方源文件哈希一致，`.al` 中 37 条文件引用均可在新目录解析。
+-
+-TD 6.2.1 原样综合和布局布线已经完成。综合资源为 3569 LUT、3088 REG、14 个 BRAM9K、2 个 PLL；最终时序为 `SWNS=-6.565ns`、`STNS=-297.430ns`、`HWNS=0.049ns`。最差的 32 条建立时间违例路径均位于 SDRAM `DQ[31:0]` 数据口，布局布线还报告 SDRAM 位置约束未采用和 `SDRAM_CLK` 使用本地布线。
+-
+-新生成的 bit 经 JTAG 临时下载后稳定复现 `2 -> 4 -> 1`、HDMI 有信号但黑屏、`KEY2/KEY4` 无可见反应。这证明干净副本已经原样复现官方六月故障，可排除下载方式、旧构建缓存和副本缺文件。
+-
+-第一轮被动诊断已完成 HDL 和 Icarus Verilog 测试，六位数码管格式为 `S C L R W X`：状态、图片数、加载启动、源完成、写完成、提交/超时。下一步在 TD 中重新综合诊断版本并上板记录六位结果。
+-
+-诊断版完成 TD 综合和布局布线后，JTAG 上板连续两次（包括一次 `KEY1` 用户复位）得到相同序列：`000002 -> 001144 -> E01141`，屏幕始终黑屏。板上六位数码管的实际物理顺序与首次设计假设相反，因此应从右向左解释，逻辑序列为 `200000 -> 441100 -> 14110E`。
+-
+-首轮曾将稳定结果 `14110E` 中的 `R=1` 解释为 BMP 源数据已经发送完成。逐拍复查后确认这是诊断观测缺陷：首图请求发出后的一个空闲余拍中，上层 `load_busy` 已置位而 `bmp_ready` 尚未拉低，导致 `R` 被提前锁存。可靠结论是：找到 4 张图、首图已启动、1 秒内没有观察到 SDRAM 整帧写完成，超时时 TF/BMP 状态仍为 `4`，说明图片数据仍在读取。第二轮将超时延长至 10 秒，并要求加载确实进入忙态后重新回到空闲才锁存 `R`。
+-
+-第二轮诊断版已完成综合、布局布线和 JTAG 上板验证。保持同一开发板、TF 卡、4 张官方 BMP、HDMI 连接及开关状态不变，仅把加载超时由约 1 秒延长到约 10 秒，并修正不参与业务控制的诊断显示。上板后图片显示恢复正常，`KEY2` 手动切图和 `KEY4` 自动轮播均与四月可用版本表现一致。由此确认：六月版本黑屏的直接原因是 1 秒整帧加载门限短于该 TF 卡实际加载时间，触发 `load_abort` 后又没有重新扫描或重试。
+-
+-当前工作基线保留 10 秒保护门限，但这只解决本次功能性黑屏。布局布线仍为 `SWNS=-6.565ns`，最差路径位于 SDRAM `DQ[31:0]`，因此 SDRAM 约束、时钟和稳定性问题仍必须在正式项目基线阶段处理，不能因当前上板可显示而视为时序通过。
+-
+-## 6. 测试记录
+-
+-| 项目 | 当前状态 | 实际现象或错误信息 |
+-| --- | --- | --- |
+-| TF 卡容量和文件系统确认 | 部分通过 | 根目录已确认放置 4 张官方 BMP，且同一 TF 卡可被残留音视频 bit 读取；仍需记录容量和 FAT32/exFAT |
+-| TD Programmer 识别开发板 | 通过 | 多个 bitstream 均可正常下载 |
+-| HDMI_B 彩条预编译版本 | 通过 | 2022 年根目录旧 bit 黑屏；2025 年 `best_result` 显示与官方现象一致 |
+-| TF 图片预编译版本 | 四月通过、六月原版失败 | 相同硬件条件下连续 JTAG A/B：2026-04-24 bit 正常显示，2026-06-05 原始 bit 完整经历 `2 -> 4 -> 1` 后黑屏 |
+-| 数码管状态显示 | 通过 | `SW6` 原为拨下，拨上后数码管正常显示 |
+-| HDMI 测试音预编译版本 | 延期 | 显示设备扬声器尚未准备好，不阻塞视频基线重建；音频主线开始前必须补测 |
+-| 彩条源码重新编译 | 待测试 | 记录构建错误和警告 |
+-| TF 图片源码重新编译 | 修复后功能通过，时序未通过 | 原样构建复现黑屏；将整帧加载超时从 1 秒延长至 10 秒后，图片、`KEY2` 手动切图和 `KEY4` 自动轮播均恢复正常；仍有 `SWNS=-6.565ns` SDRAM 时序违例 |
+-| TF/SDRAM 六位被动诊断 | 完成 | 首轮确认 1 秒超时时 BMP 仍在状态 `4`；第二轮延长到 10 秒后完整加载并正常显示，确认门限过短是六月黑屏的直接原因 |
+-| HDMI 音频源码重新编译 | 待测试 | 记录资源和时序摘要 |
+-
+-测试中出现问题时，不要同时更换工程、TF 卡、HDMI 线和显示器。每次只改变一个条件，并记录完整错误信息或拍摄清晰照片。
+-
+-## 7. 阶段 0 完成后的工作
+-
+-三个预编译例程和源码构建完成后，根据记录确定硬件与工具链基线。随后继续确认完整系统架构和第一版功能边界，经确认后再在当前工作目录建立正式 Git 工程、测试目录和设计文档。
+-
+-### 7.1 已确认的正式视频基线方案
+-
+-2026-09-03 已确认并开始执行受控迁移方案：保留 `fpga/tf_hdmi_diag` 作为诊断对照，已新建独立的 `fpga/osd_display` 正式工程；以六月纯视频源码和已验证的 10 秒超时修复为迁移起点，官方底层与项目自研控制层分目录管理。当前已完成源文件/IP/约束迁移、TD 工程路径重写、哈希清单和首个图片加载恢复控制模块及 Icarus 测试。
+-
+-第一阶段只建立可靠视频基线，采用有限重试、首图失败显示测试图、后续加载失败保留上一帧的恢复规则。进入 OSD 开发前，必须通过独立构建、JTAG、配置 Flash 冷启动、30 分钟连续轮播以及 SDRAM 时序审查。完整设计见 `docs/superpowers/specs/2026-09-03-formal-video-baseline-design.md`，迁移记录见 `docs/osd-display-migration.md`。当前正式工程已创建并完成本地控制层仿真，TD 构建和上板验收待执行。
+-
+-2026-09-03 已完成正式工程首次 TD 6.2.1 构建：`syn_1`、`phy_1` 和 bitgen 均完成，`osd_display_Runs/best_result/osd_display.bit` 的 SHA256 为 `05ca4640de35fee1f58a5d7889c58da3175029d0be588300fb5017fb15919a4d`。实现资源为 3538 LUT、3113 REG、14 BRAM9K、2 PLL 和 2 GCLK；IPC 迁移错误已消除。最终时序仍为 `SWNS=-6.565ns`、`STNS=-296.897ns`、`HWNS=0.000ns`，且保留 SDRAM 位置约束未采用和 `SDRAM_CLK` 本地布线的 Critical Warning。下一步只进行 JTAG 临时下载的功能等价验证，不写配置 Flash，时序问题另行审查。
+-
+-正式工程的 JTAG 功能等价验证已通过：首图显示、板载 `KEY1` 用户复位、`KEY2` 手动切图和 `KEY4` 自动轮播均正常。上电到首图显示约需 22 秒，与诊断对照工程及官方例程一致；10 秒参数仅在图片加载已经启动后作为异常门限，不是总启动延时。下一步保持同一板卡、TF 卡和 HDMI 连接，只写入 FPGA 配置 Flash，并完成 3 次断电冷启动记录；在此之前不处理时序违例，也不接入新的图片加载控制层。
+-
+-配置 Flash 冷启动验收已通过：使用正式工程 bitstream 连续完成 3 次断电冷启动，均在约 22 秒后正常显示首图，表现与 JTAG 和诊断基线一致。下一项上板验收为首图显示后按 `KEY4` 开启自动轮播，连续运行 30 分钟，并在结束前确认 HDMI 输出持续正常、图片仍切换且 `KEY2` / `KEY4` 仍有响应。
+-
+-30 分钟自动轮播验收已通过：HDMI 输出稳定，图片持续切换，结束前 `KEY2` 手动切图和 `KEY4` 自动轮播控制仍正常。正式工程的正常 TF 卡运行基线已通过 JTAG、配置 Flash 冷启动和长时间轮播验证。下一步接入已完成独立仿真的图片加载恢复控制层，再执行 TF 丢失和加载失败的故障注入测试；SDRAM 时序审查独立进行，不以当前功能通过替代时序收敛。
+-
+-在正式项目中，音频主线固定包括：48kHz PCM WAV 解析、TF 卡流式读取、音频 FIFO、HDMI PCM 接口、音量、静音、播放状态 OSD、欠载静音和异常文件恢复。音频可视化保留为后期加分功能。
+-
+-### 7.2 图片加载恢复与写 FIFO 节流验收
+-
+-图片加载恢复控制层和按扇区写 FIFO 节流已完成 TD 构建与上板验证。当前行为为：无 TF 卡启动时显示彩条测试图；已显示图片后拔出 TF 卡并请求下一张时，保持当前图片；TF 卡重新插入并完成初始化后，可以恢复到正常切图和自动轮播。正常首图、手动切图、自动轮播、TF 拔插恢复均已通过。
+-
+-曾出现的短间隔连续按键导致 `341100` 长时间停留、或 `321100` 读写等待状态异常，已通过请求去重、恢复状态收敛和写 FIFO 按扇区节流修复。最终复测中不再出现 `321100`，短间隔连按、缺卡恢复后的再次切图均正常。该结论仅适用于当前板卡、TF 卡、4 张 BMP 和 HDMI 连接组合，后续新增功能后仍需回归测试。
+-
+-### 7.3 SDRAM 时序审查与降频实验
+-
+-当前 `osd_display_Runs/phy_1/final_timing.rpt` 的最差建立裕量仍为 `SWNS=-6.565ns`。最差路径属于 SDRAM 硬宏 `DQ[31:0]`，位于 `ext_mem_clk` 与 180 度相移的 `sys_pll_m0/pll_inst.clkc[2]` 之间；反向 DQ 写路径为 `-2.908ns`。2026-06-05 官方 `lab_ex4_tf` 的最终时序报告具有相同路径组和相同 `-6.565ns`，因此该问题不是图片恢复控制或 FIFO 节流本次改动引入。
+-
+-DQ 路径是真实 SDRAM 接口时序，禁止以 `false_path` 屏蔽。`rst_all` 的跨时钟释放和 FIFO 异步清零跨域报告仍是独立审查项；`U3/sdram` 位置约束未采用、`SDRAM_CLK` 使用本地布线的 Critical Warning 也未擅自通过新增约束处理。
+-
+-已确认执行受控降频实验，并已经修改工程源文件，尚待 TD 编译和 JTAG 上板验证：`sys_pll` 的 C1/C2 从 `125 MHz / 125 MHz@180 度` 改为 `41.667 MHz / 41.667 MHz@180 度`，即分频 `8 -> 24`，相位保持 `0 度 / 180 度`。100 MHz SD 卡时钟、25 MHz 视频时钟、125 MHz HDMI 串行时钟、业务 RTL 和约束保持不变。实验只允许 JTAG 临时下载，验证成功前不得写配置 Flash。验收项为 DQ 双向路径非负建立裕量，以及首图、单次/短间隔连按切图、自动轮播和 TF 拔插恢复均正常；若失败，立即恢复 C1/C2 的 `DIV=8`、零度 `CPHASE=7`、180 度 `CPHASE=3`。
+-
+-2026-09-04 已完成该降频版本的 TD 构建和 JTAG 验证。最终报告为 `SWNS=-1.526ns`、`STNS=-7.172ns`、`HWNS=0.037ns`、`HTNS=0.000ns`。SDRAM DQ 双向路径已转正：`ext_mem_clk -> clkc[2]` 为 `+4.983ns`，反向为 `+1.435ns`。全局负裕量转移到 `clk -> ext_mem_clk` 的 `-0.823ns`（`rst_all` 跨域释放）和 `ext_mem_clk -> sd_card_clk` 的 `-1.526ns`（异步 FIFO 清零相关）路径。
+-
+-然而，41.667 MHz 版本功能验收失败：首图和普通单次/连续手动切图能够工作，但自动轮播高概率出现 `341100` 并稳定停留约 10 秒，随后变为 `341002`，最后由重试切换图片。`341100` 表示 BMP 源已完成而 SDRAM 整帧写完成未到；末位 `2` 确认触发十秒加载超时。TF 拔出后的失败保持和重新插卡后的重初始化、切图恢复按设计工作，但重新插卡后单次手动切图也高概率复现同一 `341100 -> 341002` 超时。因此根因不属于自动播放按键，而是 41.667 MHz 下部分写帧事务无法完成。该频率实验判定失败，不得写入配置 Flash；当前 Flash 继续保留已验收的 125 MHz 版本。2026-09-04 已按回滚设计将工作区 `sys_pll` C1/C2 恢复为 `125 MHz`、`DIV=8`、相位抽头 `7/3`；等待 TD 和 JTAG 回归验证后，再分离设计 SDRAM 时序与跨域路径的收敛方案。
+-
+-125 MHz 回滚已于 2026-09-04 完成 TD 和 JTAG 回归。`phy_1/final_timing.rpt`（15:17:47）为 `SWNS=-6.565ns`、`STNS=-299.804ns`、`HWNS=0.011ns`、`HTNS=0.000ns`；DQ 路径恢复为 `ext_mem_clk -> clkc[2]` 的 `-2.908ns` 与反向的 `-6.565ns`。新 bit 的 SHA256 为 `ad7ed0cdf25b65593158fa4af513758625fdefe1d183d7260805b6d8bb8702b9`。上板现象回到此前已验收的 125 MHz 基线，未出现 `341100`，自动轮播与 TF 拔插恢复均恢复正常。该 bit 仅用于 JTAG 回归，未写入配置 Flash。
+-
+-### 7.4 本次收工交接
+-
+-本次工作到此结束。图片加载恢复、TF 缺失回退、重新插卡恢复、短间隔按键去重和按扇区写 FIFO 节流均已完成并上板通过；当前配置 Flash 中保留的是此前通过冷启动和 30 分钟轮播验收的 125 MHz 基线，未写入本次 SDRAM 降频实验版本。
+-
+-下一步不再继续试探性降低 SDRAM 时钟。应先把时序问题拆分为可验证的独立设计：`rst_all` 在每个接收时钟域的同步释放、跨 `ext_mem_clk -> sd_card_clk` 的 FIFO 异步清零控制协议，以及在不牺牲写帧可靠性的前提下处理 125 MHz SDRAM DQ 接口时序。上述工作开始前，125 MHz JTAG 基线和 Flash 启动镜像均保持不变。
+-
+-### 7.5 赛题成品化与转场效果当前状态（2026-09-09）
+-
+-在稳定基线之上，项目已进入赛题成品化阶段，而不是重新做基础 TF/SDRAM/HDMI 功能。官方赛题解析已完成阅读；目前已具备 TF 卡 FAT32 图片播放、`KEY2` 手动换图、`KEY4` 自动轮播、TF 热拔插后保留原图并自动恢复、HDMI PCM 背景音乐和实时 OSD。后续按风险由低到高推进：先完成稳定且观感自然的转场，再完善滚动字幕等 OSD 表现，缩放和音频可视化作为后续加分项。能量柱/波形不作为当前优先项，避免破坏已经验收的播放主线。
+-
+-新的便携式 2K/144 Hz 带扬声器显示器上，首图通常约 1 秒即可出现（最多数秒），且图片、音乐、自动轮播、OSD 与 TF 热拔插恢复均正常；旧 1080p 显示器曾观察到约 22 秒。这是显示器握手/锁定相关的实测差异，不能写成 RTL 启动时间已经优化。
+-
+-已尝试的对角线淡入淡出在板上观感不合格：旧图消失过于突然，新图以较大方块逐格出现，整体过快且卡顿；还会出现小矩形闪烁、斜线和较深红色条纹。慢放录像可看到实际存在混色，但肉眼观看仍不自然，不能作为成品效果。
+-
+-2026-09-09 已在工作区完成下一版修复，尚未执行新的 TD 编译和上板验收：
+-
+-- 双帧 SDRAM 回读改为依据真实 `Sdr_rd_en` 返回字数计数，整批返回完成前不切换旧/新 FIFO 路由，处理延迟返回字，目标是消除转场专属花屏；
+-- 显示读取突发由 256 字缩短为 128 字，写帧仍保持 256 字，缩短双 FIFO 的补数等待；
+-- 透明度由 16 级扩展到 `0..64` 级，60 Hz 下约 1.08 秒，亮度台阶从 6.25% 降至 1.5625%；
+-- 对角线移动约 18 像素/帧，深红条改为不发生无符号回绕的弱软白扫光。
+-
+-`tb_video_transition_controller`、`tb_video_transition_blender`、`tb_frame_dual_fifo_read` 和顶层 Icarus 语法展开均已通过；仅保留原有 `rdusedw` 9 位连接到 10 位端口时的补零警告。详细设计和执行记录分别为 `docs/superpowers/specs/2026-09-09-dual-frame-return-routing-design.md`、`docs/superpowers/plans/2026-09-09-dual-frame-return-routing.md`、`docs/superpowers/specs/2026-09-09-smooth-crossfade-stability-design.md` 与 `docs/superpowers/plans/2026-09-09-smooth-crossfade-stability.md`。
+-
+-换新对话后的第一步：在 TD 6.2.1 中执行 `syn_1`、`phy_1` 和 bitstream，随后只进行 JTAG 下载；至少检查十次 `KEY2` 换图、多轮 `KEY4` 自动轮播、音频连续、OSD 稳定及一次 TF 拔插恢复。此轮严禁写配置 Flash。若仍出现转场专属花屏、撕裂或明显生硬的阶梯感，不再继续增加双帧方案复杂度，直接改为“单帧先淡到白、再淡入新图”的转场，保留旧图退出和新图进入的视觉过程，同时消除双帧同时回读风险。
+-
+-用户偏好：后续由助手直接选择合适技术方案，仅在需要上板测试或遇到真实阻塞时提示；所有新功能先 JTAG 验证，配置 Flash 保持目前已验收的稳定恢复基线。
+-
+-### 7.6 双帧方案板测失败后的单帧回退（2026-09-09）
+-
+-用户已完成上一节 0..64 级双帧版本的 TD 编译和 JTAG 下载。板测确认淡入淡出的
+-连续感明显改善，但总时长约 1.08 秒偏长；更重要的是，转场期间仍然出现花屏，弱软白
+-斜线也容易被误认为未处理好的视频撕裂。该结果满足上一节预先定义的回退条件，双帧
+-交叉淡入淡出不再继续调度优化。
+-
+-工作区现已改为单帧暖白转场，尚未重新执行 TD 编译和板测：
+-
+-- `frame_read_write` 的接口和内部实现已恢复为通过长期板测的单读 FIFO +
+-  `frame_fifo_read` 路径，第二读 FIFO 和 `frame_dual_fifo_read` 不再实例化，
+-  从架构上去除转场期间的双帧 SDRAM 竞争和路由风险；
+-- 转场先让旧图淡到暖白，在完整遮罩的帧边界切换 SDRAM 显示缓冲区，再让新图从
+-  暖白恢复；16 帧淡出加 16 帧淡入，60 Hz 下总时长约 0.53 秒；
+-- 遮罩采用缓入缓出表
+-  `0,1,2,4,7,11,16,23,32,41,48,53,57,60,62,63,64`，避免固定大步长在端点产生
+-  突兀变化；
+-- 斜向扫光位置与遮罩强度解耦，在整个转场中按 0..64 单向前进，不会后半段倒退；
+-  颜色改为明确的 `#FFD166` 暖金色，40 像素外带和 16 像素强核心均采用防回绕插值，
+-  让它看起来是设计元素而不是浅色撕裂线；
+-- OSD 继续在转场效果之后合成，音乐、标题、字幕和状态栏不参与淡化。
+-
+-`tb_video_transition_controller`、`tb_video_transition_blender`、
+-`tb_frame_dual_fifo_read`、`tb_video_osd_overlay` 均通过；顶层使用真实
+-`frame_read_write`、FIFO IP 和恢复后的 `frame_fifo_read` 完整展开通过。当前只剩原有
+-FIFO 端口位宽补零和厂商 RAM 悬空端口警告。设计和计划见
+-`docs/superpowers/specs/2026-09-09-single-frame-warm-white-transition-design.md` 与
+-`docs/superpowers/plans/2026-09-09-single-frame-warm-white-transition.md`。
+-
+-下一步在 TD 6.2.1 中重新运行 `syn_1`、`phy_1` 和 bitstream 生成，只做 JTAG 下载。
+-至少检查十次 `KEY2`、多轮 `KEY4`、音乐连续、OSD 稳定和一次 TF 拔插恢复；重点确认
+-转场无矩形花屏、黑帧、撕裂或 HDMI 失锁，并确认金色扫光方向和强度自然。通过前不要
+-更新配置 Flash。
+-
+-### 7.7 单帧转场板测结论与第二轮视觉候选（2026-09-09）
+-
+-用户已完成上一节单帧版本的 TD 编译和下载。板测确认花屏完全消失，约 `0.53 秒` 的
+-转场速度合适，说明恢复单读 FIFO、在完整遮罩时切换显示缓冲区的架构方向正确。
+-
+-当前版本不作为最终视觉方案：实际画面主要表现为淡入淡出叠加黄色明暗变化，并有一条
+-黄色线从左上移动到右下。该线条容易被评委误认为视频撕裂，整体效果也比网页预览单一，
+-因此不再继续调节斜线颜色或宽度，直接从候选中移除方向线。
+-
+-已生成第二轮网页预览：
+-`.superpowers/brainstorm/contest-layout-20260909/content/fpga-transition-options-v2.html`。
+-候选包括干净柔白、中心聚光、八段百叶和像素聚合。四种方案统一使用约 `0.53 秒` 时序，
+-只模拟单帧颜色映射和规则遮罩，并在完整遮罩时换图；不使用双图混合、图片平移缩放、
+-模糊或其他当前 RTL 无法忠实实现的网页效果。OSD 始终位于转场层上方。
+-
+-在用户观看第二轮预览并反馈前，不修改转场 RTL。当前技术优先级为干净柔白、中心聚光、
+-像素聚合、八段百叶；最终只实现一个板上效果，并继续保持已验证无花屏的单帧读取架构。
+-
+-### 7.8 用户改选纯双帧交叉淡化（2026-09-09）
+-
+-用户观看第二轮候选后先选择 A，但进一步明确不接受闪白，而是要求旧图逐步透明、同时
+-显现新图。该要求本质上是真实双帧交叉淡化，不能由稳定单读路径忠实实现。用户明确要求
+-直接实施，因此本节取代上一节“最终只实现单帧效果”的暂定结论；暖白、黄色明暗变化和
+-左上到右下的线条全部删除。
+-
+-工作区已完成新的纯交叉淡化实现，尚未执行 TD 构建和上板验收：
+-
+-- 控制器在帧边界锁定当前旧图与已提交新图，使用 32 个混合帧，60 Hz 下约 `0.53 秒`；
+-- alpha 使用缓入缓出表
+-  `0,1,2,3,4,5,7,9,11,13,15,17,20,23,26,29,32,35,38,41,44,47,49,51,53,55,57,59,60,61,62,63`，
+-  下一帧直接输出新图；
+-- 混色器只计算旧、新 RGB 的互补权重，不再接收坐标，也不产生白色、黄色、斜线或其他
+-  装饰效果；
+-- 双读调度器使用 64 字突发，按 FIFO 低水位优先调度，并在真实 `Sdr_rd_en` 返回完整前
+-  锁定路由；旧、新读 FIFO 均扩展为 1024 个 32-bit 字；
+-- 修复了帧请求确认竞态：控制器会在请求撤销时才更新双读模式和目标索引，调度器现在于
+-  同步后的请求首次变低时做最终原子锁存，再开始读取，避免首个混合帧误按单读模式执行；
+-- 顶层明确将已提交目标图接入 new FIFO，将当前显示图接入 old FIFO，两路经过相同
+-  `video_delay` 后混色，OSD 继续最后叠加；写帧、FAT32、音频和恢复逻辑未改。
+-
+-`tb_video_transition_controller`、`tb_video_transition_blender`、
+-`tb_frame_dual_fifo_read`、`tb_frame_read_write_dual` 和 `tb_video_osd_overlay` 均通过。
+-其中新增包装层测试让 SDRAM 返回两组可辨识像素，并确认经过真实生成的两只异步 FIFO 后
+-旧、新序列同拍且没有互换；测试还覆盖模式与目标索引在请求确认后才更新的实际时序。
+-使用真实 `frame_read_write` 和生成 FIFO 的顶层 Icarus 展开
+-通过；只保留已有的写 FIFO 水位补零和顶层 24 位常量接 21 位地址端口警告。
+-
+-下一步在 TD 6.2.1 重新运行 `syn_1`、`phy_1` 和 bitstream，只做 JTAG 下载。重点检查
+-至少十次 `KEY2` 和多轮 `KEY4` 是否为连续纯交叉淡化，且没有白闪、黄条、矩形花屏、
+-撕裂或 HDMI 失锁，同时验证音乐、OSD 和一次 TF 拔插恢复。通过前不更新配置 Flash。
+-设计和计划分别见 `docs/superpowers/specs/2026-09-09-clean-dual-frame-crossfade-design.md`
+-与 `docs/superpowers/plans/2026-09-09-clean-dual-frame-crossfade.md`。
+-
+-### 7.9 纯交叉淡化板测花屏与读链路诊断（2026-09-09）
+-
+-用户已完成上一节纯双帧版本的 TD 编译和 JTAG 下载。板测确认约 `0.53 秒` 的纯交叉
+-淡化视觉已经过关，但转场期间再次出现花屏；因此保留当前混色算法和时长，问题范围收敛
+-到双帧 SDRAM 实时读取链路。
+-
+-本次板测使用的 19:57 构建报告为 `9445/19600 LUT`、`6475/19600 REG`、
+-`28/64 BRAM9K` 和 `13/29 DSP`。两只 1024 深度读 FIFO 已分别综合为 3 块 BRAM，
+-参数确实生效。最终时序仍为 `SWNS=-6.565ns`、`STNS=-410.468ns`、
+-`HWNS=+0.004ns`，最差路径仍是继承的 SDRAM DQ 路径。现有理想化仿真只能证明旧/新
+-命令、返回路由和像素顺序，不能证明板上没有 FIFO 欠读或 DQ 采样错误。
+-
+-工作区现已完成下一版读余量与诊断修改，尚未执行新的 TD 构建和板测：
+-
+-- 125 MHz SDRAM 频率、0/180 度相位、64 字读取突发、32 帧 alpha 曲线和纯 RGB 混色
+-  均保持不变；
+-- 新、旧两只异步读 FIFO 从 1024 扩展为 4096 个 32-bit 字，利用剩余 BRAM 增加对
+-  刷新、换行、仲裁和器件抖动的容忍度；
+-- `display_valid` 后若有效像素读取时 FIFO 为空，分别锁存新图欠读位和旧图欠读位；
+-  若上一帧命令尚未完成时下一帧请求已经到达，则锁存整帧读取超时位；
+-- 三位故障经两级同步后覆盖数码管末位，按位编码为 `1=新图欠读`、`2=旧图欠读`、
+-  `3=两路欠读`、`4=整帧读取超时`，组合故障显示 `5..7`；无读故障时末位继续显示
+-  原有媒体错误码。故障上电后持续锁存，按 `KEY1` 复位可清除。
+-
+-新增失败测试先验证了接口不存在，随后 `tb_video_transition_controller`、
+-`tb_video_transition_blender`、`tb_frame_dual_fifo_read`、`tb_frame_read_write_dual` 和
+-`tb_video_osd_overlay` 五项回归全部通过；黑盒和真实双 FIFO 顶层展开均通过。只保留
+-已有的写 FIFO 水位补零和 24 位地址常量接 21 位端口警告。设计和计划见
+-`docs/superpowers/specs/2026-09-09-crossfade-read-margin-diagnostics-design.md` 与
+-`docs/superpowers/plans/2026-09-09-crossfade-read-margin-diagnostics.md`。
+-
+-下一步在 TD 6.2.1 中重新运行 `syn_1`、`phy_1` 和 bitstream，只做 JTAG 下载。下载后
+-先按一次 `KEY1` 清零锁存，再执行至少十次 `KEY2` 和多轮 `KEY4`，同时记录花屏发生后
+-数码管末位。若花屏消失且末位保持 `0`，可继续完整回归；若末位为 `1..7`，按编码处理
+-实际欠读/超时；若仍花屏而末位保持 `0`，则 FIFO 连续性不是原因，下一步直接处理
+-SDRAM DQ 采样，不再继续扩大 FIFO。通过前不要更新配置 Flash。
+-
+-### 7.10 双帧交叉淡化 SDRAM 62.5 MHz 受控实验（2026-09-09）
+-
+-4096 深度双 FIFO 版本上板后仍然花屏，但数码管末位始终为 `0`。这排除了有效像素期
+-FIFO 欠读以及上一帧未完成、下一帧请求已到的调度超时；继续扩大 FIFO 或改低水位策略
+-没有依据。当前主因收敛为 SDRAM DQ 返回数据本身：双帧交叉淡化虽然视觉算法简单，
+-却要求每个输出像素实时读取旧、新两张图，读取负载是原稳定单帧方案的两倍；最新构建的
+-最差路径仍是 125 MHz SDRAM DQ，`SWNS=-6.565ns`。
+-
+-复查还发现，先前 41.667 MHz 实验只改了 PLL，`global_def.v` 的 `SDR_CLK_PERIOD` 仍按
+-125 MHz 计算，使真实刷新间隔被拉长约三倍。因此当时的 `341100 -> 341002` 写帧失败
+-不是有效的完整降频结论。
+-
+-工作区现已准备 62.5 MHz 受控版本：C1/C2 分别保持 0/180 度，相应参数为
+-`DIV=16, CPHASE=15/7`；C0 继续为 100 MHz；`SDR_CLK_PERIOD` 同步改为
+-`1000000000/62500000`，保持刷新物理间隔不变。纯 RGB 混色、32 帧约 0.53 秒曲线、
+-64 字突发、4096 深度双 FIFO、故障码、SD/FAT32、音频与 OSD 均不改。
+-
+-设计和计划见
+-`docs/superpowers/specs/2026-09-09-sdram-62m5-crossfade-stability-design.md` 与
+-`docs/superpowers/plans/2026-09-09-sdram-62m5-crossfade-stability.md`。PLL/IPC/刷新宏的
+-机械一致性检查通过；五项聚焦回归全部通过，真实双 FIFO 顶层展开也通过，只保留已有的
+-写 FIFO 位宽补零和 24 位地址接 21 位端口警告。下一步由 TD 6.2.1 运行 `syn_1`、
+-`phy_1` 和 bitstream，并且只做 JTAG 下载。先确认
+-首图写入不出现 `341100/341002`，再测试至少十次手动转场、多轮自动轮播、音频、OSD
+-和 TF 拔插恢复；同时观察花屏时末位是否仍为 `0`。完整通过前不得更新配置 Flash。
+-
+-### 7.11 62.5 MHz 板测失败与 50 MHz 相位平衡实验（2026-09-09）
+-
+-62.5 MHz 版本已完成 TD 编译和 JTAG 板测。首图和后续图片写入均未出现
+-`341100/341002`，证明同步修改 `SDR_CLK_PERIOD` 后，先前降频版本的刷新时基问题已经
+-消除；但交叉淡化期间依旧花屏，因此 62.5 MHz 仍未达到读取稳定性要求。
+-
+-20:52 构建的 bitstream SHA256 为
+-`9F877864246163AD14F0B5863EBE6DC4527D9FF8277F8C3F9A26ACB760A0AB33`。
+-TD 正确识别 C1/C2 为 62.5 MHz，最终时序为 `SWNS=-3.766ns`、
+-`STNS=-189.381ns`、`HWNS=+0.004ns`。全局最差路径已变为独立的 100 MHz FAT32/WAV
+-逻辑，但关键 SDRAM DQ 写、读方向分别为 `+1.092ns` 和 `-2.565ns`；读取方向仍有
+-32 个违例端点，与板上花屏相符。该版本不作为最终版本。
+-
+-下一次为最后一次双帧时钟实验：C1/C2 改为 50 MHz，C1 为 0 度，C2 为 144 度；对应
+-`DIV=20`、`CPHASE=19/7`。C2 上升沿仍保持在相对 C1 的 8 ns 位置，因此写方向继续
+-保留本次已为正的约 `+1.092ns`，而下一个 C1 沿从 16 ns 移到 20 ns，读取预算增加
+-4 ns，预计读方向变为约 `+1.435ns`。相比 45.45 MHz、180 度方案，该设置具有相近的
+-预计最小 DQ 裕量，但保留更多双帧带宽。`SDR_CLK_PERIOD` 同步改为 50 MHz，刷新物理
+-间隔保持约 31.24 us。
+-
+-纯交叉淡化、4096 双 FIFO、64 字突发、故障码和所有媒体逻辑不改。若新 TD 报告的两向
+-DQ 建立裕量未全部非负，直接拒绝；若上板后末位非零，说明 50 MHz 双读吞吐不足；若
+-末位为零仍花屏，则说明现有硬宏双帧路径不可依赖。后两种情况均停止时钟实验并回退到
+-已验证无花屏的单帧架构，不再尝试 45.45/41.667 MHz。配置 Flash 继续保持不变。
+-
+-50 MHz 源级配置检查已经通过，确认 C0 未改、C2 偏移为 8 ns、刷新间隔为 31.24 us，
+-双帧平均读取量占 50 MHz 理论单字带宽的 73.728%。五项聚焦 Icarus 回归全部通过，
+-真实双 FIFO 顶层展开通过；仅保留已有的 FIFO 水位补零和 24 位地址接 21 位端口警告。
+-当前只等待新的 TD 编译、时序报告和 JTAG 板测。
+-
+-21:08 的第一次 50 MHz 构建没有正确实现上述相位：源码误把 C2 写成 `CPHASE=11`，
+-TD 派生时钟明确报告 `phase 216`、上升沿 12 ns，而不是注释和 IPC 所写的 144 度。
+-因此写方向裕量变为 `+5.130ns`，读取方向仍精确保持 `-2.565ns`；上板虽无
+-`341100/341002`，交叉淡化仍花屏。该无效实验 bitstream SHA256 为
+-`8CB458E71F0E6591678A66610A65FE91A49066B24102C777413E1C6AC65B5B8B`，不得作为
+-最终版本。工作区现已把 C2 修正为 `CPHASE=7`；下一份 TD 报告必须显示 `phase 144`
+-和 8 ns 上升沿，才算真正执行了相位平衡实验。
+-
+-修正后的 PLL/IPC/刷新宏一致性检查通过，五项聚焦 Icarus 回归全部通过，真实双 FIFO
+-顶层展开也通过；仅保留原有位宽补零和地址截断警告。现在必须重新运行 TD 全流程，不能
+-复用 21:08 的 bitstream。
+-
+-### 7.12 终止双帧实验并精确回退到已验收单帧版本（2026-09-09）
+-
+-用户再次确认交叉淡化仍花屏且未出现 `341100/341002`，并要求回到重新选择视觉方案前
+-已经上板验证无花屏的版本。至此双帧交叉淡化、双读 FIFO、读故障码和后续 SDRAM
+-降频/相位实验全部停止，不再继续修改或诊断该路径。
+-
+-工作区已经完成精确源级回退：`sys_pll` C1/C2 恢复为官方基线 125 MHz、0/180 度，
+-参数为 `DIV=8`、`CPHASE=7/3`，`SDR_CLK_PERIOD` 同步恢复为 125 MHz；
+-`frame_read_write` 恢复单个 512-word 读 FIFO 和 `frame_fifo_read`，顶层只读取
+-`active_buffer_index`，不再保留旧图读口、第二 FIFO、双读调度器或末位读故障覆盖。
+-转场恢复为已验收的 16 帧暖白淡出、完全遮罩时切换缓冲区、16 帧淡入，总时长约
+-0.53 秒，并恢复暖金色斜向扫光。音频、FAT32、TF 恢复、OSD、图片写入和垂直翻转
+-相关代码均保留不变。
+-
+-控制器、混色器、OSD 和历史双读调度器四项聚焦仿真均通过；顶层使用黑盒接口与真实
+-单 FIFO/`frame_fifo_read` 两种方式展开均通过。仅有原稳定版本已有的 FIFO 位宽补零和
+-24 位常量连接 21 位地址端口警告。当前状态为“源码回退完成，TD/JTAG 待验证”。用户在
+-TD 中保持工程开启后执行 `Reset Runs`，重新运行 `syn_1`、`phy_1`、bitstream 并通过
+-JTAG 下载的流程正确；不得复用任何 50/62.5 MHz 或双帧 bitstream，也暂不写配置 Flash。
+-
+-首次按上述流程重新打开 TD 后，`syn_1` 于 21:54 在读设计阶段失败。日志中的三个
+-`HDL-8007` 分别是 `video_transition_controller`、`video_transition_blender` 和
+-`frame_read_write` 被当成黑盒；源码文件实际都存在。根因是这些文件被替换时 TD 仍在
+-运行，文件监视器先从内存工程中移除了短暂消失的路径，随后关闭 TD 又用旧内存状态覆盖
+-磁盘上的 `.al` 修复。TD 完全退出后已再次修复工程清单：三个模块各登记一次，
+-`frame_fifo_read`、`frame_fifo_write` 和读 FIFO IP 均启用，历史
+-`frame_dual_fifo_read` 保持排除。清单断言和真实单 FIFO 顶层展开通过；下一次可直接
+-重新打开工程、`Reset Runs` 并构建。
+-
+-### 7.13 行缓存水平推入转场源码完成（2026-09-10）
+-
+-在已验收无花屏的单 FIFO、125 MHz SDRAM 基线上，转场已改为符合赛题说明的“利用
+-行缓存实现左右滑动切换”。新图从屏幕右侧推入，旧图同步向左退出；暖白/金色滤镜、
+-左上到右下的扫光线和闪白均已从生产路径移除，OSD 仍在转场完成后叠加并保持固定。
+-
+-控制器使用 28 个推进间隔，60 Hz 下约 `0.47 秒`，精确位置表为
+-`0,2,9,20,35,54,76,100,127,156,187,219,252,286,320,354,388,421,453,484,513,540,564,586,605,620,631,638,640`。
+-转场期间锁定旧、新缓冲区索引，完成到 `640` 时才把新缓冲区设为活动帧；第一张图片
+-仍直接显示。若下一帧请求追上尚未完成的 SDRAM 读取，调度器锁存故障，控制器取消
+-转场并保持原活动缓冲区，直到 `KEY1` 复位后才释放播放互锁。
+-
+-生产读取路径仍只有一个 512-word 异步 FIFO。普通位置每行串行读取旧图可见段和新图
+-可见段，总计严格 `640` 个像素；边界位于 `16..624` 时增加 32 像素柔边，先缓存旧图
+-32 个重叠像素，再在对应新图返回时做 RGB 线性混合，每行最多 `672` 次 SDRAM 读取，
+-最终仍只向 FIFO 写入 `640` 个像素。每个地址块最多 128 个命令，只有实际
+-`Sdr_rd_en` 返回数达到已发命令数后才切换地址段，不依赖固定返回延迟。写侧继续使用
+-现有优先级和已验收的 `frame_fifo_write`。
+-
+-`tb_video_transition_controller` 已逐点核对全部 29 个位置，并覆盖首图直显、索引锁定、
+-终点切换和故障保持；`tb_frame_slide_fifo_read` 使用 8x2 小画面、4 像素柔边和带空拍的
+-返回流，覆盖地址顺序、RGB 混合、端点、稳态当前帧及超时故障。上述两项以及 OSD、
+-图片加载管理、存储适配器共五项聚焦仿真全部通过；真实单 FIFO wrapper 的顶层展开也
+-通过，只保留已有的 FIFO 位宽补零、地址裁剪和 timescale 警告。工程清单中
+-`frame_slide_fifo_read` 已启用且唯一，`frame_fifo_read`、`frame_dual_fifo_read` 和
+-`video_transition_blender` 均保留源码但排除综合。
+-
+-SDRAM 配置没有变化：C1/C2 仍为 125 MHz、0/180 度，`DIV=8`、`CPHASE=7/3`，刷新
+-周期仍按 `1000000000/125000000` 计算。当前状态为“源码和 Icarus 验证完成，TD
+-综合/布局布线/JTAG 待验证”。下一步重新打开 TD，执行 `Reset Runs` 后完整运行
+-`syn_1`、`phy_1` 和 bitstream，只做 JTAG 下载；至少测试十次手动转场、多轮自动轮播、
+-连续音频、固定 OSD 及一次 TF 拔插恢复。出现花屏、黑带、行错位、HDMI 失锁或加载
+-超时即判失败，通过前不写配置 Flash。
+-
+-### 7.14 上板复现分界线花屏，新增读 FIFO 空读诊断位（2026-09-10）
+-
+-上板测试复现花屏：转场期间新旧图分界线处出现一条随 `slide_position` 左右移动
+-的竖线，图片带红色时该线也带红。`video_delay.read_en` 只按显示时序拉取读 FIFO
+-(`assign read_en = de_d[18];`)，完全没有空标志保护；而 `frame_slide_fifo_read`
+-每行唯一的一次跨帧缓冲区大地址跳变（旧图缓存段 `old_base+608` → 新图混合段
+-`new_base+0`）恰好落在分界线上，若该跳变触发额外 SDRAM 延迟，内存侧短暂供不上
+-视频侧的固定节拍消费，就会真实空读，FIFO 输出未定义/残留值——与内容相关、随
+-分界线移动的竖线完全吻合这个失效模式，且与此前 `crossfade-read-margin-diagnostics`
+-在双帧方案上定位到的“读 FIFO 欠载”是同一类根因，只是触发点换成了跨缓冲区地址
+-跳变。
+-
+-在确认根因前不直接改深度/预取参数，先加一个上板可见的诊断位：
+-`frame_read_write.v` 接出 `read_buf` 原本悬空的 `empty_flag`，新增粘滞寄存器
+-`read_fifo_underflow_seen`，`read_en && empty` 时置位、只有全局复位才清零。
+-`top.v` 仿照现有 `transition_busy_sd_sync` 的两级同步写法把它同步进
+-`sd_card_clk` 域，并让最后一位数码管（`seg_digit_x`）在该位点亮时显示 `F`（现有
+-`error_code` 只用 0~5，不会冲突），正常时仍显示 `error_code`。新增聚焦仿真
+-`tb_frame_read_write_underflow.sv`（因生成式 FIFO IP 源码不在仓库内，测试内本地
+-实现最小行为级读写指针 FIFO 和调度器占位）验证：正常先写后读全程不置位、空读
+-立即置位、之后正常读写也保持粘滞、仅复位可清零。`tb_video_transition_controller`
+-与 `tb_frame_slide_fifo_read` 回归通过，未受影响。
+-
+-当前状态是“诊断位仿真通过，上板待验证，未修复花屏”。下一次上板：TD 里 `Reset
+-Runs` 后重新走 `syn_1`/`phy_1`/JTAG，转场时盯最后一位数码管——出现 `F` 就证实是
+-读 FIFO 空读，下一步再讨论加深读 FIFO 深度或提前预取跨缓冲区段；不出现 `F` 说明
+-花屏另有原因（例如时钟约束、OSD 叠加时序），需要继续排查。通过前不写配置 Flash。
+-
+-### 7.15 诊断位上板即常亮 F，补加 display_valid 门控（2026-09-10）
+-
+-上板反馈：从上电开始最后一位就一直是 `F`，转场时也是 `F`——诊断位失去区分度。
+-根因是 `video_delay.read_en` 每个有效行都无条件脉冲，跟 `Sdr_init_done`、首帧是否
+-已提交完全无关；上电后 `frame_slide_fifo_read` 还停在 `S_IDLE`、FIFO 里什么都没
+-写入之前，`read_en` 照样拉取，必然触发一次真实空读。这次空读本身无害——首帧提交前
+-`display_valid=0`，显示复用器输出黑屏/测试图案，根本不看 `read_data`——但粘滞锁存
+-没有办法区分“开机时空读一次”和“转场时又空读了一次”，一旦上电触发就永久卡在 `F`。
+-
+-修复：`frame_read_write.v` 新增 `display_valid` 输入端口，锁存条件改为
+-`display_valid && read_en && read_fifo_empty`；`top.v` 把已有的、供显示复用器使用
+-的 `display_valid`（`video_clk` 域，与 `read_clk` 同域）接入该端口——转场期间
+-`display_valid` 保持为 1，所以门控后的诊断位仍能覆盖转场场景，只是排除了首帧提交
+-前那次无害的开机空读。`tb_frame_read_write_underflow.sv` 新增一组“首帧提交前空读
+-不应置位”的用例，配合原有的置位/粘滞/复位清零用例。四项聚焦仿真（控制器、调度器、
+-本诊断测试、stub 路径顶层展开）全部回归通过。
+-
+-当前状态仍是“诊断位仿真通过，上板待验证，未修复花屏”。下一次上板需要从首帧真正
+-显示开始盯最后一位数码管（而不是从上电就看），尤其关注转场过程中是否出现 `F`。
+-
+-### 7.16 空读发生在首帧显示瞬间、与转场无关；诊断位升级为饱和计数器（2026-09-10）
+-
+-上板反馈：上电是 `0`，第一张图片刚显示出来（一次按键都没按，完全没触发过转场）
+-就变成 `F`，之后一直是 `F`。这排除了此前“空读只发生在转场分界线那次跨缓冲区地址
+-跳变”的假设——问题在新调度器 `frame_slide_fifo_read` 处理普通稳态显示
+-（`slide_active=0`、`p=0`）时就已经存在，至少发生过一次，跟转场没有必然关系。
+-
+-但原来的诊断位只是一个粘滞标志位，只能回答“发生过没有”，回答不了“发生了一次还是
+-持续不断发生”——而 `video_delay.read_en` 在一整行有效期间是持续拉高的（不是单周期
+-脉冲），如果某一行卡住空读了 20 多个周期，跟真的连续每行都空读，在粘滞位上看起来
+-完全一样。为了能分辨这两种情况，把诊断位从“是否发生过”升级为 4 位饱和事件计数器
+-`read_fifo_underflow_count`：对门控条件（`display_valid && read_en &&
+-read_fifo_empty`）做边沿检测，一次连续的空读区间只算一次事件，饱和在 `4'hF` 不
+-回绕。`top.v` 把整条 4 位总线按本文件里已有的 `disp_buf_idx_video_sync`/
+-`osd_status_video_sync` 那种多位总线双寄存器同步方式接入 `sd_card_clk` 域，非零时
+-直接用这个计数值覆盖 `seg_digit_x`（而不是简单显示 `F`）。`tb_frame_read_write_underflow.sv`
+-改写为验证计数语义：两次独立空读记两次事件；连续 20 周期的持续空读只记一次事件；
+-饱和在 `4'hF`；只有复位才清零。控制器、调度器、stub 顶层展开三项回归不受影响。
+-
+-当前状态仍是“诊断位仿真通过，上板待验证，未修复花屏”。下一次上板请直接读数码管上
+-的具体数值（不只是看是不是非零）：如果在完全不触发转场的稳态播放期间，计数值很快
+-定住在一个很小的数字不再增长，说明是一次性的开机/冷访问小毛刺，本身可能无视觉影响，
+-转场时能看到的竖线需要另外找原因（或者是同一个吞吐余量问题被转场时持续的边界跳变
+-放大到肉眼可见）；如果稳态播放期间计数值持续增长（完全不触发转场也一样），说明新
+-调度器本身相对旧的整帧直读方案存在通用的吞吐/余量退化，这才是下一步要优先修的，而
+-不是转场分界线的跳变逻辑。
+-
+-### 7.17 上板半秒内冲满F、与转场无关；仿真定位真实根因；诊断位升级为逐帧刷新（2026-09-10）
+-
+-上板反馈：上电是 `0`，第一张图片刚显示出来（完全没按键、没触发任何转场）就在半秒内
+-迅速冲到 `F`。由于诊断位仍是“只要发生过就永久粘住”的粘滞计数器，无法区分“早期饱和
+-一次后就恢复正常”和“每一帧都以这种速度持续饱和”，所以先做了一次更深入的仿真排查，
+-而不是继续瞎猜参数。
+-
+-**仿真排查。** 搭了一个临时集成仿真（不进入正式测试套件），把真实的 `video_timing_data`、
+-`video_delay`、`frame_read_write`、`frame_slide_fifo_read` 按真实时钟比例（25MHz 视频
+-时钟 / 125MHz 内存时钟，与 `video_pll.v`/`sys_pll.v` 一致）接在一起，SDRAM 用理想化的
+-"最快情形"替身模型（固定4周期延迟、每周期都能接受新命令、零写侧竞争），并让
+-`display_valid` 在多个真实视频帧之后才拉高（模拟 TF 卡真实加载耗时远超一帧，排除此前
+-"第一次真实 read_req 之前就冷启动空读"的干扰）。
+-
+-结果：**即使在完全没有转场的稳态播放期间**（`slide_active=0`、`p=0`，寻址方式与转场前
+-的整帧直读方案完全一致），读 FIFO 仍然反复空读，大约每帧 426 次，而且是无限期持续
+-发生，不是一次性开机现象。追踪调度器内部状态发现：空读发生时调度器始终停在
+-`S_IDLE`、`row_index=479`（最后一行）、FIFO 完全为空，而视频侧 `de` 仍在帧中间持续
+-拉高、还需要更多行。根因是：`read_req` 每帧只触发一次（vsync 边沿），调度器的准入
+-控制 `wrusedw < FIFO_START_LEVEL` 只保证"FIFO瞬时占用不超过约512字"，**完全没有机制
+-让"整帧累计生产速度"匹配"视频整帧的真实消费速度"**。在理想化的快速内存假设下，调度
+-器能在远小于视频实际显示480行所需的约15.36ms内，就把整帧307,200个像素全部写完，
+-之后整帧剩余时间全程闲置、无事可做——这与上板"几乎瞬间冲满、跟转场无关"的现象高度
+-吻合。
+-
+-**需要保留的重要说明。** 这套准入控制模式（`FIFO_DEPTH=512`、`BURST_SIZE=128`、
+-`wrusedw < FIFO_DEPTH-BURST_SIZE`）在转场前"已上板验证"的旧版整帧读取器
+-`frame_fifo_read.v` 里原样存在；而且稳态模式（`p=0`）下 `frame_slide_fifo_read` 每行
+-发出的仍是与旧方案完全相同的单次640字连续读取，没有额外地址跳变——所以这不是转场
+-跳变逻辑带来的新退化。真实 SDRAM（有真实的行激活/预充电/刷新开销，我的理想化模型
+-完全没有建模这些）几乎肯定比理想化替身慢，因此仿真测出的"每帧426次"这个具体数字，
+-很可能高估了真实上板的严重程度。但上板本身的时间特征（半秒内冲满、与转场无关）与
+-仿真揪出的机制高度吻合，因此把它当作现阶段最有力的解释，而不是仿真假象。
+-
+-**诊断位升级为逐帧刷新、不再永久粘滞。** 永久粘滞的计数器只能回答"上电以来有没有
+-发生过"，无法回答"是不是每一帧都这么快饱和"。`frame_read_write.v` 新增
+-`read_fifo_underflow_count_per_frame`：内部仍用边沿检测统计当前帧的空读事件数（饱和
+-在 `4'hF`），但在每次帧边界（`read_req` 在 `read_clk` 域的上升沿）把"刚结束那一帧"的
+-计数值锁存到一个稳定的输出寄存器，再把running计数器清零重新开始。这样数码管上显示
+-的值每帧才更新一次、稳定保持约16.8ms，而不是帧内瞬时抖动，也不会被早期一次饱和永久
+-盖住后续帧的真实情况。`top.v` 的双寄存器同步和 `seg_digit_x` 覆盖逻辑结构不变，只是
+-改用新的端口名。`tb_frame_read_write_underflow.sv` 改写为显式驱动多个帧边界并验证：
+-帧内的空读事件不会提前影响显示值；显示值只在下一次帧边界才更新为"上一帧"的计数；
+-帧内饱和不影响当前显示；紧接着一个完全干净的帧会让显示值归零（证明这是逐帧快照，
+-不是永久粘滞）。控制器、调度器回归不受影响。
+-
+-当前状态仍是“诊断位仿真通过，上板待验证，未修复花屏”。下一次上板请连续观察数码管
+-好几秒（在完全不触发转场的稳态播放下）：如果第一两帧后就稳定回落到 0（或很小且不再
+-重复的数），说明确实只是一次性开机瞬态，转场时的竖线需要另外排查；如果稳态播放下
+-每一帧都持续显示很高的值（很可能就是 `F`，与仿真吻合），就证实了调度器完全没有帧内
+-真实节拍余量，下一步应该给 `frame_slide_fifo_read` 加上明确的速率限制（例如限制它相对
+-视频真实行位置最多能提前多少行，而不是只限制 FIFO 瞬时占用），而不是继续把这当成
+-转场分界线特有的问题。
+-
+-### 7.18 固定左侧色线定位为 AXIS 行末标志错位（2026-09-11）
+-
+-刷新停顿握手修复上板后，花屏和原有黄色线条已经消失，但转场运动期间屏幕最左侧仍有
+-一列随图片内容变色的竖线，停止运动后消失。进一步确认该线固定在屏幕 `x=0`，不跟随
+-新旧图片分界线移动，因此排除了 32 像素柔边和 SDRAM 跨缓冲区读跳变。
+-
+-新增 `tb_video_delay_line_boundary.sv`，使用生产异步 FIFO 和 `video_delay` 对两行首尾
+-标记像素逐个核对；测试通过，证明 FIFO 读延迟没有把上一行末像素送到下一行首像素。
+-随后新增 `tb_video_rgb_to_axis_line_boundary.sv`，对两条完整 640 像素 AXIS 行逐像素核对，
+-稳定复现第 640 个像素到来时 `O_video_last=0`。根因是每行首像素分支把 `S_x_cnt` 保持
+-为 0，导致其余整行计数落后一拍，最后一个像素只能观察到 638，永远达不到原判定值 639。
+-
+-修复仅把首像素分支的下一计数值改为 1；RGB、valid、SOF、视频时序、转场合成和 SDRAM
+-路径均未改。修复后两条 640 像素测试行都只在 `x=639` 精确产生一次 TLAST，FIFO 边界、
+-转场控制器、行调度器、逐帧 underflow 和真实顶层展开全部通过。七组 refresh-stall/FIFO
+-扫描再次跑满 24 帧，均为 `underflow=0`、`dropped=0`、`scheduler_stuck=0`。
+-
+-TD 命令行已用最新源码重新综合，并通过 multi-seed 的 seed 2 完成布局布线和 bitstream：
+-routing overflow 为 0，Hold WNS 为 `+0.021 ns`。下一步只烧录 seed 2 的 bitstream，确认
+-转场期间固定在屏幕最左侧的内容相关色线是否消失。
+-
+-### 7.19 Pipeline the transition feather datapath (2026-09-11)
+-
+-Board testing showed that the TLAST correction did not materially reduce the
+-fixed left-edge color line. The routed timing report then identified a
+-transition-only hardware defect: the 125 MHz `ext_mem_clk` path from the
+-overlap cache through the feather multiplier/add chain to `fifo_write_data`
+-had -4.746 ns setup slack and ten logic levels.
+-
+-`frame_slide_fifo_read.v` now carries direct and blended pixels through one
+-ordered output-valid pipeline. Feather processing is split into registered
+-difference/direction, registered multiplication, and final add/sub stages.
+-The scheduler reserves three FIFO entries for in-flight output and waits for
+-the pipeline to drain before ending a frame. SDRAM command/return accounting
+-and transition addresses are unchanged.
+-
+-The new `tb_frame_slide_full_line.sv` checks every pixel in two 640-pixel rows
+-at slide positions 0, 2, 16, 320, 624, 638, and 640. It passes together with
+-the scheduler, controller, underflow, FIFO/video-delay, and RGB-to-AXIS tests.
+-The seven refresh/depth cases passed an eight-frame post-change matrix with
+-zero underflow, dropped commands, or scheduler stalls. A full 24-frame rerun
+-was attempted first but all parallel jobs reached the script's 900-second
+-process limit before producing final result records.
+-
+-TD synthesis and seed-2 place/route/bitgen completed. The former feather
+-datapath no longer appears among the worst `ext_mem_clk` paths; the registered
+-`fifo_write_data` to read-FIFO RAM path has +0.134 ns slack. The remaining
+-internal `ext_mem_clk` WNS is -1.253 ns in write-FIFO-level to read/write
+-arbitration control, while the global -6.565 ns remains the SDRAM DQ external
+-capture path. Board validation of the new bitstream is pending.
+-
+-### 7.20 SDRAM 读取稳定化与水平转场最终验收（2026-09-13）
+-
+-在 7.19 之后继续用纯色诊断、地址图案、阶段着色和真实图片逐层缩小故障范围，最终确认
+-转场期间的两类内容相关彩线来自 SDRAM 分段读取时的陈旧返回和不完整突发处理，而不是
+-OSD、HDMI 输出、图片文件或屏幕物理边缘。最终修复由以下两部分组成：
+-
+-- 每个可见读段开始前执行 4-word 预读并丢弃返回，隔离地址切换后的陈旧数据；
+-- 可见 payload 始终发出完整的固定 128-word burst，并在切换到下一地址段前排空多余尾部返回。
+-
+-`video_delay.v` 同时改为使用读 FIFO 的 `valid`，并通过 4 项视频域对齐队列保证数据、有效
+-标志与显示时序一致，避免行首沿用上一行末像素。读 FIFO 最终保持
+-`SHOW_AHEAD_EN=0 + OUTREG`，继续映射到 BRAM；没有采用加深 FIFO、SDRAM 降频或 PLL
+-相位调整作为最终修复。
+-
+-最终生产配置为：
+-
+-```verilog
+-.WRITE_BUFFER_SOLID_DIAGNOSTIC(0),
+-.SLIDE_FEATHER_ENABLE(0),
+-.SLIDE_FIFO_UNIFORM_DIAGNOSTIC(0),
+-.SLIDE_SDRAM_UNIFORM_DIAGNOSTIC(0),
+-.SLIDE_READ_ADDRESS_PATTERN_DIAGNOSTIC(0),
+-.SLIDE_PHASE_COLOR_DIAGNOSTIC(0),
+-.READ_CHUNK_PREROLL_WORDS(4),
+-.FIXED_READ_BURST_ENABLE(1),
+-```
+-
+-专项仿真覆盖陈旧返回、固定 burst、640x480 全帧、七个滑动位置逐像素、多帧显示、FIFO、
+-视频延迟、AXIS、OSD、转场、underflow、marker、写入诊断以及真实/桩顶层展开，均通过。
+-refresh-stall/FIFO 深度矩阵的有效完成记录均为 `underflow=0`、`dropped=0`、
+-`scheduler_stuck=0`；最坏的 `stall=16, depth=512` 另完成 24 帧运行。固定 burst 全帧读取
+-约耗时 `107.2 us`，低于一帧周期。
+-
+-最终 bitstream 已完成 TD 综合、布局布线、生成和 JTAG 上板验证。真实图片手动切换和自动
+-轮播期间，屏幕最左侧彩线与随分界线移动的彩线均消失；画面没有花屏、黑屏、异常重影、
+-上下乱动或按键失灵。音频、OSD、TF 卡拔插恢复及稳定显示回归均通过。因此阶段 6 正式
+-验收完成，当前无羽化版本作为后续开发和比赛展示的稳定基线。
+-
+-羽化不再列入项目计划。启用羽化会为每行增加两个 32 像素读段；在固定 burst 机制下造成
+-显著额外读取，上板出现多重残影、横纵乱动、转场无法完成和下一张按键失效。恢复
+-`SLIDE_FEATHER_ENABLE=0` 后全部恢复正常。16-word 预读也已由实测否决，其相对 4-word
+-方案几乎没有改善，不再继续增加。
+-
+-### 7.21 下一阶段入口：图片缩放
+-
+-下一阶段按总体计划进入阶段 7。首先建立独立、可逐像素核对的最近邻缩放模块和测试，
+-再接入现有图片加载/显示路径；最近邻稳定后才评估双线性插值。阶段 7 必须以本节记录的
+-无羽化稳定配置为回归基线，不再修改已经验收的 SDRAM 滑动调度、时钟、FIFO 深度或
+-固定 burst 策略。任何新功能均先通过 Icarus 回归，再进入 TD 和 JTAG 上板验证。
+-
+-
+-### 2026-09-23 音频频谱重写
+-
+-亮度/对比度移植回归通过；底部频谱改为512点串行FFT（hop256）、48个独立混合对数频带、AGC/静音门/帧锁存和192像素宽细柱。设计和验收状态见 superpowers/specs/2026-09-22-audio-bars-visualizer-design.md 及验证记录。
++完整文档索引见 [`docs/README.md`](README.md)。
+\ No newline at end of file
+diff --git a/fpga/osd_display/.lock.f b/fpga/osd_display/.lock.f
+index 7ed4200..83814d8 100644
+--- a/fpga/osd_display/.lock.f
++++ b/fpga/osd_display/.lock.f
+@@ -1,4 +1,4 @@
+ force
+ tan20
+-25876
++15952
+ D:\fpga\project\fpga\osd_display\.lock.f
+diff --git a/fpga/osd_display/README.md b/fpga/osd_display/README.md
+index 06e45d3..036c02a 100644
+--- a/fpga/osd_display/README.md
++++ b/fpga/osd_display/README.md
+@@ -1,24 +1,30 @@
+-# OSD Display FPGA Project
++﻿# OSD Display FPGA Project
+ 
+-This is the formal project for the reliable video baseline. `fpga/tf_hdmi_diag`
+-remains the diagnostic reference and is not modified by this project.
++姝ｅ紡宸ョ▼锛岀敤浜庡彲闈犺棰戝熀绾裤€傜洰鏍囧钩鍙帮細瀹夎矾 EG4S20BG256锛堝悍鑺?HX4S20C 鍚屽皝瑁咃級锛孒DMI 800脳480@60Hz銆?
++## 褰撳墠鐘舵€?
++`rtl/top/top.v` 涓洪《灞傦紝瀹炵幇 800脳480@60Hz HDMI 闊宠棰戞挱鏀剧郴缁燂細
+ 
+-## Current migration status
++- FAT32 / BMP 璇诲彇锛氭敮鎸佷换鎰忓垎杈ㄧ巼锛岀粡 `rtl/image/image_bilinear_scaler.v` 鍙岀嚎鎬х缉鏀鹃摵婊″睆骞?- SDRAM 鍙屽抚缂撳瓨 + 绋冲畾杞挱
++- HDMI 瑙嗛 + 48 kHz PCM WAV 闊抽锛堝惈 ACR锛?- OSD 鏍囬 / 鐘舵€?+ 婊氬姩瀛楀箷 + 琛岀紦瀛樻按骞虫帹鍏ヨ浆鍦?- 浜害 / 瀵规瘮搴﹁皟鑺?+ 512 鐐?FFT 棰戣氨鑳介噺鏌?
++## 鎸夐敭涓庡紑鍏筹紙涓婃澘鎿嶄綔锛?
++| 鍣ㄤ欢 | 寮曡剼 | 鍔熻兘 |
++| --- | --- | --- |
++| `KEY1` | B2 | 鎵嬪姩鍒囧埌涓嬩竴寮犲浘 |
++| `KEY2` | C1 | 鑷姩杞挱 寮€ / 鍏?|
++| `KEY3` | B1 | 浜害/瀵规瘮搴︼細鐭寜 +姝ラ暱锛岄暱鎸?鈭掓闀?|
++| `SW1`鈥揱SW4` | C8/C7/C6/C5 | 閫氶亾 / 姝ラ暱閫夋嫨 |
++| `RST_N` | A2 | 鍏ㄥ眬澶嶄綅 |
+ 
+-- `rtl/top/top.v` is the functionally equivalent 10-second timeout baseline.
+-- `rtl/vendor`, `ip/anlogic`, and `constraints` are local migration copies.
+-- `rtl/control/image_load_manager.v` is an independently tested replacement
+-  boundary for image loading and recovery. It is deliberately not connected to
+-  the top-level baseline until the migration build and board equivalence test
+-  have passed.
++> 鏈伐绋?*娌℃湁 `KEY4`**銆傛棭鏈熸枃妗ｉ噷鐨勩€宍KEY4` 鑷姩杞挱銆嶅凡鏀逛负 `KEY2`銆?
++## 鏋勫缓
+ 
+-## Required first hardware checks
++1. 鐢?TD 6.2.1 鎵撳紑鍚岀洰褰?`osd_display.al`锛岃繍琛?`syn_1` 鍐?`phy_1`锛堟垨鐢?`*_Runs/*/run.bat`锛夈€?2. JTAG 涓嬭浇楠岃瘉鍔熻兘銆?3. 閫氳繃鍚庡啀鍐欓厤缃?Flash锛屽仛鍐峰惎鍔ㄩ獙鏀躲€?
++## 娴嬭瘯
+ 
+-1. Open `osd_display.al` in this directory with TD 6.2.1 and run `syn_1` then `phy_1`.
+-2. Record all clock, SDRAM, and timing warnings. Do not add broad false paths.
+-3. Download through JTAG and confirm the four official BMP images, `KEY1`,
+-   `KEY2`, and `KEY4` behave as in the validated diagnostic baseline.
+-4. Only after JTAG equivalence, write configuration Flash and perform three
+-   power-off cold starts, followed by a 30-minute automatic-play run.
++Icarus Verilog 鍥炲綊锛歚tools/run_audio_bars_tests.ps1`锛堢粨鏋滃啓鍏?`audio_bars_Runs/tests/results.txt`锛夈€?
++## 宸茬煡鏈敹鏁?
++- SDRAM DQ 寤虹珛瑁曢噺 `SWNS = -6.565 ns`锛屼笌 2026-06-05 瀹樻柟 `lab_ex4_tf` 鍩虹嚎涓€鑷达紝灞炲畼鏂瑰簳搴у浐鏈夎涓猴紝绂佹鐢?`false_path` 灞忚斀銆?- 闇€鐢ㄦ渶鏂?bit 閲嶆柊鍋氫竴娆?Flash 鍥哄寲 + 鍐峰惎鍔ㄩ獙鏀讹紙璧涢鍩虹瑕佹眰銆屼笂鐢靛嵆鍙繍琛屻€嶏級銆?
++## 鏂囨。
+ 
+-Generated `*_Runs` directories and programming files are intentionally ignored.
++瀹屾暣椤圭洰鏂囨。绱㈠紩瑙?[`../docs/README.md`](../docs/README.md)銆?
++鐢熸垚鐨?`*_Runs` 鐩綍銆佹棩蹇楀拰鐑у綍鏂囦欢宸茶 `.gitignore` 蹇界暐銆
+\ No newline at end of file
+diff --git a/fpga/osd_display/ip/anlogic/video_pll.ipc b/fpga/osd_display/ip/anlogic/video_pll.ipc
+index bacfe37..5785595 100644
+--- a/fpga/osd_display/ip/anlogic/video_pll.ipc
++++ b/fpga/osd_display/ip/anlogic/video_pll.ipc
+@@ -22,14 +22,14 @@
+         <clocks>
+             <clock>
+                 <id>0</id>
+-                <clock_division_factor>40</clock_division_factor>
+-                <clock_frequency>25.0000000000000000MHz</clock_frequency>
++                <clock_division_factor>30</clock_division_factor>
++                <clock_frequency>33.3333333333333333MHz</clock_frequency>
+                 <phase_shift>0.0000000000000000deg</phase_shift>
+             </clock>
+             <clock>
+                 <id>1</id>
+-                <clock_division_factor>8</clock_division_factor>
+-                <clock_frequency>125.0000000000000000MHz</clock_frequency>
++                <clock_division_factor>6</clock_division_factor>
++                <clock_frequency>166.6666666666666667MHz</clock_frequency>
+                 <phase_shift>0.0000000000000000deg</phase_shift>
+             </clock>
+         </clocks>
+diff --git a/fpga/osd_display/ip/anlogic/video_pll.v b/fpga/osd_display/ip/anlogic/video_pll.v
+index e5631f6..461ed71 100644
+--- a/fpga/osd_display/ip/anlogic/video_pll.v
++++ b/fpga/osd_display/ip/anlogic/video_pll.v
+@@ -15,8 +15,8 @@
+ //	Clock division factor:       2
+ //	Clock information:
+ //		Clock name	| Frequency 	| Phase shift
+-//		C0        	| 25.000000 MHZ	| 0.0000  DEG  
+-//		C1        	| 125.000000MHZ	| 0.0000  DEG  
++//		C0        	| 33.333333 MHZ	| 0.0000  DEG  
++//		C1        	| 166.666667MHZ	| 0.0000  DEG  
+ ///////////////////////////////////////////////////////////////////////////////
+ `timescale 1 ns / 100 fs
+ 
+@@ -58,12 +58,12 @@ module video_pll (
+     .REFCLK_DIV(2),
+     .FBCLK_DIV(1),
+     .CLKC0_ENABLE("ENABLE"),
+-    .CLKC0_DIV(40),
+-    .CLKC0_CPHASE(39),
++    .CLKC0_DIV(30),
++    .CLKC0_CPHASE(29),
+     .CLKC0_FPHASE(0),
+     .CLKC1_ENABLE("ENABLE"),
+-    .CLKC1_DIV(8),
+-    .CLKC1_CPHASE(7),
++    .CLKC1_DIV(6),
++    .CLKC1_CPHASE(5),
+     .CLKC1_FPHASE(0) 
+   ) pll_inst (
+     .refclk(refclk),
+@@ -87,4 +87,3 @@ module video_pll (
+   );
+ 
+ endmodule
+-
+diff --git a/fpga/osd_display/rtl/control/image_load_manager.v b/fpga/osd_display/rtl/control/image_load_manager.v
+index 9750291..2202aee 100644
+--- a/fpga/osd_display/rtl/control/image_load_manager.v
++++ b/fpga/osd_display/rtl/control/image_load_manager.v
+@@ -68,6 +68,12 @@ reg [31:0] storage_init_wait_count;
+ reg        scan_active_seen;
+ reg        resume_next_after_reinit;
+ reg        preserve_display_after_reinit;
++// Cache of the image-to-SDRAM-bank mapping.  Four banks are available in the
++// frame store; keeping this map here lets a playback request switch banks
++// immediately when an image has already been loaded.
++reg [1:0] image_bank [0:7];
++reg       image_bank_valid [0:7];
++integer   cache_i;
+ 
+ assign load_in_progress = (state == ST_LOAD) || (state == ST_VERIFY);
+ assign idle             = (state == ST_IDLE);
+@@ -86,10 +92,17 @@ function [2:0] next_image_index;
+     end
+ endfunction
+ 
+-function [1:0] inactive_buffer;
++// Select the next bank after the currently displayed bank.  This keeps the
++// displayed frame protected while allowing all four banks to participate.
++function [1:0] next_write_buffer;
+     input [1:0] current;
+     begin
+-        inactive_buffer = (current == 2'd0) ? 2'd1 : 2'd0;
++        case (current)
++            2'd0: next_write_buffer = 2'd1;
++            2'd1: next_write_buffer = 2'd2;
++            2'd2: next_write_buffer = 2'd3;
++            default: next_write_buffer = 2'd0;
++        endcase
+     end
+ endfunction
+ 
+@@ -119,6 +132,10 @@ always @(posedge clk or posedge rst) begin
+         scan_active_seen    <= 1'b0;
+         resume_next_after_reinit <= 1'b0;
+         preserve_display_after_reinit <= 1'b0;
++        for (cache_i = 0; cache_i < 8; cache_i = cache_i + 1) begin
++            image_bank[cache_i]       <= 2'd0;
++            image_bank_valid[cache_i] <= 1'b0;
++        end
+     end else begin
+         scan_start <= 1'b0;
+         load_start <= 1'b0;
+@@ -187,7 +204,7 @@ always @(posedge clk or posedge rst) begin
+                                                   next_image_index(current_image_index, scan_found_count) :
+                                                   2'd0;
+                             write_buffer_index <= display_valid ?
+-                                                  inactive_buffer(display_buffer_index) : 2'd0;
++                                                  next_write_buffer(display_buffer_index) : 2'd0;
+                             retry_count         <= 2'd0;
+                             skipped_image_count <= 3'd0;
+                             resume_next_after_reinit <= 1'b0;
+@@ -243,7 +260,7 @@ always @(posedge clk or posedge rst) begin
+                             retry_count         <= 2'd0;
+                             skipped_image_count <= skipped_image_count + 3'd1;
+                             target_image_index  <= next_image_index(target_image_index, image_count);
+-                            write_buffer_index  <= inactive_buffer(display_buffer_index);
++                            write_buffer_index  <= next_write_buffer(display_buffer_index);
+                             state               <= ST_LOAD;
+                         end else begin
+                             retry_count <= 2'd0;
+@@ -265,6 +282,15 @@ always @(posedge clk or posedge rst) begin
+                 end
+ 
+                 ST_COMMIT: begin
++                    // The selected bank may have contained an older image.
++                    // Invalidate that old mapping before publishing the new one.
++                    for (cache_i = 0; cache_i < 8; cache_i = cache_i + 1) begin
++                        if (image_bank_valid[cache_i] &&
++                            (image_bank[cache_i] == write_buffer_index))
++                            image_bank_valid[cache_i] <= 1'b0;
++                    end
++                    image_bank[target_image_index]       <= write_buffer_index;
++                    image_bank_valid[target_image_index] <= 1'b1;
+                     display_buffer_index <= write_buffer_index;
+                     current_image_index  <= target_image_index;
+                     display_valid        <= 1'b1;
+@@ -285,12 +311,22 @@ always @(posedge clk or posedge rst) begin
+                         state             <= ST_RESET_WAIT;
+                     end else if ((error_code != ERR_ALL_FAILED) &&
+                                  (next_request || auto_request)) begin
+-                        target_image_index <= next_image_index(current_image_index, image_count);
+-                        write_buffer_index <= inactive_buffer(display_buffer_index);
+-                        pending_next       <= 1'b0;
+-                        retry_count        <= 2'd0;
+-                        skipped_image_count <= 3'd0;
+-                        state              <= ST_LOAD;
++                        // A cached image only needs a bank switch.  Avoiding a
++                        // second FAT/SD read is the main playback speedup.
++                        if (image_bank_valid[next_image_index(current_image_index, image_count)]) begin
++                            current_image_index  <= next_image_index(current_image_index, image_count);
++                            display_buffer_index <= image_bank[next_image_index(current_image_index, image_count)];
++                            display_valid        <= 1'b1;
++                            display_test_pattern <= 1'b0;
++                            error_code           <= ERR_NONE;
++                        end else begin
++                            target_image_index <= next_image_index(current_image_index, image_count);
++                            write_buffer_index <= next_write_buffer(display_buffer_index);
++                            pending_next       <= 1'b0;
++                            retry_count        <= 2'd0;
++                            skipped_image_count <= 3'd0;
++                            state              <= ST_LOAD;
++                        end
+                     end
+                 end
+ 
+diff --git a/fpga/osd_display/rtl/image/image_bilinear_scaler.v b/fpga/osd_display/rtl/image/image_bilinear_scaler.v
+index 2c9c207..ffaccf7 100644
+--- a/fpga/osd_display/rtl/image/image_bilinear_scaler.v
++++ b/fpga/osd_display/rtl/image/image_bilinear_scaler.v
+@@ -48,7 +48,7 @@
+ //   1 个共享串行除法器（配置阶段先后跑 X、Y 两次，各 DIVW 拍）
+ //
+ module image_bilinear_scaler #(
+-    parameter [15:0] DST_WIDTH     = 16'd640,
++    parameter [15:0] DST_WIDTH     = 16'd800,
+     parameter [15:0] DST_HEIGHT    = 16'd480,
+     parameter [15:0] MAX_SRC_WIDTH = 16'd1920,
+     parameter [15:0] MAX_SRC_HEIGHT= 16'd1080,
+@@ -115,6 +115,7 @@ module image_bilinear_scaler #(
+     // 1) 配置锁存
+     // =======================================================================
+     reg [15:0] cfg_w, cfg_h;
++    reg [15:0] fit_w, fit_h, fit_x0, fit_y0;
+     reg        cfg_latched;
+     // 一次性标志：配置块只能在 cfg_valid 首次有效时触发一次。
+     // 若只靠 !cfg_latched 判断，而在 cfg_latched 拉高之前的每一拍都会重新
+@@ -124,6 +125,15 @@ module image_bilinear_scaler #(
+     wire       cfg_w_valid = (src_width != 16'd0) && (src_width <= MAX_SRC_WIDTH);
+     wire       cfg_h_valid = (src_height != 16'd0) && (src_height <= MAX_SRC_HEIGHT);
+ 
++    // 资源安全的宽高比分类：只使用移位/加法比较，不使用组合除法器。
++    wire [19:0] asp_w3 = ({4'd0,src_width} << 1) + {4'd0,src_width};
++    wire [19:0] asp_h4 = ({4'd0,src_height} << 2);
++    wire [19:0] asp_w9 = ({4'd0,src_width} << 3) + {4'd0,src_width};
++    wire [19:0] asp_h16 = ({4'd0,src_height} << 4);
++    wire aspect_43 = (asp_w3 >= asp_h4) && (asp_w3 <= asp_h4 + 20'd8);
++    wire aspect_169 = (asp_w9 >= asp_h16) && (asp_w9 <= asp_h16 + 20'd16);
++    wire width_limited = (asp_w3 >= asp_h4);
++
+     // =======================================================================
+     // 2) 共享串行除法器（恢复余数法，逐位处理被除数最高位）
+     //       dividend = srcN << F   (<= 1966080, 21 bit)
+@@ -268,14 +278,14 @@ module image_bilinear_scaler #(
+ 
+     // ---- 水平累加器下一状态 ----
+     wire [16:0]     remacc_x_sum = {1'b0, remacc_x} + {1'b0, rem_x};
+-    wire            carry_x      = (remacc_x_sum >= {1'b0, DST_WIDTH});
+-    wire [15:0]     remacc_x_new = carry_x ? (remacc_x_sum[15:0] - DST_WIDTH) : remacc_x_sum[15:0];
++    wire            carry_x      = (remacc_x_sum >= {1'b0, fit_w});
++    wire [15:0]     remacc_x_new = carry_x ? (remacc_x_sum[15:0] - fit_w) : remacc_x_sum[15:0];
+     wire [FIXW-1:0] fix_x_new    = fix_x + step_x + {{(FIXW-1){1'b0}}, carry_x};
+ 
+     // ---- 垂直累加器下一状态 ----
+     wire [16:0]     remacc_y_sum = {1'b0, remacc_y} + {1'b0, rem_y};
+-    wire            carry_y      = (remacc_y_sum >= {1'b0, DST_HEIGHT});
+-    wire [15:0]     remacc_y_new = carry_y ? (remacc_y_sum[15:0] - DST_HEIGHT) : remacc_y_sum[15:0];
++    wire            carry_y      = (remacc_y_sum >= {1'b0, fit_h});
++    wire [15:0]     remacc_y_new = carry_y ? (remacc_y_sum[15:0] - fit_h) : remacc_y_sum[15:0];
+     wire [FIXW-1:0] fix_y_new    = fix_y + step_y + {{(FIXW-1){1'b0}}, carry_y};
+ 
+     // =======================================================================
+@@ -313,6 +323,9 @@ module image_bilinear_scaler #(
+ 
+     wire em_x_last = (out_x == (DST_WIDTH  - 16'd1));
+     wire em_y_last = (out_y == (DST_HEIGHT - 16'd1));
++    wire bar_pixel = (out_x < fit_x0) || (out_x >= fit_x0 + fit_w) ||
++                     (out_y < fit_y0) || (out_y >= fit_y0 + fit_h);
++    wire fit_row = (out_y >= fit_y0) && (out_y < fit_y0 + fit_h);
+     // sy1 行写完的条件：已完成的行数 wr_row 必须 > sy1
+     wire row_pair_ready = (wr_row > sy1);
+ 
+@@ -442,6 +455,7 @@ module image_bilinear_scaler #(
+             step_x <= 0; step_y <= 0; rem_x <= 0; rem_y <= 0;
+ 
+             cfg_w <= 0; cfg_h <= 0; cfg_latched <= 1'b0; cfg_started <= 1'b0;
++            fit_w <= DST_WIDTH; fit_h <= DST_HEIGHT; fit_x0 <= 0; fit_y0 <= 0;
+ 
+             fifo_wp <= 0; fifo_rp <= 0; fifo_cnt <= 0;
+             src_overflow_count <= 8'd0;
+@@ -511,6 +525,18 @@ module image_bilinear_scaler #(
+                 cfg_started  <= 1'b1;
+                 cfg_w <= src_width;
+                 cfg_h <= src_height;
++                // Uniform fit-to-frame geometry.  The products above select
++                // the limiting axis; the other axis is one integer divide.
++                // All offsets are derived from the destination dimensions.
++                if (width_limited) begin
++                    if (aspect_43) begin fit_w <= 16'd640; fit_h <= DST_HEIGHT; fit_x0 <= 16'd80; fit_y0 <= 16'd0; end
++                    else begin fit_w <= DST_WIDTH; fit_h <= aspect_169 ? 16'd450 : DST_HEIGHT; fit_x0 <= 16'd0; fit_y0 <= aspect_169 ? 16'd15 : 16'd0; end
++                end else begin
++                    fit_h <= DST_HEIGHT;
++                    fit_w <= DST_WIDTH;
++                    fit_y0 <= 16'd0;
++                    fit_x0 <= 16'd0;
++                end
+                 if (!cfg_w_valid || !cfg_h_valid) error_code[0] <= 1'b1;
+                 // 启动 X 轴除法
+                 div_is_y     <= 1'b0;
+@@ -583,7 +609,7 @@ module image_bilinear_scaler #(
+                     // 输出行的起始源行」，见 EM_P6。若在这里改成当前行的 sy0，
+                     // 降采样步长接近 3 时（1080/480 = 2.25）会死锁。
+                     EM_ROW_WAIT: begin
+-                        if (row_pair_ready) begin
++                        if (!fit_row || row_pair_ready) begin
+                             out_x    <= 16'd0;
+                             em_state <= EM_P0;
+                         end
+@@ -616,13 +642,18 @@ module image_bilinear_scaler #(
+                     EM_P6: begin
+                         // 输出缓冲满则原地等待（h0/h1 已稳定，不会丢数据）
+                         if (!out_stall) begin
+-                            dst_data  <= dst_c;
++                            dst_data  <= bar_pixel ? 24'h000000 : dst_c;
+                             dst_valid <= 1'b1;
+                             px_count  <= px_count + 32'd1;
+                             if (em_x_last) begin
+                                 // 本行结束：推进垂直累加器，水平累加器清零
+-                                fix_y    <= fix_y_new;
+-                                remacc_y <= remacc_y_new;
++                                // Letterbox rows do not consume source
++                                // coordinates; keep the accumulator parked
++                                // until the active image rectangle begins.
++                                if (fit_row) begin
++                                    fix_y    <= fix_y_new;
++                                    remacc_y <= remacc_y_new;
++                                end
+                                 fix_x    <= 0;
+                                 remacc_x <= 0;
+                                 out_x    <= 16'd0;
+@@ -641,8 +672,10 @@ module image_bilinear_scaler #(
+                                     em_state <= EM_ROW_INIT;
+                                 end
+                             end else begin
+-                                fix_x    <= fix_x_new;
+-                                remacc_x <= remacc_x_new;
++                                if (!bar_pixel) begin
++                                    fix_x    <= fix_x_new;
++                                    remacc_x <= remacc_x_new;
++                                end
+                                 out_x    <= out_x + 16'd1;
+                                 em_state <= EM_P0;
+                             end
+diff --git a/fpga/osd_display/rtl/storage/fat32_wav_loader.v b/fpga/osd_display/rtl/storage/fat32_wav_loader.v
+index 9f3834d..b512a02 100644
+--- a/fpga/osd_display/rtl/storage/fat32_wav_loader.v
++++ b/fpga/osd_display/rtl/storage/fat32_wav_loader.v
+@@ -66,6 +66,7 @@ reg [3:0]  riff_byte_index;
+ reg [2:0]  chunk_byte_index;
+ reg [31:0] chunk_id;
+ reg [31:0] chunk_size;
++reg [1:0]  chunk_size_mod3;
+ reg [31:0] chunk_remaining;
+ reg         chunk_pad_pending;
+ reg [31:0] fmt_byte_index;
+@@ -101,23 +102,36 @@ wire [31:0] reader_sd_sec_read_addr;
+ assign sd_sec_read      = reader_sd_sec_read;
+ assign sd_sec_read_addr = reader_sd_sec_read_addr;
+ 
+-function is_divisible_by_six;
+-    input [31:0] value;
+-    integer bit_index;
+-    reg [2:0] remainder;
++function [1:0] add_byte_mod3;
++    input [1:0] residue;
++    input [7:0] value;
++    reg [2:0] pair_sum_lo;
++    reg [2:0] pair_sum_hi;
++    reg [3:0] pair_sum;
++    reg [1:0] byte_mod3;
++    reg [2:0] total;
+     begin
+-        // Six is two times three.  The parity check plus this small serial
+-        // modulo-three reduction avoids inferring a general-purpose divider.
+-        remainder = 3'd0;
+-        for (bit_index = 31; bit_index >= 0; bit_index = bit_index - 1) begin
+-            remainder = {remainder[1:0], value[bit_index]};
+-            if (remainder >= 3'd3)
+-                remainder = remainder - 3'd3;
+-        end
+-        is_divisible_by_six = !value[0] && (remainder == 3'd0);
++        // 4 == 1 (mod 3): reduce four base-4 digits in a balanced tree.
++        // Explicit widths retain the carry bits (sum range is 0..12).
++        pair_sum_lo = {1'b0, value[1:0]} + {1'b0, value[3:2]};
++        pair_sum_hi = {1'b0, value[5:4]} + {1'b0, value[7:6]};
++        pair_sum = {1'b0, pair_sum_lo} + {1'b0, pair_sum_hi};
++        case (pair_sum)
++            4'd0, 4'd3, 4'd6, 4'd9, 4'd12: byte_mod3 = 2'd0;
++            4'd1, 4'd4, 4'd7, 4'd10: byte_mod3 = 2'd1;
++            default: byte_mod3 = 2'd2;
++        endcase
++        total = {1'b0, residue} + {1'b0, byte_mod3};
++        add_byte_mod3 = (total >= 3'd3) ? (total - 3'd3) : total;
+     end
+ endfunction
+ 
++// 256 == 1 (mod 3), so little-endian size bytes can be accumulated as
++// they arrive. No extra parser cycle: the reader has no byte-level ready.
++wire [1:0] next_chunk_size_mod3 = add_byte_mod3(
++    (chunk_byte_index == 3'd0) ? 2'd0 : chunk_size_mod3,
++    reader_file_sec_data);
++
+ // Audio files are commonly much larger than BMP headers and can span tens of
+ // thousands of FAT32 clusters.  Keep the reader's conservative default for
+ // other clients, while allowing BGM.WAV to use the full 16-bit chain limit.
+@@ -168,6 +182,7 @@ always @(posedge clk or posedge rst) begin
+         chunk_byte_index    <= 3'd0;
+         chunk_id            <= 32'd0;
+         chunk_size          <= 32'd0;
++        chunk_size_mod3     <= 2'd0;
+         chunk_remaining     <= 32'd0;
+         chunk_pad_pending   <= 1'b0;
+         fmt_byte_index      <= 32'd0;
+@@ -233,6 +248,7 @@ always @(posedge clk or posedge rst) begin
+                     chunk_byte_index     <= 3'd0;
+                     chunk_id             <= 32'd0;
+                     chunk_size           <= 32'd0;
++                    chunk_size_mod3      <= 2'd0;
+                     chunk_remaining      <= 32'd0;
+                     chunk_pad_pending    <= 1'b0;
+                     fmt_byte_index       <= 32'd0;
+@@ -323,6 +339,7 @@ always @(posedge clk or posedge rst) begin
+                                 end
+ 
+                                 P_CHUNK_SIZE: begin
++                                    chunk_size_mod3 <= next_chunk_size_mod3;
+                                     case (chunk_byte_index)
+                                         3'd0: chunk_size[7:0]   <= reader_file_sec_data;
+                                         3'd1: chunk_size[15:8]  <= reader_file_sec_data;
+@@ -347,8 +364,7 @@ always @(posedge clk or posedge rst) begin
+                                             if (!fmt_seen ||
+                                                 ({reader_file_sec_data, chunk_size[23:0]} == 32'd0) ||
+                                                 (pcm_is_24_bit ?
+-                                                 !is_divisible_by_six({reader_file_sec_data,
+-                                                                       chunk_size[23:0]}) :
++                                                 (chunk_size[0] || (next_chunk_size_mod3 != 2'd0)) :
+                                                  (chunk_size[1:0] != 2'd0)) ||
+                                                 ({reader_file_sec_data,
+                                                   chunk_size[23:0]} >
+diff --git a/fpga/osd_display/rtl/storage/image_storage_adapter.v b/fpga/osd_display/rtl/storage/image_storage_adapter.v
+index 5017dfb..34c4e94 100644
+--- a/fpga/osd_display/rtl/storage/image_storage_adapter.v
++++ b/fpga/osd_display/rtl/storage/image_storage_adapter.v
+@@ -8,7 +8,9 @@ module image_storage_adapter #(
+     // SPI 限制（每像素约 96 拍），写侧缩放器每输出像素要 7 拍，所以
+     // 源图必须有 W*H*96 >= 640*480*7，即 W*H >= 22400。这里默认 32000
+     // （约 1.4 倍余量）。做成参数是为了让集成测试能用小图。
+-    parameter [31:0] MIN_SRC_PIXELS = 32'd32000
++    parameter [31:0] MIN_SRC_PIXELS = 32'd32000,
++    parameter [15:0] DST_WIDTH      = 16'd640,
++    parameter [15:0] DST_HEIGHT     = 16'd480
+ )(
+     input  wire        clk,
+     input  wire        rst,
+@@ -482,8 +484,8 @@ assign load_progress_pulse = image_grant && sd_sec_read_end;
+ //   把这些代价全部消掉。
+ // ---------------------------------------------------------------------------
+ image_bilinear_scaler #(
+-    .DST_WIDTH      (16'd640),
+-    .DST_HEIGHT     (16'd480),
++    .DST_WIDTH      (DST_WIDTH),
++    .DST_HEIGHT     (DST_HEIGHT),
+     .MAX_SRC_WIDTH  (16'd1920),
+     .MAX_SRC_HEIGHT (16'd1080),
+     .FRAC_BITS      (4'd10),
+diff --git a/fpga/osd_display/rtl/top/top.v b/fpga/osd_display/rtl/top/top.v
+index 9575262..fa9bbeb 100644
+--- a/fpga/osd_display/rtl/top/top.v
++++ b/fpga/osd_display/rtl/top/top.v
+@@ -30,9 +30,13 @@ module top(
+ parameter MEM_DATA_BITS = 32;
+ parameter ADDR_BITS     = 21;
+ parameter BUSRT_BITS    = 10;
+-parameter FRAME_PIXELS  = 24'd307200;   // 640*480
++localparam integer VIDEO_WIDTH  = 800;
++localparam integer VIDEO_HEIGHT = 480;
++parameter FRAME_PIXELS  = VIDEO_WIDTH * VIDEO_HEIGHT;
+ parameter BUF0_ADDR     = 24'd0;
+ parameter BUF1_ADDR     = FRAME_PIXELS;
++parameter BUF2_ADDR     = FRAME_PIXELS * 2;
++parameter BUF3_ADDR     = FRAME_PIXELS * 3;
+ 
+ wire Sdr_init_done;
+ wire Sdr_init_ref_vld;
+@@ -276,7 +280,9 @@ assign frame_write_done_pulse = frame_write_toggle_sync[2] ^ frame_write_toggle_
+ image_storage_adapter #(
+     .SCAN_START_SECTOR (32'd0),
+     .SCAN_MAX_SECTOR   (32'd131071),
+-    .SCAN_TARGET_COUNT (4'd8)
++    .SCAN_TARGET_COUNT (4'd8),
++    .DST_WIDTH         (VIDEO_WIDTH),
++    .DST_HEIGHT        (VIDEO_HEIGHT)
+ ) image_storage_adapter_m0(
+     .clk               (sd_card_clk),
+     .rst               (rst_all),
+@@ -603,7 +609,9 @@ video_timing_data video_timing_data_m0(
+     .de                (de_0)
+ );
+ 
+-video_transition_controller video_transition_controller_m0(
++video_transition_controller #(
++    .FRAME_WIDTH            (VIDEO_WIDTH)
++) video_transition_controller_m0(
+     .video_clk              (video_clk),
+     .rst                    (rst_all),
+     .video_read_req         (video_read_req),
+@@ -769,8 +777,8 @@ video_osd_overlay video_osd_overlay_m0(
+ frame_read_write #(
+     .WRITE_V_FLIP        (1),
+     .WRITE_BUFFER_SOLID_DIAGNOSTIC(0),
+-    .FRAME_WIDTH         (640),
+-    .FRAME_HEIGHT        (480),
++    .FRAME_WIDTH         (VIDEO_WIDTH),
++    .FRAME_HEIGHT        (VIDEO_HEIGHT),
+     .SLIDE_FEATHER_ENABLE(0),
+     .SLIDE_FIFO_UNIFORM_DIAGNOSTIC(0),
+     .SLIDE_SDRAM_UNIFORM_DIAGNOSTIC(0),
+@@ -799,8 +807,8 @@ frame_read_write #(
+     .read_finish       (),
+     .read_addr_0       (BUF0_ADDR),
+     .read_addr_1       (BUF1_ADDR),
+-    .read_addr_2       (24'd0),
+-    .read_addr_3       (24'd0),
++    .read_addr_2       (BUF2_ADDR),
++    .read_addr_3       (BUF3_ADDR),
+     .read_addr_index   (slide_active ? slide_new_buffer_index :
+                                        active_buffer_index),
+     .read_addr_index_old(slide_old_buffer_index),
+@@ -825,8 +833,8 @@ frame_read_write #(
+     .write_finish      (frame_write_finish),
+     .write_addr_0      (BUF0_ADDR),
+     .write_addr_1      (BUF1_ADDR),
+-    .write_addr_2      (24'd0),
+-    .write_addr_3      (24'd0),
++    .write_addr_2      (BUF2_ADDR),
++    .write_addr_3      (BUF3_ADDR),
+     .write_addr_index  (write_buf_idx),
+     .write_len         (FRAME_PIXELS),
+     .write_en          (sd_card_write_en),
+@@ -852,7 +860,10 @@ sdram U3(
+ );
+ 
+ // ===================== RGB/DE 转 AXIS 视频 =====================
+-video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
++video_rgb_to_axis_640x480 #(
++    .VIDEO_WIDTH   (VIDEO_WIDTH),
++    .VIDEO_HEIGHT  (VIDEO_HEIGHT)
++) u_video_rgb_to_axis_640x480(
+     .I_clk         (video_clk),
+     .I_rst         (rst_all),
+     .I_vs          (vs),
+@@ -879,17 +890,17 @@ startup_pulse #(
+ // ===================== HDMI 1.4b 发射 =====================
+ hdmi_1_4b_transmitter_core_wrapper #(
+     .DEVICE                 ( "EG"       ),
+-    .HTOTAL                 ( 800        ),
+-    .HSA                    ( 96         ),
+-    .HFP                    ( 16         ),
+-    .HBP                    ( 48         ),
+-    .HACTIVE                ( 640        ),
+-    .VTOTAL                 ( 525        ),
+-    .VSA                    ( 2          ),
+-    .VFP                    ( 10         ),
+-    .VBP                    ( 33         ),
++    .HTOTAL                 ( 1056       ),
++    .HSA                    ( 128        ),
++    .HFP                    ( 40         ),
++    .HBP                    ( 88         ),
++    .HACTIVE                ( 800        ),
++    .VTOTAL                 ( 505        ),
++    .VSA                    ( 3          ),
++    .VFP                    ( 1          ),
++    .VBP                    ( 21         ),
+     .VACTIVE                ( 480        ),
+-    .VIDEO_VIC              ( 1          ),
++    .VIDEO_VIC              ( 0          ),
+     .VIDEO_TPG              ( "Disable"  ),
+     .VIDEO_FORMAT           ( "RGB"      ),
+     .AUDIO_SAMPLE_RATE      ( "48K"      ),
+diff --git a/fpga/osd_display/rtl/vendor/SD/video_define.v b/fpga/osd_display/rtl/vendor/SD/video_define.v
+index c6e7bde..6f07e79 100644
+--- a/fpga/osd_display/rtl/vendor/SD/video_define.v
++++ b/fpga/osd_display/rtl/vendor/SD/video_define.v
+@@ -1 +1,2 @@
+-`define	VIDEO_640_480
+\ No newline at end of file
++// Native 16:10 panel timing.
++`define	VIDEO_800_480
+diff --git a/fpga/osd_display/rtl/vendor/video_rgb_to_axis_640x480.v b/fpga/osd_display/rtl/vendor/video_rgb_to_axis_640x480.v
+index 3ff1218..61fc0fc 100644
+--- a/fpga/osd_display/rtl/vendor/video_rgb_to_axis_640x480.v
++++ b/fpga/osd_display/rtl/vendor/video_rgb_to_axis_640x480.v
+@@ -1,5 +1,8 @@
+ 
+-module video_rgb_to_axis_640x480(
++module video_rgb_to_axis_640x480 #(
++    parameter integer VIDEO_WIDTH = 640,
++    parameter integer VIDEO_HEIGHT = 480
++)(
+     input  wire        I_clk,
+     input  wire        I_rst,
+     input  wire        I_vs,
+@@ -69,7 +72,7 @@ always @(posedge I_clk or posedge I_rst) begin
+             end
+ 
+             // 640x480 最后一个有效像素
+-            if (S_x_cnt == 11'd639)
++            if (S_x_cnt == VIDEO_WIDTH-1)
+                 O_video_last <= 1'b1;
+         end
+         else begin
+diff --git a/fpga/osd_display/rtl/video/audio_bars_overlay.v b/fpga/osd_display/rtl/video/audio_bars_overlay.v
+index 806363e..ede4bde 100644
+--- a/fpga/osd_display/rtl/video/audio_bars_overlay.v
++++ b/fpga/osd_display/rtl/video/audio_bars_overlay.v
+@@ -1,6 +1,8 @@
+ `timescale 1ns/1ps
+ module audio_bars_overlay #(
+- parameter [9:0] LINE_X0=224, LINE_X1=415
++ parameter [9:0] LINE_X0=224, LINE_X1=415,
++ parameter [9:0] BASELINE=416,
++ parameter [9:0] TOP_Y=336
+ )(
+  input wire [9:0] x,y,
+  input wire de,
+@@ -10,7 +12,7 @@ module audio_bars_overlay #(
+ );
+  wire [9:0] dx=x-LINE_X0;
+  wire [7:0] column=dx[9:2];
+- wire [9:0] t=10'd416-y;
++ wire [9:0] t=BASELINE-y;
+  reg [7:0] level;
+  reg [6:0] h;
+  function [6:0] height;
+@@ -365,10 +367,10 @@ module audio_bars_overlay #(
+   if(de && x>=LINE_X0 && x<=LINE_X1) begin
+    if(column<48) level=bands_display[column*8 +:8];
+    h=height(level);
+-   if(y==416) begin line_active=1;bars_rgb=24'hffffff;end
++   if(y==BASELINE) begin line_active=1;bars_rgb=24'hffffff;end
+    else begin
+-    if(y==415) begin line_active=1;bars_rgb=24'hb8c4ce;end
+-    if(column<48 && !dx[1] && y>=336 && y<=415 && t<={3'b0,h} && h!=0) begin
++    if(y==(BASELINE-1)) begin line_active=1;bars_rgb=24'hb8c4ce;end
++    if(column<48 && !dx[1] && y>=TOP_Y && y<BASELINE && t<={3'b0,h} && h!=0) begin
+      bars_active=1;line_active=0;bars_rgb=gradient(t[6:0]);
+     end
+    end
+diff --git a/fpga/osd_display/rtl/video/video_osd_overlay.v b/fpga/osd_display/rtl/video/video_osd_overlay.v
+index 4bc5025..26853a0 100644
+--- a/fpga/osd_display/rtl/video/video_osd_overlay.v
++++ b/fpga/osd_display/rtl/video/video_osd_overlay.v
+@@ -61,13 +61,13 @@ localparam [23:0] SCAN_RGB     = 24'hA7C7FF;
+ //
+ // 这一层画在亮度/对比度调节之后，所以菜单本身始终是全亮的，不会被调暗。
+ // ---------------------------------------------------------------------------
+-localparam [9:0] MENU_PANEL_X0 = 10'd448;
+-localparam [9:0] MENU_PANEL_X1 = 10'd632;
+-localparam [9:0] MENU_PANEL_Y0 = 10'd24;
+-localparam [9:0] MENU_PANEL_Y1 = 10'd60;
+-localparam [9:0] MENU_LABEL_X  = 10'd452;
+-localparam [9:0] MENU_DIGIT_X  = 10'd464;
+-localparam [9:0] MENU_BAR_X    = 10'd492;
++localparam [9:0] MENU_PANEL_X0 = 10'd16;
++localparam [9:0] MENU_PANEL_X1 = 10'd200;
++localparam [9:0] MENU_PANEL_Y0 = 10'd8;
++localparam [9:0] MENU_PANEL_Y1 = 10'd44;
++localparam [9:0] MENU_LABEL_X  = 10'd20;
++localparam [9:0] MENU_DIGIT_X  = 10'd32;
++localparam [9:0] MENU_BAR_X    = 10'd60;
+ localparam [9:0] MENU_BAR_W    = 10'd128;   // 8 段 x 16
+ localparam [9:0] MENU_SEG_W    = 10'd14;
+ localparam [9:0] MENU_ROW0_Y   = 10'd26;    // 亮度行
+@@ -98,10 +98,16 @@ wire [3:0] status_char_index;
+ wire [2:0] title_row;
+ wire [2:0] status_row;
+ wire [7:0] title_glyph;
++wire [7:0] time_glyph;
++wire [7:0] date_glyph;
++wire [9:0] time_x_offset = x - 10'd680;
++wire [9:0] date_x_offset = x - 10'd640;
+ wire [7:0] status_glyph;
+ wire       title_pixel;
+ wire       status_pixel;
+ wire       title_active;
++wire       time_active;
++wire       date_active;
+ wire       status_active;
+ wire       indicator_active;
+ wire [23:0] status_rgb;
+@@ -158,7 +164,12 @@ wire       audio_meter_active;
+ wire       audio_meter_fill;
+ wire [23:0] bars_rgb;
+ wire bars_active, line_active;
+-audio_bars_overlay u_audio_bars_overlay (
++audio_bars_overlay #(
++    .LINE_X0(10'd568),
++    .LINE_X1(10'd759),
++    .BASELINE(10'd196),
++    .TOP_Y(10'd116)
++) u_audio_bars_overlay (
+     .x(x), .y(y), .de(de), .bands_display(audio_bands),
+     .bars_rgb(bars_rgb), .bars_active(bars_active), .line_active(line_active)
+ );
+@@ -173,8 +184,12 @@ assign status_char_index = status_x_offset[6:3];
+ assign title_row = title_y_offset[3:1];
+ assign status_row = status_y_offset[3:1];
+ 
+-assign title_active = (y >= TITLE_Y) && (y < (TITLE_Y + 10'd16)) &&
+-                      (x >= TITLE_X) && (x < (TITLE_X + 10'd88));
++// The former top title bar was intentionally removed in v3.
++assign title_active = 1'b0;
++assign time_active = (y >= 10'd4) && (y < 10'd20) &&
++                     (x >= 10'd680) && (x < 10'd760);
++assign date_active = (y >= 10'd20) && (y < 10'd36) &&
++                     (x >= 10'd640) && (x < 10'd760);
+ assign status_active = (y >= STATUS_Y) && (y < (STATUS_Y + 10'd16)) &&
+                        (x >= STATUS_X) && (x < (STATUS_X + 10'd80));
+ assign indicator_active = (y >= (STATUS_Y + 10'd4)) &&
+@@ -255,6 +270,8 @@ assign menu_hl_b = (menu_channel != 2'b01);
+ assign menu_hl_c = (menu_channel != 2'b00);
+ 
+ assign title_glyph = glyph_row(title_char(title_char_index), title_row);
++assign time_glyph = glyph_row(time_char((x - 10'd680) >> 3), (y - 10'd4) >> 1);
++assign date_glyph = glyph_row(date_char((x - 10'd640) >> 3), (y - 10'd20) >> 1);
+ assign status_glyph = glyph_row(status_char(status_char_index,
+                                              display_valid,
+                                              display_test_pattern,
+@@ -266,13 +283,10 @@ assign status_glyph = glyph_row(status_char(status_char_index,
+                                              image_count), status_row);
+ assign ticker_glyph = glyph_row(ticker_char(ticker_char_index), ticker_row);
+ assign title_pixel = title_active && title_glyph[7 - title_x_offset[2:0]];
++wire time_pixel = time_active && time_glyph[7 - time_x_offset[2:0]];
++wire date_pixel = date_active && date_glyph[7 - date_x_offset[2:0]];
+ assign status_pixel = status_active && status_glyph[7 - status_x_offset[2:0]];
+ assign ticker_pixel = ticker_text_active && ticker_glyph[7 - ticker_column];
+-assign audio_meter_offset = x - 10'd512;
+-assign audio_meter_active = (y >= 10'd8) && (y < 10'd16) &&
+-                            (x >= 10'd512) && (x < 10'd632);
+-assign audio_meter_fill = audio_meter_active &&
+-                          (audio_meter_offset < ({2'd0, audio_level} * 10'd120 >> 8));
+ assign status_rgb = display_test_pattern ? FALLBACK_RGB :
+                     !storage_ready ? WAIT_RGB :
+                     load_in_progress ? LOAD_RGB :
+@@ -300,6 +314,19 @@ function [7:0] title_char;
+     end
+ endfunction
+ 
++function [7:0] time_char;
++    input [3:0] i;
++    begin
++        time_char = (i == 4'd2) ? 8'h3A : 8'h58;
++    end
++endfunction
++function [7:0] date_char;
++    input [3:0] i;
++    begin
++        date_char = ((i == 4'd4) || (i == 4'd7)) ? 8'h7C : 8'h58;
++    end
++endfunction
++
+ function [7:0] ticker_char;
+     input [5:0] char_index;
+     begin
+@@ -787,6 +814,19 @@ function [7:0] glyph_row;
+                 3'd5: glyph_row = 8'b01000000;
+                 3'd6: glyph_row = 8'b00000000;
+             endcase
++            8'h58: case (row) // X
++                3'd0: glyph_row = 8'b01000010;
++                3'd1: glyph_row = 8'b00100100;
++                3'd2: glyph_row = 8'b00011000;
++                3'd3: glyph_row = 8'b00011000;
++                3'd4: glyph_row = 8'b00100100;
++                3'd5: glyph_row = 8'b01000010;
++                3'd6: glyph_row = 8'b01000010;
++            endcase
++            8'h3A: case (row) // colon
++                3'd2, 3'd5: glyph_row = 8'b00011000;
++            endcase
++            8'h7C: glyph_row = 8'b00011000;
+             default: glyph_row = 8'h00;
+         endcase
+     end
+@@ -831,11 +871,8 @@ always @* begin
+ 
+     if (de) begin
+         if (y < TOP_BAR_HEIGHT) begin
+-            rgb_out_r = BAR_RGB;
+-            if (title_pixel)
++            if (time_pixel || date_pixel)
+                 rgb_out_r = TITLE_RGB;
+-            if (audio_meter_active)
+-                rgb_out_r = audio_meter_fill ? AUDIO_RGB : 24'h244056;
+         end else if (ticker_active) begin
+             rgb_out_r = BAR_RGB;
+             if (ticker_pixel)
+@@ -851,6 +888,9 @@ always @* begin
+         if (bars_active || line_active)
+             rgb_out_r = bars_rgb;
+ 
++        if (time_pixel || date_pixel)
++            rgb_out_r = TITLE_RGB;
++
+         if (menu_panel_active) begin
+             if (menu_seg_b_area)
+                 rgb_out_r = menu_seg_b_on ? (menu_hl_b ? MENU_SEG_ON : MENU_SEG_ON_DIM)
+diff --git a/fpga/osd_display/rtl/video/video_transition_controller.v b/fpga/osd_display/rtl/video/video_transition_controller.v
+index c34be1c..205b72c 100644
+--- a/fpga/osd_display/rtl/video/video_transition_controller.v
++++ b/fpga/osd_display/rtl/video/video_transition_controller.v
+@@ -4,7 +4,9 @@
+ 
+ // Frame-level controller for the line-buffer horizontal slide. All state
+ // changes happen on the rising edge of a video frame read request.
+-module video_transition_controller (
++module video_transition_controller #(
++    parameter integer FRAME_WIDTH = 640
++) (
+     input  wire       video_clk,
+     input  wire       rst,
+     input  wire       video_read_req,
+@@ -33,7 +35,39 @@ assign frame_request = video_read_req && !video_read_req_d;
+ function [9:0] slide_curve;
+     input [4:0] step;
+     begin
+-        case (step)
++        if (FRAME_WIDTH == 800) case (step)
++            5'd0:  slide_curve = 10'd0;
++            5'd1:  slide_curve = 10'd3;
++            5'd2:  slide_curve = 10'd11;
++            5'd3:  slide_curve = 10'd25;
++            5'd4:  slide_curve = 10'd44;
++            5'd5:  slide_curve = 10'd68;
++            5'd6:  slide_curve = 10'd95;
++            5'd7:  slide_curve = 10'd125;
++            5'd8:  slide_curve = 10'd159;
++            5'd9:  slide_curve = 10'd195;
++            5'd10: slide_curve = 10'd234;
++            5'd11: slide_curve = 10'd274;
++            5'd12: slide_curve = 10'd315;
++            5'd13: slide_curve = 10'd358;
++            5'd14: slide_curve = 10'd400;
++            5'd15: slide_curve = 10'd443;
++            5'd16: slide_curve = 10'd485;
++            5'd17: slide_curve = 10'd526;
++            5'd18: slide_curve = 10'd566;
++            5'd19: slide_curve = 10'd605;
++            5'd20: slide_curve = 10'd641;
++            5'd21: slide_curve = 10'd675;
++            5'd22: slide_curve = 10'd705;
++            5'd23: slide_curve = 10'd733;
++            5'd24: slide_curve = 10'd756;
++            5'd25: slide_curve = 10'd775;
++            5'd26: slide_curve = 10'd789;
++            5'd27: slide_curve = FRAME_WIDTH;
++            5'd28: slide_curve = FRAME_WIDTH;
++            default: slide_curve = FRAME_WIDTH;
++        endcase
++        else case (step)
+             5'd0:  slide_curve = 10'd0;
+             5'd1:  slide_curve = 10'd2;
+             5'd2:  slide_curve = 10'd9;
+@@ -133,7 +167,7 @@ always @(posedge video_clk or posedge rst) begin
+                         slide_position <= slide_curve(phase_step + 5'd1);
+                     end else begin
+                         phase_step          <= 5'd28;
+-                        slide_position      <= 10'd640;
++                        slide_position      <= FRAME_WIDTH;
+                         active_buffer_index <= slide_new_buffer_index;
+                         slide_active        <= 1'b0;
+                         transition_busy     <= 1'b0;
+diff --git a/fpga/osd_display/tests/tb_fat32_image_storage_adapter.sv b/fpga/osd_display/tests/tb_fat32_image_storage_adapter.sv
+index 19ac191..efe176b 100644
+--- a/fpga/osd_display/tests/tb_fat32_image_storage_adapter.sv
++++ b/fpga/osd_display/tests/tb_fat32_image_storage_adapter.sv
+@@ -1,6 +1,6 @@
+ `timescale 1ns/1ps
+ 
+-module tb_fat32_image_storage_adapter;
++module tb_fat32_image_storage_adapter #(parameter AUDIO_ONLY = 0);
+ 
+ reg clk = 1'b0;
+ reg rst = 1'b1;
+@@ -8,12 +8,12 @@ reg scan_start = 1'b0;
+ reg load_start = 1'b0;
+ reg load_abort = 1'b0;
+ reg storage_reinit = 1'b0;
+-reg [1:0] target_image_index = 2'd0;
++reg [2:0] target_image_index = 3'd0;
+ reg write_req_ack = 1'b0;
+ reg write_fifo_afull = 1'b0;
+ wire storage_ready;
+ wire scan_done;
+-wire [2:0] scan_found_count;
++wire [3:0] scan_found_count;
+ wire source_done_pulse;
+ wire source_error_pulse;
+ wire write_req;
+@@ -273,8 +273,8 @@ initial begin
+     #1;
+     expect_bit(storage_ready, 1'b1, "adapter reports initialized storage");
+     expect_value(scan_found_count, 3'd1, "real directory scan finds one BMP");
+-    expect_value(dut.image_cluster0, 32'd5, "real directory metadata has first cluster");
+-    expect_value(dut.image_size0, 32'd600, "real directory metadata has file size");
++    expect_value(dut.image_cluster[0], 32'd5, "real directory metadata has first cluster");
++    expect_value(dut.image_size[0], 32'd600, "real directory metadata has file size");
+     expect_value(dut.volume_first_fat_lba, 32'd2, "real directory metadata has FAT LBA");
+     expect_value(dut.volume_first_data_lba, 32'd3, "real directory metadata has data LBA");
+ 
+@@ -289,6 +289,24 @@ initial begin
+     @(negedge clk);
+     audio_fifo_wrusedw = 10'd768;
+ 
++    // Focused audio regression uses the real scanner, WAV reader and arbiter.
++    // The legacy BMP scenario below predates the bilinear scaler migration.
++    if (AUDIO_ONLY) begin
++        repeat (600) @(negedge clk);
++        expect_value(audio_frame_count, 32'd2, "high watermark pauses WAV refill");
++        expect_value(dut.u_sd_card_top.request_count, 32'd4, "scan and BGM requests only");
++        expect_value(dut.u_sd_card_top.request_log[3], 32'd8, "BGM sector selected");
++        audio_fifo_wrusedw = 10'd0;
++        while (audio_frame_count < 4) @(negedge clk);
++        expect_value(captured_audio_frame[2], 32'h02010403, "WAV loop resumes first frame");
++        expect_value(captured_audio_frame[3], 32'h12111413, "WAV loop resumes second frame");
++        storage_reinit = 1'b1;
++        repeat (5) @(negedge clk);
++        expect_bit(audio_fifo_rst, 1'b1, "storage reinit resets audio FIFO");
++        $display("PASS tb_wav_storage_adapter: scan, PCM, watermark, loop, reinit");
++        $finish;
++    end
++
+     fork
+         begin
+             @(posedge write_req);
+@@ -336,6 +354,10 @@ end
+ 
+ endmodule
+ 
++module tb_wav_storage_adapter;
++    tb_fat32_image_storage_adapter #(.AUDIO_ONLY(1)) scenario();
++endmodule
++
+ // SD-sector responder used to run the real scanner and loader through the adapter.
+ module sd_card_top(
+     input clk, input rst, output reg SD_nCS, output reg SD_DCLK, output reg SD_MOSI,
+diff --git a/fpga/osd_display/tests/tb_fat32_wav_loader.sv b/fpga/osd_display/tests/tb_fat32_wav_loader.sv
+index a8696d9..22ed42b 100644
+--- a/fpga/osd_display/tests/tb_fat32_wav_loader.sv
++++ b/fpga/osd_display/tests/tb_fat32_wav_loader.sv
+@@ -382,6 +382,49 @@ task automatic start_loader;
+     end
+ endtask
+ 
++// Exercise the public byte stream with continuous sector data. In particular,
++// accepting 42 must preserve the very first payload byte after the size field.
++task automatic check_data_size;
++    input [31:0] size_bytes;
++    input accepted;
++    integer index;
++    begin
++        @(negedge clk);
++        abort = 1'b1;
++        @(negedge clk);
++        abort = 1'b0;
++        repeat (3) @(posedge clk);
++        while (serving || end_pending || request_complete)
++            @(posedge clk);
++        @(negedge clk);
++        rst = 1'b1;
++        repeat (2) @(negedge clk);
++        rst = 1'b0;
++        clear_disk();
++        clear_observations();
++        make_extensible_pcm_wav();
++        put_file_le32(90, size_bytes);
++        file_size = 32'd94 + size_bytes;
++        for (index = 0; index < 7; index = index + 1) begin
++            put_file_le24(94 + index * 6, 24'h123456 + index * 256);
++            put_file_le24(97 + index * 6, 24'h654321 + index * 256);
++        end
++        $display("TEST 24-bit data chunk size=%0d accepted=%0b", size_bytes, accepted);
++        start_loader();
++        if (accepted) begin
++            while ((frame_count < 8) && !error_seen) @(negedge clk);
++            expect_bit(error_seen, 1'b0, "divisible data size accepted");
++            for (index = 0; index < 7; index = index + 1)
++                expect_frame(index, 16'h1234 + index, 16'h6543 + index,
++                             "all seven frames retain byte alignment");
++            expect_frame(7, 16'h1234, 16'h6543, "42-byte payload loops");
++        end else begin
++            while (!error_seen) @(negedge clk);
++            expect_value(frame_count, 32'd0, "invalid data size emits no frames");
++        end
++    end
++endtask
++
+ initial begin
+     clear_disk();
+     clear_observations();
+@@ -486,6 +529,11 @@ initial begin
+     #1;
+     expect_value(frame_count, 32'd0, "invalid WAV emits no PCM frames");
+ 
++    check_data_size(32'd40, 1'b0);
++    check_data_size(32'd42, 1'b1);
++    check_data_size(32'd41, 1'b0);
++    check_data_size(32'd0, 1'b0);
++
+     $display("PASS tb_fat32_wav_loader");
+     $finish;
+ end
+diff --git a/fpga/osd_display/tests/top_compile_stubs.v b/fpga/osd_display/tests/top_compile_stubs.v
+index 70ed777..170fe8b 100644
+--- a/fpga/osd_display/tests/top_compile_stubs.v
++++ b/fpga/osd_display/tests/top_compile_stubs.v
+@@ -80,7 +80,9 @@ module sdram(input Clk, input Clk_sft, input Rst, output Sdr_init_done,
+ endmodule
+ 
+ `ifndef OSD_USE_REAL_VIDEO_RGB_TO_AXIS
+-module video_rgb_to_axis_640x480(
++module video_rgb_to_axis_640x480 #(
++    parameter VIDEO_WIDTH = 640, parameter VIDEO_HEIGHT = 480
++)(
+     input I_clk, input I_rst, input I_vs, input I_de, input [23:0] I_rgb,
+     input I_video_ready, input I_marker_enable,
+     output O_video_user, output O_video_valid, output O_video_last,
+diff --git a/fpga/osd_display/tools/run_audio_bars_tests.ps1 b/fpga/osd_display/tools/run_audio_bars_tests.ps1
+index 166e24b..f655c37 100644
+--- a/fpga/osd_display/tools/run_audio_bars_tests.ps1
++++ b/fpga/osd_display/tools/run_audio_bars_tests.ps1
+@@ -14,11 +14,17 @@ $tests=@{
+  'tb_audio_pcm_player'=@('rtl/audio/audio_pcm_player.v');
+  'tb_hdmi_audio_acr'=@('rtl/audio/hdmi_audio_acr.v');
+  'tb_brightness_contrast_adjust'=@('rtl/video/brightness_contrast_adjust.v');
+- 'tb_param_menu_controller'=@('rtl/control/param_menu_controller.v')
++ 'tb_param_menu_controller'=@('rtl/control/param_menu_controller.v');
++ 'tb_fat32_wav_loader'=@('rtl/storage/fat32_wav_loader.v','rtl/storage/fat32_file_sector_reader.v');
++ 'tb_wav_chunk_mod3'=@('rtl/storage/fat32_wav_loader.v','rtl/storage/fat32_file_sector_reader.v');
++ 'tb_fat32_wav_long_file_reader'=@('rtl/storage/fat32_file_sector_reader.v');
++ 'tb_sd_sector_arbiter'=@('rtl/storage/sd_sector_arbiter.v');
++ 'tb_wav_storage_adapter'=@('tests/tb_fat32_image_storage_adapter.sv','rtl/storage/image_storage_adapter.v','rtl/storage/fat32_directory_scan.v','rtl/storage/fat32_bmp_loader.v','rtl/storage/fat32_wav_loader.v','rtl/storage/fat32_file_sector_reader.v','rtl/storage/sd_sector_arbiter.v','rtl/image/image_bilinear_scaler.v')
+ }
+ $results=@()
+ foreach($name in ($tests.Keys | Sort-Object)){
+- $sources=@((Join-Path $projectRoot "tests/$name.sv"))
++ $sources=@()
++ if($name -ne 'tb_wav_storage_adapter'){$sources+=Join-Path $projectRoot "tests/$name.sv"}
+  $sources += $tests[$name] | ForEach-Object {Join-Path $projectRoot $_}
+  $out=Join-Path $OutputDirectory "$name.vvp"
+  & iverilog -g2012 -s $name -o $out $sources

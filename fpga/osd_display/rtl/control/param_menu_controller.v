@@ -15,7 +15,7 @@
 //
 // 拨码定义（sw 为逻辑值，1 = 拨上，依据开发板手册 2.19 节）：
 //   sw[1:0] : 00 = 调亮度   01 = 调对比度
-//             10 = 亮度+对比度一起调   11 = 恢复默认
+//             10 = 亮度+对比度一起调   11 = 恢复默认 + 音量档
 //   sw[3:2] : 00 = 步长 1   01 = 步长 4     10 = 步长 16   11 = 步长 32
 //
 // 注意：四个通道档位全部有实际作用，**不设"保留"档**。早期版本把 11 做成
@@ -25,6 +25,8 @@
 // 按键（KEY3）：
 //   短按（松手时未达长按阈值）              -> 当前通道 += 步长
 //   长按（按住 >= LONG_PRESS_MS，松手时判定）-> 当前通道 -= 步长
+//   sw[1:0] = 11 时：亮度/对比度保持默认，KEY3 短按 = 音量 +1 档，长按 = -1 档
+//   （0..8 档，0 = 静音，8 = 原音量，每档 6 dB；默认 VOLUME_DEFAULT）
 //
 // ---------------------------------------------------------------------------
 // 三个必须守住的设计点（都是踩过坑才写进来的）：
@@ -51,7 +53,8 @@ module param_menu_controller #(
     parameter integer LONG_PRESS_MS   = 1000,
     parameter integer MENU_HOLD_MS    = 5000,
     parameter [7:0]   BRIGHTNESS_DEFAULT = 8'd255,
-    parameter [7:0]   CONTRAST_DEFAULT   = 8'd128
+    parameter [7:0]   CONTRAST_DEFAULT   = 8'd128,
+    parameter [3:0]   VOLUME_DEFAULT     = 4'd8
 )(
     input  wire       clk,
     input  wire       rst,           // 高有效异步
@@ -61,7 +64,8 @@ module param_menu_controller #(
     output wire [7:0] contrast,
     output wire [1:0] menu_channel,  // 当前调节通道，供 OSD 高亮
     output wire       menu_active,   // 最近一次操作后保持 MENU_HOLD_MS
-    output wire       cfg_toggle     // 每次配置变化翻转一次（跨时钟域握手）
+    output wire       cfg_toggle,    // 每次配置变化翻转一次（跨时钟域握手）
+    output reg  [3:0] volume         // 音量档 0..8（慢变，接收端两次采样一致即可）
 );
 
     localparam integer DEBOUNCE_CYCLES   = (CLK_FREQ_HZ / 1000) * DEBOUNCE_MS;
@@ -170,8 +174,21 @@ module param_menu_controller #(
     // ------------------------------------------------------------------
     reg [31:0] menu_timer;
 
-    // 一次"操作"：拨码变化，或保留档以外的按键松手
-    wire menu_event = sw_changed || (key_release && (sel_ch != 2'b11));
+    // 一次"操作"：拨码变化，或按键松手（11 档调音量也算，便于数码管显示）
+    wire menu_event = sw_changed || key_release;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            volume <= VOLUME_DEFAULT;
+        end else if (key_release && (sel_ch == 2'b11)) begin
+            if (long_fired) begin
+                if (volume != 4'd0)
+                    volume <= volume - 4'd1;
+            end else if (volume < 4'd8) begin
+                volume <= volume + 4'd1;
+            end
+        end
+    end
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
@@ -213,10 +230,26 @@ module param_menu_controller #(
     wire [7:0] cur_c  = cfg[15:8];
     wire [1:0] cur_ch = cfg[18:17];
 
-    wire [7:0] b_plus  = (cur_b > (8'd255 - step)) ? 8'd255 : (cur_b + step);
-    wire [7:0] b_minus = (cur_b > step)            ? (cur_b - step) : 8'd0;
-    wire [7:0] c_plus  = (cur_c > (8'd255 - step)) ? 8'd255 : (cur_c + step);
-    wire [7:0] c_minus = (cur_c > step)            ? (cur_c - step) : 8'd0;
+    // 时序（100 MHz）：加减钳位先寄存一拍，不再和 next_cfg 比较、cfg 使能串在
+    // 一拍里（原来 -1.05ns）。cur_b/cur_c 每次变化后有 TOGGLE_SPACING 拍间隔，
+    // 这期间按键本来就不会提交，所以晚一拍不影响结果。
+    reg [7:0] b_plus;
+    reg [7:0] b_minus;
+    reg [7:0] c_plus;
+    reg [7:0] c_minus;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            b_plus  <= 8'd0;
+            b_minus <= 8'd0;
+            c_plus  <= 8'd0;
+            c_minus <= 8'd0;
+        end else begin
+            b_plus  <= (cur_b > (8'd255 - step)) ? 8'd255 : (cur_b + step);
+            b_minus <= (cur_b > step)            ? (cur_b - step) : 8'd0;
+            c_plus  <= (cur_c > (8'd255 - step)) ? 8'd255 : (cur_c + step);
+            c_minus <= (cur_c > step)            ? (cur_c - step) : 8'd0;
+        end
+    end
 
     reg [7:0] next_b;
     reg [7:0] next_c;

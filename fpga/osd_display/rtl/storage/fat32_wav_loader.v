@@ -86,6 +86,16 @@ reg [23:0] pcm_left;
 reg [23:0] pcm_right;
 reg [31:0] file_sec_index;
 reg [31:0] file_byte_index;
+// 时序优化：file_size - file_byte_index 的镜像计数器，与 file_byte_index
+// 同步递减，比较时不再需要 32 位减法器。
+reg [31:0] file_bytes_left;
+// 时序（100 MHz）：32 位 ==0 / >=LIMIT 比较原来直接挡在每个解析字段寄存器的
+// ce 上。改成随计数器一起维护的寄存器标志，每次 -1 / +1 时预判下一值。
+reg        file_bytes_left_zero;
+reg        header_limit_hit;
+// chunk size 的模 3 余数，按长度字节逐个累积（256 ≡ 1 mod 3），
+// 取代原先对 32 位值做 32 次串行模 3 归约的长组合链。
+reg [1:0]  chunk_size_mod3;
 
 wire        reader_busy;
 wire        reader_done;
@@ -99,22 +109,34 @@ wire        reader_sd_sec_read;
 wire [31:0] reader_sd_sec_read_addr;
 
 assign sd_sec_read      = reader_sd_sec_read;
+
+// 本字节并入后的 chunk size 余数（第 0 字节从 0 开始）
+wire [1:0] chunk_size_mod3_next =
+    add_byte_mod3((chunk_byte_index == 3'd0) ? 2'd0 : chunk_size_mod3,
+                  reader_file_sec_data);
 assign sd_sec_read_addr = reader_sd_sec_read_addr;
 
-function is_divisible_by_six;
-    input [31:0] value;
-    integer bit_index;
-    reg [2:0] remainder;
+// (acc + b) mod 3。4 ≡ 1 (mod 3)，所以 b 的四个 2 位组直接相加即可：
+// 两两相加 (0..6)，再相加 (0..12)，查表归约到 0..2，最后与 acc 相加做
+// 一次条件减 3。各级位宽都留足进位。
+function [1:0] add_byte_mod3;
+    input [1:0] acc;
+    input [7:0] b;
+    reg [2:0] p0, p1;
+    reg [3:0] sum;
+    reg [1:0] r;
+    reg [2:0] t;
     begin
-        // Six is two times three.  The parity check plus this small serial
-        // modulo-three reduction avoids inferring a general-purpose divider.
-        remainder = 3'd0;
-        for (bit_index = 31; bit_index >= 0; bit_index = bit_index - 1) begin
-            remainder = {remainder[1:0], value[bit_index]};
-            if (remainder >= 3'd3)
-                remainder = remainder - 3'd3;
-        end
-        is_divisible_by_six = !value[0] && (remainder == 3'd0);
+        p0  = {1'b0, b[1:0]} + {1'b0, b[3:2]};
+        p1  = {1'b0, b[5:4]} + {1'b0, b[7:6]};
+        sum = {1'b0, p0} + {1'b0, p1};
+        case (sum)
+            4'd0, 4'd3, 4'd6, 4'd9, 4'd12: r = 2'd0;
+            4'd1, 4'd4, 4'd7, 4'd10:       r = 2'd1;
+            default:                       r = 2'd2;
+        endcase
+        t = {1'b0, acc} + {1'b0, r};
+        add_byte_mod3 = (t >= 3'd3) ? (t - 3'd3) : t[1:0];
     end
 endfunction
 
@@ -188,6 +210,10 @@ always @(posedge clk or posedge rst) begin
         pcm_right           <= 24'd0;
         file_sec_index      <= 32'd0;
         file_byte_index     <= 32'd0;
+        file_bytes_left     <= 32'd0;
+        file_bytes_left_zero <= 1'b1;
+        header_limit_hit    <= 1'b0;
+        chunk_size_mod3     <= 2'd0;
     end else begin
         reader_start      <= 1'b0;
         reader_abort      <= 1'b0;
@@ -247,12 +273,16 @@ always @(posedge clk or posedge rst) begin
                     fmt_seen             <= 1'b0;
                     pcm_is_24_bit        <= 1'b0;
                     header_bytes_seen    <= 32'd0;
+                    header_limit_hit     <= (HEADER_SCAN_LIMIT_BYTES == 16'd0);
                     data_bytes_remaining <= 32'd0;
                     sample_byte_index    <= 3'd0;
                     pcm_left             <= 24'd0;
                     pcm_right            <= 24'd0;
                     file_sec_index       <= 32'd0;
                     file_byte_index      <= 32'd0;
+                    file_bytes_left      <= file_size;
+                    file_bytes_left_zero <= (file_size == 32'd0);
+                    chunk_size_mod3      <= 2'd0;
                     data_complete        <= 1'b0;
                     loader_state         <= ST_WAIT_READER;
                 end
@@ -277,18 +307,26 @@ always @(posedge clk or posedge rst) begin
                 ST_STREAM_SECTOR: begin
                     if (reader_file_sec_data_valid) begin
                         if (parser_state == P_DRAIN_TAIL) begin
-                            if (file_byte_index < file_size)
+                            if (!file_bytes_left_zero) begin
                                 file_byte_index <= file_byte_index + 32'd1;
-                        end else if (file_byte_index >= file_size) begin
+                                file_bytes_left <= file_bytes_left - 32'd1;
+                                file_bytes_left_zero <= (file_bytes_left == 32'd1);
+                            end
+                        end else if (file_bytes_left_zero) begin
                             parser_error <= 1'b1;
                         end else if ((parser_state != P_PCM_DATA) &&
-                                     (header_bytes_seen >= HEADER_SCAN_LIMIT_BYTES)) begin
+                                     header_limit_hit) begin
                             parser_error <= 1'b1;
                         end else begin
                             file_byte_index <= file_byte_index + 32'd1;
+                            file_bytes_left <= file_bytes_left - 32'd1;
+                            file_bytes_left_zero <= (file_bytes_left == 32'd1);
                             if ((parser_state != P_PCM_DATA) &&
-                                (parser_state != P_DRAIN_TAIL))
+                                (parser_state != P_DRAIN_TAIL)) begin
                                 header_bytes_seen <= header_bytes_seen + 32'd1;
+                                header_limit_hit  <= ((header_bytes_seen + 32'd1) >=
+                                                      HEADER_SCAN_LIMIT_BYTES);
+                            end
 
                             case (parser_state)
                                 P_RIFF: begin
@@ -323,6 +361,7 @@ always @(posedge clk or posedge rst) begin
                                 end
 
                                 P_CHUNK_SIZE: begin
+                                    chunk_size_mod3 <= chunk_size_mod3_next;
                                     case (chunk_byte_index)
                                         3'd0: chunk_size[7:0]   <= reader_file_sec_data;
                                         3'd1: chunk_size[15:8]  <= reader_file_sec_data;
@@ -346,13 +385,15 @@ always @(posedge clk or posedge rst) begin
                                         end else if (chunk_id == CHUNK_DATA) begin
                                             if (!fmt_seen ||
                                                 ({reader_file_sec_data, chunk_size[23:0]} == 32'd0) ||
+                                                // 24-bit: 能被 6 整除 = 偶数且模 3 为 0
                                                 (pcm_is_24_bit ?
-                                                 !is_divisible_by_six({reader_file_sec_data,
-                                                                       chunk_size[23:0]}) :
+                                                 (chunk_size[0] || (chunk_size_mod3_next != 2'd0)) :
                                                  (chunk_size[1:0] != 2'd0)) ||
+                                                // 超出本字节之后的剩余长度
+                                                // (> left-1  <=>  >= left, left 此时 >= 1)
                                                 ({reader_file_sec_data,
-                                                  chunk_size[23:0]} >
-                                                 (file_size - file_byte_index - 32'd1))) begin
+                                                  chunk_size[23:0]} >=
+                                                 file_bytes_left)) begin
                                                 parser_error <= 1'b1;
                                             end else begin
                                                 data_bytes_remaining <= {reader_file_sec_data,

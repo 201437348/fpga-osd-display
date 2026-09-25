@@ -58,13 +58,13 @@ localparam [23:0] SCAN_RGB     = 24'hA7C7FF;
 //
 // 这一层画在亮度/对比度调节之后，所以菜单本身始终是全亮的，不会被调暗。
 // ---------------------------------------------------------------------------
-localparam [9:0] MENU_PANEL_X0 = 10'd448;
-localparam [9:0] MENU_PANEL_X1 = 10'd632;
+localparam [9:0] MENU_PANEL_X0 = 10'd16;
+localparam [9:0] MENU_PANEL_X1 = 10'd200;
 localparam [9:0] MENU_PANEL_Y0 = 10'd24;
 localparam [9:0] MENU_PANEL_Y1 = 10'd60;
-localparam [9:0] MENU_LABEL_X  = 10'd452;
-localparam [9:0] MENU_DIGIT_X  = 10'd464;
-localparam [9:0] MENU_BAR_X    = 10'd492;
+localparam [9:0] MENU_LABEL_X  = 10'd20;
+localparam [9:0] MENU_DIGIT_X  = 10'd32;
+localparam [9:0] MENU_BAR_X    = 10'd60;
 localparam [9:0] MENU_BAR_W    = 10'd128;   // 8 段 x 16
 localparam [9:0] MENU_SEG_W    = 10'd14;
 localparam [9:0] MENU_ROW0_Y   = 10'd26;    // 亮度行

@@ -6,22 +6,27 @@ reg clk = 1'b0;
 reg rst = 1'b1;
 reg storage_ready = 1'b0;
 reg scan_done = 1'b0;
-reg [2:0] scan_found_count = 3'd0;
+reg [3:0] scan_found_count = 4'd0;
 reg source_done_pulse = 1'b0;
 reg source_error_pulse = 1'b0;
 reg storage_fault_pulse = 1'b0;
 reg write_done_pulse = 1'b0;
 reg next_request = 1'b0;
 reg auto_request = 1'b0;
+reg prev_request = 1'b0;
+reg load_progress_pulse = 1'b0;
+// Legacy checks below keep the display "unsettled" so no background preload
+// starts; the cache section at the end raises it.
+reg display_settled = 1'b0;
 
 wire scan_start;
 wire load_start;
 wire load_abort;
 wire storage_reinit;
-wire [1:0] target_image_index;
-wire [1:0] write_buffer_index;
-wire [1:0] display_buffer_index;
-wire [1:0] current_image_index;
+wire [2:0] target_image_index;
+wire [2:0] write_buffer_index;
+wire [2:0] display_buffer_index;
+wire [2:0] current_image_index;
 wire display_valid;
 wire display_test_pattern;
 wire [2:0] state;
@@ -30,9 +35,11 @@ wire [3:0] error_code;
 wire pending_next;
 wire source_done_seen;
 wire write_done_seen;
-wire [2:0] image_count;
+wire [3:0] image_count;
 wire load_in_progress;
 wire idle;
+wire commit_pulse;
+wire preloading;
 
 always #5 clk = ~clk;
 
@@ -51,8 +58,11 @@ image_load_manager #(
     .source_error_pulse(source_error_pulse),
     .storage_fault_pulse(storage_fault_pulse),
     .write_done_pulse(write_done_pulse),
+    .load_progress_pulse(load_progress_pulse),
+    .display_settled(display_settled),
     .next_request(next_request),
     .auto_request(auto_request),
+    .prev_request(prev_request),
     .scan_start(scan_start),
     .load_start(load_start),
     .load_abort(load_abort),
@@ -71,8 +81,13 @@ image_load_manager #(
     .write_done_seen(write_done_seen),
     .image_count(image_count),
     .load_in_progress(load_in_progress),
-    .idle(idle)
+    .idle(idle),
+    .commit_pulse(commit_pulse),
+    .preloading(preloading)
 );
+
+integer commit_count = 0;
+always @(posedge commit_pulse) commit_count = commit_count + 1;
 
 task automatic tick;
     begin
@@ -117,7 +132,7 @@ task automatic wait_for_state;
 endtask
 
 task automatic finish_scan;
-    input [2:0] count;
+    input [3:0] count;
     begin
         scan_done = 1'b0;
         scan_found_count = count;
@@ -126,7 +141,7 @@ task automatic finish_scan;
         scan_done = 1'b1;
         tick();
         scan_done = 1'b0;
-        wait_for_state(3'd2, "load state after scan");
+        wait_for_state(3'd2, "load state after scan");   // via ST_SELECT (miss)
     end
 endtask
 
@@ -154,7 +169,7 @@ task automatic complete_current_load;
 endtask
 
 task automatic finish_preserving_recovery_scan;
-    input [2:0] count;
+    input [3:0] count;
     begin
         scan_done = 1'b0;
         scan_found_count = count;
@@ -172,13 +187,15 @@ task automatic reset_dut;
         rst = 1'b1;
         storage_ready = 1'b0;
         scan_done = 1'b0;
-        scan_found_count = 3'd0;
+        scan_found_count = 4'd0;
+        display_settled = 1'b0;
         source_done_pulse = 1'b0;
         source_error_pulse = 1'b0;
         storage_fault_pulse = 1'b0;
         write_done_pulse = 1'b0;
         next_request = 1'b0;
         auto_request = 1'b0;
+        prev_request = 1'b0;
         repeat (2) tick();
         rst = 1'b0;
         tick();
@@ -332,6 +349,145 @@ initial begin
     expect_bit(display_valid, 1'b0, "failed first image is not committed");
     expect_bit(display_test_pattern, 1'b1, "failed first image shows test pattern");
     expect_value(error_code, 4'd2, "first-image timeout recorded");
+
+    // -----------------------------------------------------------------
+    // Six-slot cache, 5 images: after one round every image stays in SDRAM
+    // -----------------------------------------------------------------
+    reset_dut();
+    commit_count = 0;
+    storage_ready = 1'b1;
+    finish_scan(4'd5);
+    complete_current_load(1'b1);
+    expect_value(display_buffer_index, 3'd0, "cache: first image in slot 0");
+    expect_value(commit_count, 1, "cache: first load commits once");
+    display_settled = 1'b1;
+
+    // Priority +1, +2, -1, +3 (-2 == +3 for 5 images): 1, 2, 4, 3 -> slots 1..4.
+    wait_for_state(3'd3, "cache: preload +1 verify");
+    expect_bit(preloading, 1'b1, "cache: preload flag");
+    expect_bit(idle, 1'b1, "cache: preload still reports idle");
+    expect_value(target_image_index, 3'd1, "cache: preload target 1");
+    expect_value(write_buffer_index, 3'd1, "cache: preload slot 1");
+    complete_current_load(1'b1);
+    expect_value(display_buffer_index, 3'd0, "cache: preload keeps display");
+    expect_value(current_image_index, 3'd0, "cache: preload keeps current");
+    expect_value(commit_count, 1, "cache: preload does not commit");
+    wait_for_state(3'd3, "cache: preload +2 verify");
+    expect_value(target_image_index, 3'd2, "cache: preload target 2");
+    expect_value(write_buffer_index, 3'd2, "cache: preload slot 2");
+    complete_current_load(1'b0);
+    wait_for_state(3'd3, "cache: preload -1 verify");
+    expect_value(target_image_index, 3'd4, "cache: preload target 4 (prev)");
+    expect_value(write_buffer_index, 3'd3, "cache: preload slot 3");
+    complete_current_load(1'b1);
+    wait_for_state(3'd3, "cache: preload +3 verify");
+    expect_value(target_image_index, 3'd3, "cache: preload target 3");
+    expect_value(write_buffer_index, 3'd4, "cache: preload slot 4");
+
+    // A request during a preload whose successor is cached switches at once.
+    next_request = 1'b1;
+    tick();
+    next_request = 1'b0;
+    expect_value(current_image_index, 3'd1, "cache: hit during preload");
+    expect_value(display_buffer_index, 3'd1, "cache: hit slot during preload");
+    expect_value(commit_count, 2, "cache: hit during preload commits");
+    expect_bit(preloading, 1'b1, "cache: preload continues");
+    complete_current_load(1'b1);
+    expect_value(display_buffer_index, 3'd1, "cache: preload completion keeps display");
+
+    // All five images cached: nothing more to load.
+    repeat (40) tick();
+    expect_value(state, 3'd5, "cache: all cached, stays idle");
+    expect_bit(preloading, 1'b0, "cache: no further preload");
+
+    // A full forward round (next and auto) and a prev step are all hits.
+    begin : walk
+        integer k;
+        reg [2:0] exp_img [0:4];
+        reg [2:0] exp_slot [0:4];
+        exp_img[0] = 3'd2; exp_slot[0] = 3'd2;
+        exp_img[1] = 3'd3; exp_slot[1] = 3'd4;
+        exp_img[2] = 3'd4; exp_slot[2] = 3'd3;
+        exp_img[3] = 3'd0; exp_slot[3] = 3'd0;
+        exp_img[4] = 3'd1; exp_slot[4] = 3'd1;
+        for (k = 0; k < 5; k = k + 1) begin
+            if (k % 2) auto_request = 1'b1; else next_request = 1'b1;
+            tick();
+            next_request = 1'b0;
+            auto_request = 1'b0;
+            repeat (3) tick();
+            expect_value(current_image_index, exp_img[k], "cache: walk image");
+            expect_value(display_buffer_index, exp_slot[k], "cache: walk slot");
+            expect_value(commit_count, 3 + k, "cache: walk commits");
+            repeat (20) tick();
+            expect_value(state, 3'd5, "cache: walk starts no load");
+            expect_bit(preloading, 1'b0, "cache: walk starts no preload");
+        end
+    end
+    prev_request = 1'b1; tick(); prev_request = 1'b0;
+    repeat (3) tick();
+    expect_value(current_image_index, 3'd0, "cache: prev hit");
+    expect_value(display_buffer_index, 3'd0, "cache: prev hit slot");
+    expect_value(commit_count, 8, "cache: prev hit commits");
+    repeat (20) tick();
+    expect_value(state, 3'd5, "cache: prev hit starts no load");
+
+    // -----------------------------------------------------------------
+    // Six images: slot 5 is used, a failing preload is dropped quietly
+    // -----------------------------------------------------------------
+    reset_dut();
+    commit_count = 0;
+    storage_ready = 1'b1;
+    finish_scan(4'd6);
+    complete_current_load(1'b1);
+    display_settled = 1'b1;
+    // Priority +1, +2, -1, +3, -2: 1, 2, 5, 3, 4.
+    wait_for_state(3'd3, "six: preload 1");
+    expect_value(target_image_index, 3'd1, "six: preload target 1");
+    complete_current_load(1'b1);
+    wait_for_state(3'd3, "six: preload 2");
+    expect_value(target_image_index, 3'd2, "six: preload target 2");
+    complete_current_load(1'b1);
+    wait_for_state(3'd3, "six: failing preload verify");
+    expect_bit(preloading, 1'b1, "six: failing preload is a preload");
+    expect_value(target_image_index, 3'd5, "six: preload target 5 (prev)");
+    expect_value(write_buffer_index, 3'd3, "six: failing preload slot 3");
+    begin : fail_preload
+        integer n;
+        n = 0;
+        while (preloading && (n < 200)) begin tick(); n = n + 1; end
+    end
+    expect_bit(preloading, 1'b0, "six: failing preload gives up");
+    expect_value(error_code, 4'd0, "six: preload failure reports no error");
+    expect_value(current_image_index, 3'd0, "six: preload failure keeps image");
+    wait_for_state(3'd3, "six: preload 3");
+    expect_value(target_image_index, 3'd3, "six: preload target 3");
+    expect_value(write_buffer_index, 3'd3, "six: 3 reuses the freed slot");
+    complete_current_load(1'b1);
+    wait_for_state(3'd3, "six: preload 4");
+    expect_value(target_image_index, 3'd4, "six: preload target 4");
+    expect_value(write_buffer_index, 3'd4, "six: preload slot 4");
+    complete_current_load(1'b1);
+    repeat (60) tick();
+    expect_value(state, 3'd5, "six: failed preload is not retried");
+
+    // Prev miss from idle loads image 5 in the foreground into slot 5.
+    prev_request = 1'b1; tick(); prev_request = 1'b0;
+    wait_for_state(3'd3, "six: prev miss verify");
+    expect_bit(preloading, 1'b0, "six: prev miss is foreground");
+    expect_value(target_image_index, 3'd5, "six: prev miss target 5");
+    expect_value(write_buffer_index, 3'd5, "six: prev miss slot 5");
+    complete_current_load(1'b1);
+    expect_value(current_image_index, 3'd5, "six: prev miss loads 5");
+    expect_value(display_buffer_index, 3'd5, "six: display slot 5");
+    expect_value(commit_count, 2, "six: prev miss commits");
+    // Everything is cached now: 5 -> 0 is a hit into slot 0.
+    next_request = 1'b1; tick(); next_request = 1'b0;
+    repeat (3) tick();
+    expect_value(current_image_index, 3'd0, "six: wrap hit");
+    expect_value(display_buffer_index, 3'd0, "six: wrap hit slot 0");
+    repeat (20) tick();
+    expect_value(state, 3'd5, "six: wrap hit starts no load");
 
     $display("PASS tb_image_load_manager");
     $finish;

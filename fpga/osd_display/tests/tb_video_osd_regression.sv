@@ -3,7 +3,9 @@ module tb_video_osd_regression;
 reg clk=0,rst=1,vs=0,de=0;reg [23:0] rgb=24'h123456;reg menu=0;
 wire [23:0] actual,reference;integer x,y,m;
 always #5 clk=~clk;
-video_osd_overlay dut(.video_clk(clk),.rst(rst),.vs(vs),.de(de),.rgb_in(rgb),.display_valid(1'b1),.display_test_pattern(1'b0),.storage_ready(1'b1),.manager_state(3'd2),.load_in_progress(1'b0),.target_image_index(3'd1),.current_image_index(3'd0),.image_count(4'd8),.menu_active(menu),.brightness_value(8'd200),.contrast_value(8'd128),.menu_channel(2'd1),.audio_level(8'd64),.audio_bands({48{8'd255}}),.rgb_out(actual));
+// 喂入旧标题文本：新 OSD 必须与旧参考逐像素一致
+wire [319:0] title_txt = 320'h202020202020202020202020202020202020202020202020202020202059414c505349442044534f;
+video_osd_overlay dut(.info_text(title_txt),.video_clk(clk),.rst(rst),.vs(vs),.de(de),.rgb_in(rgb),.display_valid(1'b1),.display_test_pattern(1'b0),.storage_ready(1'b1),.manager_state(3'd2),.load_in_progress(1'b0),.target_image_index(3'd1),.current_image_index(3'd0),.image_count(4'd8),.menu_active(menu),.brightness_value(8'd200),.contrast_value(8'd128),.menu_channel(2'd1),.rgb_out(actual));
 video_osd_overlay_reference ref_dut(.video_clk(clk),.rst(rst),.vs(vs),.de(de),.rgb_in(rgb),.display_valid(1'b1),.display_test_pattern(1'b0),.storage_ready(1'b1),.manager_state(3'd2),.load_in_progress(1'b0),.target_image_index(3'd1),.current_image_index(3'd0),.image_count(4'd8),.menu_active(menu),.brightness_value(8'd200),.contrast_value(8'd128),.menu_channel(2'd1),.rgb_out(reference));
 initial begin
  repeat(3) @(negedge clk);rst=0;

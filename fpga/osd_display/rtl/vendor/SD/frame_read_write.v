@@ -45,8 +45,10 @@ module frame_read_write
 	input [ADDR_BITS - 1:0]          read_addr_1,
 	input [ADDR_BITS - 1:0]          read_addr_2,
 	input [ADDR_BITS - 1:0]          read_addr_3,
-	input [1:0]                      read_addr_index,
-	input [1:0]                      read_addr_index_old,
+	input [ADDR_BITS - 1:0]          read_addr_4,
+	input [ADDR_BITS - 1:0]          read_addr_5,
+	input [2:0]                      read_addr_index,       // 槽号 0..5
+	input [2:0]                      read_addr_index_old,
 	input                            slide_active,
 	input [9:0]                      slide_position,
 	input [ADDR_BITS - 1:0]          read_len,
@@ -70,7 +72,9 @@ module frame_read_write
 	input [ADDR_BITS - 1:0]          write_addr_1,
 	input [ADDR_BITS - 1:0]          write_addr_2,
 	input [ADDR_BITS - 1:0]          write_addr_3,
-	input [1:0]                      write_addr_index,
+	input [ADDR_BITS - 1:0]          write_addr_4,
+	input [ADDR_BITS - 1:0]          write_addr_5,
+	input [2:0]                      write_addr_index,
 	input [ADDR_BITS - 1:0]          write_len,
 	input                            write_en,
 	input [WRITE_DATA_BITS - 1:0]    write_data,
@@ -105,9 +109,9 @@ assign read_fifo_write_data =
 	32'hFFFFFF00 : slide_fifo_write_data;
 
 assign write_fifo_data = WRITE_BUFFER_SOLID_DIAGNOSTIC ?
-	(write_addr_index == 2'd0) ? 32'hE0202000 :
-	(write_addr_index == 2'd1) ? 32'h20E04000 :
-	(write_addr_index == 2'd2) ? 32'h2040E000 :
+	(write_addr_index == 3'd0) ? 32'hE0202000 :
+	(write_addr_index == 3'd1) ? 32'h20E04000 :
+	(write_addr_index == 3'd2) ? 32'h2040E000 :
 	                            32'hE0E02000 : write_data;
 
 always @(posedge mem_clk or posedge rst) begin
@@ -213,6 +217,8 @@ frame_fifo_write #(
 	.write_addr_1     (write_addr_1),
 	.write_addr_2     (write_addr_2),
 	.write_addr_3     (write_addr_3),
+	.write_addr_4     (write_addr_4),
+	.write_addr_5     (write_addr_5),
 	.write_addr_index (write_addr_index),
 	.write_len        (write_len),
 	.fifo_aclr        (write_fifo_aclr),
@@ -267,6 +273,8 @@ frame_slide_fifo_read #(
 	.read_addr_1      (read_addr_1),
 	.read_addr_2      (read_addr_2),
 	.read_addr_3      (read_addr_3),
+	.read_addr_4      (read_addr_4),
+	.read_addr_5      (read_addr_5),
 	.old_buffer_index (read_addr_index_old),
 	.new_buffer_index (read_addr_index),
 	.slide_active     (slide_active),

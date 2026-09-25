@@ -9,18 +9,18 @@ module video_transition_controller (
     input  wire       rst,
     input  wire       video_read_req,
     input  wire       display_valid,
-    input  wire [1:0] committed_buffer_index,
+    input  wire [2:0] committed_buffer_index,   // 槽号 0..5
     input  wire       read_fault,
-    output reg  [1:0] active_buffer_index,
-    output reg  [1:0] slide_old_buffer_index,
-    output reg  [1:0] slide_new_buffer_index,
+    output reg  [2:0] active_buffer_index,
+    output reg  [2:0] slide_old_buffer_index,
+    output reg  [2:0] slide_new_buffer_index,
     output reg        slide_active,
     output reg        transition_busy,
     output reg  [9:0] slide_position
 );
 
-reg [1:0] observed_buffer_index;
-reg [1:0] target_buffer_index;
+reg [2:0] observed_buffer_index;
+reg [2:0] target_buffer_index;
 reg [4:0] phase_step;
 reg       transition_pending;
 reg       first_frame_seen;
@@ -70,11 +70,11 @@ endfunction
 
 always @(posedge video_clk or posedge rst) begin
     if (rst) begin
-        active_buffer_index    <= 2'd0;
-        slide_old_buffer_index <= 2'd0;
-        slide_new_buffer_index <= 2'd0;
-        observed_buffer_index  <= 2'd0;
-        target_buffer_index    <= 2'd0;
+        active_buffer_index    <= 3'd0;
+        slide_old_buffer_index <= 3'd0;
+        slide_new_buffer_index <= 3'd0;
+        observed_buffer_index  <= 3'd0;
+        target_buffer_index    <= 3'd0;
         phase_step             <= 5'd0;
         transition_pending     <= 1'b0;
         first_frame_seen       <= 1'b0;

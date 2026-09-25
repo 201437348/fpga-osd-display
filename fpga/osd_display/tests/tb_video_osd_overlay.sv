@@ -41,7 +41,7 @@ video_osd_overlay dut (
     .brightness_value    (brightness_value),
     .contrast_value      (contrast_value),
     .menu_channel        (menu_channel),
-    .audio_level(8'd0), .audio_bands(384'd0),
+    .info_text           (320'h202033332e3020454c414353202030383031583032393120474d492020303834583034362054554f),
     .rgb_out             (rgb_out)
 );
 
@@ -229,40 +229,40 @@ initial begin
 
     // -----------------------------------------------------------------------
     // 参数菜单（第13课）
-    // 版面：面板 x 448..631 / y 24..59；亮度行 y 26..39、对比度行 y 44..57；
-    //       标签 x 452..459；数值 x 464..487（3 位 x 8px）；
-    //       进度条 x 492 起，段距 16、段宽 14，共 492..617
+    // 版面：面板 x 16..199 / y 24..59（左上角常驻）；亮度行 y 26..39、对比度行 y 44..57；
+    //       标签 x 20..27；数值 x 32..55（3 位 x 8px）；
+    //       进度条 x 60 起，段距 16、段宽 14，共 60..185
     // -----------------------------------------------------------------------
     menu_active = 1'b0;
     brightness_value = 8'd255;
     contrast_value = 8'd128;
     menu_channel = 2'b00;
-    force dut.x = 10'd500;
+    force dut.x = 10'd68;
     force dut.y = 10'd30;
     #1;
     expect_rgb(rgb_out, 24'h123456, "menu hidden while inactive");
 
     menu_active = 1'b1;
-    force dut.x = 10'd450;   // 面板内、两行之间的空白处
+    force dut.x = 10'd18;   // 面板内、两行之间的空白处
     force dut.y = 10'd25;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "menu panel background");
 
     // 面板四边界
-    force dut.x = 10'd447;
+    force dut.x = 10'd15;
     force dut.y = 10'd30;
     #1;
     expect_rgb(rgb_out, 24'h123456, "one pixel left of panel is picture");
-    force dut.x = 10'd448;
+    force dut.x = 10'd16;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "panel left edge");
-    force dut.x = 10'd631;
+    force dut.x = 10'd199;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "panel right edge inside");
-    force dut.x = 10'd632;
+    force dut.x = 10'd200;
     #1;
     expect_rgb(rgb_out, 24'h123456, "one pixel right of panel is picture");
-    force dut.x = 10'd500;
+    force dut.x = 10'd68;
     force dut.y = 10'd59;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "panel bottom edge inside");
@@ -274,24 +274,24 @@ initial begin
     menu_channel = 2'b10;   // 两行都高亮，先把条形解码单独验干净
     // 亮度 = 255：8 段全亮
     force dut.y = 10'd26;
-    force dut.x = 10'd492;
+    force dut.x = 10'd60;
     #1;
     expect_rgb(rgb_out, 24'h54E3E3, "brightness segment 0 on at 255");
-    force dut.x = 10'd604;
+    force dut.x = 10'd172;
     #1;
     expect_rgb(rgb_out, 24'h54E3E3, "brightness segment 7 on at 255");
 
     // 段间 2px 空隙露出面板底色
-    force dut.x = 10'd506;
+    force dut.x = 10'd74;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "gap between segments shows panel");
 
     // 阈值是 value > i*32（写成 >= 的话第 8 段要求 256，永远点不亮）
     brightness_value = 8'd224;
-    force dut.x = 10'd604;
+    force dut.x = 10'd172;
     #1;
     expect_rgb(rgb_out, 24'h10213A, "brightness segment 7 off at 224");
-    force dut.x = 10'd492;
+    force dut.x = 10'd60;
     #1;
     expect_rgb(rgb_out, 24'h54E3E3, "brightness segment 0 still on at 224");
 
@@ -300,17 +300,17 @@ initial begin
     expect_rgb(rgb_out, 24'h10213A, "brightness all off at 0");
 
     brightness_value = 8'd128;
-    force dut.x = 10'd540;
+    force dut.x = 10'd108;
     #1;
     expect_rgb(rgb_out, 24'h54E3E3, "brightness segment 3 on at 128");
-    force dut.x = 10'd556;
+    force dut.x = 10'd124;
     #1;
     expect_rgb(rgb_out, 24'h10213A, "brightness segment 4 off at 128");
 
     // 对比度行独立解码
     contrast_value = 8'd255;
     force dut.y = 10'd44;
-    force dut.x = 10'd604;
+    force dut.x = 10'd172;
     #1;
     expect_rgb(rgb_out, 24'h54E3E3, "contrast segment 7 on at 255");
     contrast_value = 8'd0;
@@ -321,7 +321,7 @@ initial begin
     contrast_value = 8'd255;
     menu_channel = 2'b00;    // 只高亮亮度 -> 对比度行应变暗
     force dut.y = 10'd44;
-    force dut.x = 10'd604;
+    force dut.x = 10'd172;
     #1;
     expect_rgb(rgb_out, 24'h2E6E6E, "inactive contrast bar is dimmed");
     menu_channel = 2'b01;    // 切到对比度 -> 应变亮
@@ -332,26 +332,26 @@ initial begin
     // ---- 十进制读数 ----
     // 亮度 255 -> "255"：'2' row0=00111100（bit2 亮）、'5' row0=01111110（bit6 亮）
     brightness_value = 8'd255;
-    force dut.x = 10'd469;
+    force dut.x = 10'd37;
     force dut.y = 10'd26;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "hundreds digit 2 lit");
-    force dut.x = 10'd473;
+    force dut.x = 10'd41;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "tens digit 5 lit");
-    force dut.x = 10'd481;
+    force dut.x = 10'd49;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "units digit 5 lit");
 
     // 亮度 64 -> " 64"：百位是空格，一个像素都不画
     brightness_value = 8'd64;
-    force dut.x = 10'd469;
+    force dut.x = 10'd37;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "hundreds blank below 100");
-    force dut.x = 10'd474;   // 十位 '6' row0=00111100，xoff[2:0]=2 -> bit5 亮
+    force dut.x = 10'd42;   // 十位 '6' row0=00111100，xoff[2:0]=2 -> bit5 亮
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "tens digit 6 lit");
-    force dut.x = 10'd485;   // 个位 '4' row0=00000100，xoff[2:0]=5 -> bit2 亮
+    force dut.x = 10'd53;   // 个位 '4' row0=00000100，xoff[2:0]=5 -> bit2 亮
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "units digit 4 lit");
 
@@ -359,39 +359,39 @@ initial begin
     menu_channel = 2'b01;
     contrast_value = 8'd128;
     force dut.y = 10'd44;
-    force dut.x = 10'd477;   // xoff[2:0]=5 -> bit2 亮
+    force dut.x = 10'd45;   // xoff[2:0]=5 -> bit2 亮
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "contrast tens digit 2 lit");
 
     // ---- 标签与高亮 ----
     // 'B' row0 = 01111100（xoff=1 亮），'C' row0 = 00111100（xoff=2 亮）
     menu_channel = 2'b00;
-    force dut.x = 10'd453;
+    force dut.x = 10'd21;
     force dut.y = 10'd26;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "brightness label B highlighted");
-    force dut.x = 10'd452;
+    force dut.x = 10'd20;
     #1;
     expect_rgb(rgb_out, 24'h0B1526, "brightness label transparent pixel");
 
     // 高亮跟随通道
     menu_channel = 2'b01;
-    force dut.x = 10'd453;
+    force dut.x = 10'd21;
     force dut.y = 10'd26;
     #1;
     expect_rgb(rgb_out, 24'hA7C7FF, "brightness label dim when contrast selected");
-    force dut.x = 10'd454;
+    force dut.x = 10'd22;
     force dut.y = 10'd44;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "contrast label highlighted");
 
     // 两个一起调：两行都高亮
     menu_channel = 2'b10;
-    force dut.x = 10'd453;
+    force dut.x = 10'd21;
     force dut.y = 10'd26;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "both mode highlights brightness");
-    force dut.x = 10'd454;
+    force dut.x = 10'd22;
     force dut.y = 10'd44;
     #1;
     expect_rgb(rgb_out, 24'hFFD166, "both mode highlights contrast");

@@ -57,8 +57,9 @@ module frame_read_write #(
     output App_rd_en, output [20:0] App_rd_addr, input Sdr_rd_en,
     input [31:0] Sdr_rd_dout, input read_clk, input read_req, output read_req_ack,
     output read_finish, input [23:0] read_addr_0, input [23:0] read_addr_1,
-    input [23:0] read_addr_2, input [23:0] read_addr_3, input [1:0] read_addr_index,
-    input [1:0] read_addr_index_old, input slide_active, input [9:0] slide_position,
+    input [23:0] read_addr_2, input [23:0] read_addr_3, input [23:0] read_addr_4,
+    input [23:0] read_addr_5, input [2:0] read_addr_index,
+    input [2:0] read_addr_index_old, input slide_active, input [9:0] slide_position,
     input [23:0] read_len, input read_en, input display_valid,
     output [31:0] read_data, output read_data_valid, output read_fault,
     output [3:0] read_fifo_underflow_count_per_frame,
@@ -66,7 +67,8 @@ module frame_read_write #(
     output [20:0] App_wr_addr, output [31:0] App_wr_din, output [3:0] App_wr_dm,
     input write_clk, input write_req, output write_req_ack, output write_finish,
     input [23:0] write_addr_0, input [23:0] write_addr_1, input [23:0] write_addr_2,
-    input [23:0] write_addr_3, input [1:0] write_addr_index, input [23:0] write_len,
+    input [23:0] write_addr_3, input [23:0] write_addr_4, input [23:0] write_addr_5,
+    input [2:0] write_addr_index, input [23:0] write_len,
     input write_en, input [31:0] write_data, output write_fifo_afull
 );
 endmodule

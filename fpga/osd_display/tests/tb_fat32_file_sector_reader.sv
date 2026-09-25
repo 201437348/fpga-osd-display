@@ -287,6 +287,7 @@ initial begin
     clear_request_log();
     $display("TEST invalid start");
     start_session(32'd1, 32'd512, 8'd2);
+    @(negedge clk);   // start 在读取器内部寄存一拍
     expect_bit(done, 1'b1, "invalid first cluster completes with error");
     expect_bit(error, 1'b1, "invalid first cluster is rejected");
     expect_value(request_count, 32'd0, "invalid start makes no SD request");

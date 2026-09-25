@@ -63,6 +63,25 @@ function is_power_of_two;
     end
 endfunction
 
+// 时序（100 MHz）：start 时的参数检查原来直接驱动所有锁存寄存器的 ce。
+// 改为 start 和检查结果各打一拍再用。调用方发出 start 后都一直等 busy，
+// 期间 file_size 等输入保持不变，所以晚一拍接收等价。
+reg start_q;
+reg start_bad_q;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        start_q     <= 1'b0;
+        start_bad_q <= 1'b0;
+    end else begin
+        start_q     <= start;
+        start_bad_q <= (file_first_cluster < 32'd2) ||
+                       (file_size == 32'd0) ||
+                       !is_power_of_two(sectors_per_cluster) ||
+                       (sectors_per_cluster > 8'd128);
+    end
+end
+
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         state                       <= ST_IDLE;
@@ -108,11 +127,8 @@ always @(posedge clk or posedge rst) begin
                     busy        <= 1'b0;
                     sd_sec_read <= 1'b0;
 
-                    if (start) begin
-                        if ((file_first_cluster < 32'd2) ||
-                            (file_size == 32'd0) ||
-                            !is_power_of_two(sectors_per_cluster) ||
-                            (sectors_per_cluster > 8'd128)) begin
+                    if (start_q) begin
+                        if (start_bad_q) begin
                             done  <= 1'b1;
                             error <= 1'b1;
                         end else begin

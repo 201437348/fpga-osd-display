@@ -1,24 +1,30 @@
-# OSD Display FPGA Project
+﻿# OSD Display FPGA Project
 
-This is the formal project for the reliable video baseline. `fpga/tf_hdmi_diag`
-remains the diagnostic reference and is not modified by this project.
+姝ｅ紡宸ョ▼锛岀敤浜庡彲闈犺棰戝熀绾裤€傜洰鏍囧钩鍙帮細瀹夎矾 EG4S20BG256锛堝悍鑺?HX4S20C 鍚屽皝瑁咃級锛孒DMI 800脳480@60Hz銆?
+## 褰撳墠鐘舵€?
+`rtl/top/top.v` 涓洪《灞傦紝瀹炵幇 800脳480@60Hz HDMI 闊宠棰戞挱鏀剧郴缁燂細
 
-## Current migration status
+- FAT32 / BMP 璇诲彇锛氭敮鎸佷换鎰忓垎杈ㄧ巼锛岀粡 `rtl/image/image_bilinear_scaler.v` 鍙岀嚎鎬х缉鏀鹃摵婊″睆骞?- SDRAM 鍙屽抚缂撳瓨 + 绋冲畾杞挱
+- HDMI 瑙嗛 + 48 kHz PCM WAV 闊抽锛堝惈 ACR锛?- OSD 鏍囬 / 鐘舵€?+ 婊氬姩瀛楀箷 + 琛岀紦瀛樻按骞虫帹鍏ヨ浆鍦?- 浜害 / 瀵规瘮搴﹁皟鑺?+ 512 鐐?FFT 棰戣氨鑳介噺鏌?
+## 鎸夐敭涓庡紑鍏筹紙涓婃澘鎿嶄綔锛?
+| 鍣ㄤ欢 | 寮曡剼 | 鍔熻兘 |
+| --- | --- | --- |
+| `KEY1` | B2 | 鎵嬪姩鍒囧埌涓嬩竴寮犲浘 |
+| `KEY2` | C1 | 鑷姩杞挱 寮€ / 鍏?|
+| `KEY3` | B1 | 浜害/瀵规瘮搴︼細鐭寜 +姝ラ暱锛岄暱鎸?鈭掓闀?|
+| `SW1`鈥揱SW4` | C8/C7/C6/C5 | 閫氶亾 / 姝ラ暱閫夋嫨 |
+| `RST_N` | A2 | 鍏ㄥ眬澶嶄綅 |
 
-- `rtl/top/top.v` is the functionally equivalent 10-second timeout baseline.
-- `rtl/vendor`, `ip/anlogic`, and `constraints` are local migration copies.
-- `rtl/control/image_load_manager.v` is an independently tested replacement
-  boundary for image loading and recovery. It is deliberately not connected to
-  the top-level baseline until the migration build and board equivalence test
-  have passed.
+> 鏈伐绋?*娌℃湁 `KEY4`**銆傛棭鏈熸枃妗ｉ噷鐨勩€宍KEY4` 鑷姩杞挱銆嶅凡鏀逛负 `KEY2`銆?
+## 鏋勫缓
 
-## Required first hardware checks
+1. 鐢?TD 6.2.1 鎵撳紑鍚岀洰褰?`osd_display.al`锛岃繍琛?`syn_1` 鍐?`phy_1`锛堟垨鐢?`*_Runs/*/run.bat`锛夈€?2. JTAG 涓嬭浇楠岃瘉鍔熻兘銆?3. 閫氳繃鍚庡啀鍐欓厤缃?Flash锛屽仛鍐峰惎鍔ㄩ獙鏀躲€?
+## 娴嬭瘯
 
-1. Open `osd_display.al` in this directory with TD 6.2.1 and run `syn_1` then `phy_1`.
-2. Record all clock, SDRAM, and timing warnings. Do not add broad false paths.
-3. Download through JTAG and confirm the four official BMP images, `KEY1`,
-   `KEY2`, and `KEY4` behave as in the validated diagnostic baseline.
-4. Only after JTAG equivalence, write configuration Flash and perform three
-   power-off cold starts, followed by a 30-minute automatic-play run.
+Icarus Verilog 鍥炲綊锛歚tools/run_audio_bars_tests.ps1`锛堢粨鏋滃啓鍏?`audio_bars_Runs/tests/results.txt`锛夈€?
+## 宸茬煡鏈敹鏁?
+- SDRAM DQ 寤虹珛瑁曢噺 `SWNS = -6.565 ns`锛屼笌 2026-06-05 瀹樻柟 `lab_ex4_tf` 鍩虹嚎涓€鑷达紝灞炲畼鏂瑰簳搴у浐鏈夎涓猴紝绂佹鐢?`false_path` 灞忚斀銆?- 闇€鐢ㄦ渶鏂?bit 閲嶆柊鍋氫竴娆?Flash 鍥哄寲 + 鍐峰惎鍔ㄩ獙鏀讹紙璧涢鍩虹瑕佹眰銆屼笂鐢靛嵆鍙繍琛屻€嶏級銆?
+## 鏂囨。
 
-Generated `*_Runs` directories and programming files are intentionally ignored.
+瀹屾暣椤圭洰鏂囨。绱㈠紩瑙?[`../docs/README.md`](../docs/README.md)銆?
+鐢熸垚鐨?`*_Runs` 鐩綍銆佹棩蹇楀拰鐑у綍鏂囦欢宸茶 `.gitignore` 蹇界暐銆

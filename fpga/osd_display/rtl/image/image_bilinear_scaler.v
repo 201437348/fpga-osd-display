@@ -31,12 +31,12 @@
 // ---------------------------------------------------------------------------
 // 吞吐
 // ---------------------------------------------------------------------------
-//   输出回路每个输出像素 7 拍（EM_P0..EM_P6，已由 tools/scaler_cycle_model.js
-//   逐拍模型实测：307200 个输出像素用了 2,153,084 拍 = 7.008 拍/像素）。
+//   输出回路每个输出像素 9 拍（EM_P0..EM_P6 + 插值流水 EM_P5B/EM_P6A；
+//   改流水前 tools/scaler_cycle_model.js 实测为 7.008 拍/像素）。
 //   源码流速率由 SPI(25MHz) 决定：每像素 3 字节 ≈ 96 拍@100MHz 才来 1 个。
 //   一帧要 640*480 个输出像素，故必须满足
-//         640*480*7 <= srcW*srcH*96   ->   srcW*srcH >= 22400
-//   fat32_bmp_loader 的 MIN_SRC_PIXELS = 32000 留了约 1.4 倍余量。
+//         640*480*9 <= srcW*srcH*96   ->   srcW*srcH >= 28800
+//   fat32_bmp_loader 的 MIN_SRC_PIXELS = 32000 留了约 1.1 倍余量。
 //
 // ---------------------------------------------------------------------------
 // 资源
@@ -63,7 +63,12 @@ module image_bilinear_scaler #(
     //      那会把 FIFO 的实际容量压成"阈值"，扇区剩余像素被静默丢弃。
     //      见第 3 节 fifo_full/fifo_wr 的注释与 tests/tb_scaler_chain.sv。
     // 反压阈值见第 3 节的 FIFO_AFULL_LEAVE，当前 = FDEP - 176。
-    parameter [15:0] IN_FIFO_DEPTH = 16'd256
+    parameter [15:0] IN_FIFO_DEPTH = 16'd256,
+    // 黑边像素输出间隔（拍/像素）。黑边不依赖源数据，若 1 拍 1 个满速吐，
+    // 写 FIFO 会连续突发把 SDRAM 带宽占满，读侧（显示/滑动转场）断流
+    // -> read_fault 锁死（1920x1080 上下各 60 行黑边实测复现）。
+    // 取 8：与图像像素 EM_P0..P6 的 7 拍/像素同量级。
+    parameter [3:0]  BLACK_INTERVAL = 4'd8
 )(
     input  wire        clk,             // sd_card_clk (100 MHz)
     input  wire        rst,
@@ -97,7 +102,15 @@ module image_bilinear_scaler #(
 
     // bit0 = 源尺寸超出 MAX_SRC_WIDTH（非法）
     // bit1 = 输出像素数校验失败（本应恰好 DST_WIDTH*DST_HEIGHT 个）
-    output reg  [1:0]  error_code
+    output reg  [1:0]  error_code,
+
+    // 等比例缩放结果（info_valid 拉高后有效，直到下一次 start）
+    //   img_width/img_height : 缩放后图像在输出帧里占的尺寸
+    //   scale_x100           : 缩放比 x100（例：640/600 -> 106，1920->640 -> 33）
+    output reg  [15:0] img_width,
+    output reg  [15:0] img_height,
+    output reg  [15:0] scale_x100,
+    output wire        info_valid
 );
 
     localparam integer F     = FRAC_BITS;
@@ -125,23 +138,74 @@ module image_bilinear_scaler #(
     wire       cfg_h_valid = (src_height != 16'd0) && (src_height <= MAX_SRC_HEIGHT);
 
     // =======================================================================
+    // 1b) 等比例缩放（letterbox）
+    //
+    //   统一缩放比 = min(DST_W/srcW, DST_H/srcH)，X/Y 用同一个步长，图像居中，
+    //   其余区域填黑。判断哪条边先贴边只需比较交叉乘积（无除法）：
+    //       fit_w = (srcW * DST_H >= srcH * DST_W)   -> 宽先贴边
+    //   记 N = 受限边的源尺寸，D = 对应的输出尺寸（fit_w ? (srcW,DST_W) : (srcH,DST_H)），
+    //   则缩放比 = D/N：
+    //       步长        STEP = (N << F) / D，余数 REM = (N << F) mod D
+    //       另一条边尺寸      = floor(另一边源尺寸 * D / N)
+    //       缩放比 x100       = floor(D * 100 / N)
+    //   例（DST 640x480）：640x400 -> 1.00, 640x400 居中；
+    //                      600x400 -> 1.06, 640x426；1920x1080 -> 0.33, 640x360。
+    //
+    //   采样仍是左上对齐的 sx(i) = floor(i * N / D)，Bresenham 的分母由常量
+    //   DST_WIDTH/DST_HEIGHT 换成了寄存器 scale_den（= D），两轴共用。
+    //   不越界：宽贴边时 i <= DST_W-1 -> sx <= srcW-1；
+    //           另一边 j <= floor(srcH*D/N)-1 -> j*N/D < srcH -> sy <= srcH-1。
+    // =======================================================================
+    wire [31:0] cross_w = {16'd0, src_width}  * {16'd0, DST_HEIGHT};
+    wire [31:0] cross_h = {16'd0, src_height} * {16'd0, DST_WIDTH};
+    wire        fit_w_c = (cross_w >= cross_h);
+
+    reg         fit_w;          // 1 = 宽贴边，0 = 高贴边
+    reg  [15:0] scale_num;      // N
+    reg  [15:0] scale_den;      // D
+    reg  [15:0] img_x0, img_x1; // 图像列区间 [img_x0, img_x1)
+    reg  [15:0] img_y0, img_y1; // 图像行区间 [img_y0, img_y1)
+
+    // =======================================================================
     // 2) 共享串行除法器（恢复余数法，逐位处理被除数最高位）
-    //       dividend = srcN << F   (<= 1966080, 21 bit)
-    //       divisor  = dstN        (640 / 480)
-    //    先算 X，再算 Y，各 DIVW 拍。只在配置阶段跑一次。
+    //    配置阶段依次跑 3 次，各 DIVW 拍：
+    //       DIV_STEP  : (N << F) / D          -> 步长 + 余数   (<= 1966080, 21 bit)
+    //       DIV_OTHER : 另一边源尺寸 * D / N  -> 另一边输出尺寸 (<= 1080*640, 20 bit)
+    //       DIV_SCALE : D * 100 / N           -> 缩放比 x100
     // =======================================================================
     localparam [1:0] DIV_IDLE = 2'd0, DIV_RUN = 2'd1, DIV_DONE = 2'd2;
+    // DIV_POST：另一边尺寸的钳位/居中偏移分 3 拍算完（时序，100 MHz）
+    localparam [1:0] DIV_POST = 2'd3;
+    localparam [1:0] DIV_STEP = 2'd0, DIV_OTHER = 2'd1, DIV_SCALE = 2'd2;
 
     reg [1:0]      div_state;
     reg [DIVW-1:0] div_rem, div_quot, div_dividend;
     reg [15:0]     div_divisor;
     reg [5:0]      div_cnt;
-    reg            div_is_y;
+    reg [1:0]      div_phase;
+    reg [1:0]      div_post;
+    reg [15:0]     oth_raw_r, oth_size_r, oth_off_r;
 
+    // 两轴共用同一缩放比，所以 step_x == step_y、rem_x == rem_y。
+    // 保留两套名字只是为了让下面的累加器代码保持 X/Y 对称、易读。
     reg [FIXW-1:0] step_x, step_y;
     reg [15:0]     rem_x,  rem_y;
 
-    wire [DIVW-1:0] div_cand = {div_rem[DIVW-2:0], div_dividend[div_cnt - 6'd1]};
+    assign info_valid = cfg_latched;
+
+    // 另一条边的输出尺寸：钳到 [1, DST]（源尺寸合法时本就在范围内，钳位只防呆）
+    wire [15:0] other_dst_lim = fit_w ? DST_HEIGHT : DST_WIDTH;
+    wire [15:0] other_raw     = (div_quot[DIVW-1:16] != 0) ? 16'hFFFF : div_quot[15:0];
+    wire [31:0] other_dividend = fit_w ? ({16'd0, cfg_h} * {16'd0, DST_WIDTH})
+                                       : ({16'd0, cfg_w} * {16'd0, DST_HEIGHT});
+    wire [31:0] scale_dividend = {16'd0, scale_den} * 32'd100;
+    wire [15:0] other_size    = (oth_raw_r == 16'd0) ? 16'd1 :
+                                (oth_raw_r > other_dst_lim) ? other_dst_lim : oth_raw_r;
+    wire [15:0] other_off      = (other_dst_lim - oth_size_r) >> 1;
+
+    // 被除数每步左移一位、商从最低位移入：与按 div_cnt 下标取位/置位完全等价，
+    // 但去掉了 32 选 1 的可变下标（时序）。
+    wire [DIVW-1:0] div_cand = {div_rem[DIVW-2:0], div_dividend[DIVW-1]};
     wire            div_ge   = (div_cand >= {16'd0, div_divisor});
 
     // =======================================================================
@@ -225,6 +289,7 @@ module image_bilinear_scaler #(
     localparam LBUF_SLOT = 16'd2048;    // 每槽深度，>= MAX_SRC_WIDTH，且 <= 2048
 
     reg [15:0] wr_row;      // 正在写入的行号（数值上等于已完成的行数）
+    reg [15:0] wr_row_done; // wr_row 晚一拍：行缓存写入打了一拍，读侧用它判断行已写完
     reg [15:0] wr_col;      // 行内列号
 
     // 槽基址 = slot * LBUF_SLOT（2bit x 常量 -> 4 选 1 常量多路，无乘法器）
@@ -260,6 +325,7 @@ module image_bilinear_scaler #(
     // 当前 fix 解码出的采样位置（组合，稳定于整个输出像素期间）
     wire [15:0]  sx0_c = fix_x[FIXW-1:F];
     wire [F-1:0] fx_c  = fix_x[F-1:0];
+    reg  [F-1:0] fx_r;   // 本像素的水平小数（fix_x 在 EM_P4 已推进到下一像素）
     wire [15:0]  sx1_c = (sx0_c >= (cfg_w - 16'd1)) ? (cfg_w - 16'd1) : (sx0_c + 16'd1);
 
     wire [15:0]  sy0_c = fix_y[FIXW-1:F];
@@ -268,18 +334,18 @@ module image_bilinear_scaler #(
 
     // ---- 水平累加器下一状态 ----
     wire [16:0]     remacc_x_sum = {1'b0, remacc_x} + {1'b0, rem_x};
-    wire            carry_x      = (remacc_x_sum >= {1'b0, DST_WIDTH});
-    wire [15:0]     remacc_x_new = carry_x ? (remacc_x_sum[15:0] - DST_WIDTH) : remacc_x_sum[15:0];
+    wire            carry_x      = (remacc_x_sum >= {1'b0, scale_den});
+    wire [15:0]     remacc_x_new = carry_x ? (remacc_x_sum[15:0] - scale_den) : remacc_x_sum[15:0];
     wire [FIXW-1:0] fix_x_new    = fix_x + step_x + {{(FIXW-1){1'b0}}, carry_x};
 
     // ---- 垂直累加器下一状态 ----
     wire [16:0]     remacc_y_sum = {1'b0, remacc_y} + {1'b0, rem_y};
-    wire            carry_y      = (remacc_y_sum >= {1'b0, DST_HEIGHT});
-    wire [15:0]     remacc_y_new = carry_y ? (remacc_y_sum[15:0] - DST_HEIGHT) : remacc_y_sum[15:0];
+    wire            carry_y      = (remacc_y_sum >= {1'b0, scale_den});
+    wire [15:0]     remacc_y_new = carry_y ? (remacc_y_sum[15:0] - scale_den) : remacc_y_sum[15:0];
     wire [FIXW-1:0] fix_y_new    = fix_y + step_y + {{(FIXW-1){1'b0}}, carry_y};
 
     // =======================================================================
-    // 6) 输出侧状态机（每输出像素 7 拍：EM_P0..EM_P6）
+    // 6) 输出侧状态机（每输出像素 9 拍：EM_P0..EM_P6，含 EM_P5B/EM_P6A）
     // =======================================================================
     localparam [3:0] EM_ROW_INIT = 4'd0,   // 锁存本输出行的垂直采样位置
                      EM_ROW_WAIT = 4'd1,   // 等 sy1 行写完
@@ -290,7 +356,10 @@ module image_bilinear_scaler #(
                      EM_P4       = 4'd6,   // 取 p11
                      EM_P5       = 4'd7,   // 算 h0/h1
                      EM_P6       = 4'd8,   // 算 v、输出、推进累加器
-                     EM_FINISH   = 4'd9;
+                     EM_FINISH   = 4'd9,
+                     EM_BLACK    = 4'd10,  // 黑边像素：BLACK_INTERVAL 拍 1 个，不读行缓存
+                     EM_P5B      = 4'd11,  // 水平插值第 2 级：移位/加减 -> h0/h1
+                     EM_P6A      = 4'd12;  // 垂直插值第 1 级：乘法 -> vm*
 
     reg [3:0]  em_state;
     reg [15:0] out_y, out_x;
@@ -300,7 +369,17 @@ module image_bilinear_scaler #(
 
     reg [23:0] p00, p01, p10, p11, h0, h1;
 
+    // 插值两级流水寄存器（第 1 级乘法 / 第 2 级移位加减）
+    // 时序：原先 p11->h1、h0/h1->dst_data 都是「乘法+加减」一拍完成，
+    // 100MHz 下 -2.9ns；拆成两级后每级只有乘法或加减。
+    reg [F+9:0] hm0r, hm0g, hm0b, hm1r, hm1g, hm1b;   // 水平乘积
+    reg [2:0]   hge0, hge1;                           // b >= a
+    reg [23:0]  ha0, ha1;                             // 被插值的 a
+    reg [F+9:0] vmr, vmg, vmb;                        // 垂直乘积
+    reg [2:0]   vge;
+
     reg [31:0] px_count;        // 已输出像素数，用于最终校验
+    reg [3:0]  black_div;       // 黑边限速计数
 
     // 行缓存读地址：由当前状态 **组合** 译码。
     // 地址在 EM_P0 发出，RAM 的输出寄存器在 EM_P0 末采样 -> EM_P1 数据有效，
@@ -311,10 +390,36 @@ module image_bilinear_scaler #(
     // rd_data（8 选 1 的结果）在存储器实例之后定义。
     reg  [15:0] rd_addr_c;
 
+    // 时序（100 MHz）：四个抽头地址预先打一拍。原来 cfg_w-1 比较 -> sx1 选择 ->
+    // 加槽基址 -> RAM 地址脚是一条组合长路径。fix_x 在 EM_P4 推进、sy0/sy1 在
+    // EM_ROW_INIT 更新，距离下一次 EM_P0 至少隔 1 拍，所以寄存器版本在 EM_P0..P3
+    // 期间总是与组合版本相同。
+    reg  [15:0] rd_a00_r, rd_a01_r, rd_a10_r, rd_a11_r;
+    always @(posedge clk) begin
+        rd_a00_r <= slot_base(sy0[SLOTB-1:0]) + sx0_c;
+        rd_a01_r <= slot_base(sy0[SLOTB-1:0]) + sx1_c;
+        rd_a10_r <= slot_base(sy1[SLOTB-1:0]) + sx0_c;
+        rd_a11_r <= slot_base(sy1[SLOTB-1:0]) + sx1_c;
+    end
+
     wire em_x_last = (out_x == (DST_WIDTH  - 16'd1));
     wire em_y_last = (out_y == (DST_HEIGHT - 16'd1));
     // sy1 行写完的条件：已完成的行数 wr_row 必须 > sy1
-    wire row_pair_ready = (wr_row > sy1);
+    wire row_pair_ready = (wr_row_done > sy1);
+
+    // ---- letterbox 区域判断 ----
+    // 当前行是否图像行；下一个像素（同一行 out_x+1）是否图像像素；
+    // 下一行（out_y+1）是否图像行；当前行是否最后一个图像行。
+    wire [15:0] out_x_nx      = out_x + 16'd1;
+    wire [15:0] out_y_nx      = out_y + 16'd1;
+    wire        row_is_img    = (out_y    >= img_y0) && (out_y    < img_y1);
+    wire        nx_is_img     = row_is_img && (out_x_nx >= img_x0) && (out_x_nx < img_x1);
+    wire        ny_is_img     = (out_y_nx >= img_y0) && (out_y_nx < img_y1);
+    wire        row_img_last  = (out_y_nx == img_y1);
+    // 一个像素输出后的下一状态（黑边与图像像素共用）
+    wire [3:0]  em_next_px    = em_x_last ? (em_y_last ? EM_FINISH :
+                                              (ny_is_img ? EM_ROW_INIT : EM_BLACK))
+                                          : (nx_is_img ? EM_P0 : EM_BLACK);
 
     // ---- 逐通道线性插值 ----
     //
@@ -339,32 +444,41 @@ module image_bilinear_scaler #(
     //   b >= a:  a + floor((b-a)t/MUL)  = a + (m >> F)
     //   b <  a:  a - ceil((a-b)t/MUL)   = a - ((m + MUL-1) >> F)
     // 合起来正好等于 floor((a*MUL + (b-a)*t) / MUL)。
-    function [7:0] lerp8;
+    // 第 1 级：|b-a| * t（唯一一个乘法器）
+    function [F+9:0] lerp_m;
         input [7:0]   a;
         input [7:0]   b;
         input [F-1:0] t;
         reg [7:0]     dpos;     // |b - a|
-        reg [F+9:0]   m;        // dpos * t，最大 255*1023 = 260865
-        reg [F+9:0]   lo;       // floor(m / MUL)
-        reg [F+9:0]   hi;       // ceil (m / MUL)
         begin
-            dpos  = (b >= a) ? (b - a) : (a - b);
-            m     = dpos * t;                       // 唯一一个乘法器
-            lo    = m >> F;
-            hi    = (m + (MUL - 1)) >> F;
-            lerp8 = (b >= a) ? (a + lo) : (a - hi);
+            dpos   = (b >= a) ? (b - a) : (a - b);
+            lerp_m = dpos * t;                      // 最大 255*1023 = 260865
         end
     endfunction
 
-    wire [23:0] h0_c = {lerp8(p00[23:16], p01[23:16], fx_c),
-                        lerp8(p00[15:8],  p01[15:8],  fx_c),
-                        lerp8(p00[7:0],   p01[7:0],   fx_c)};
-    wire [23:0] h1_c = {lerp8(p10[23:16], p11[23:16], fx_c),
-                        lerp8(p10[15:8],  p11[15:8],  fx_c),
-                        lerp8(p10[7:0],   p11[7:0],   fx_c)};
-    wire [23:0] dst_c = {lerp8(h0[23:16], h1[23:16], fy),
-                         lerp8(h0[15:8],  h1[15:8],  fy),
-                         lerp8(h0[7:0],   h1[7:0],   fy)};
+    // 第 2 级：a + floor(m/MUL) 或 a - ceil(m/MUL)
+    function [7:0] lerp_fin;
+        input [7:0]   a;
+        input         ge;       // b >= a
+        input [F+9:0] m;
+        reg [F+9:0]   lo;       // floor(m / MUL)
+        reg [F+9:0]   hi;       // ceil (m / MUL)
+        begin
+            lo       = m >> F;
+            hi       = (m + (MUL - 1)) >> F;
+            lerp_fin = ge ? (a + lo) : (a - hi);
+        end
+    endfunction
+
+    wire [23:0] h0_c = {lerp_fin(ha0[23:16], hge0[2], hm0r),
+                        lerp_fin(ha0[15:8],  hge0[1], hm0g),
+                        lerp_fin(ha0[7:0],   hge0[0], hm0b)};
+    wire [23:0] h1_c = {lerp_fin(ha1[23:16], hge1[2], hm1r),
+                        lerp_fin(ha1[15:8],  hge1[1], hm1g),
+                        lerp_fin(ha1[7:0],   hge1[0], hm1b)};
+    wire [23:0] dst_c = {lerp_fin(h0[23:16], vge[2], vmr),
+                         lerp_fin(h0[15:8],  vge[1], vmg),
+                         lerp_fin(h0[7:0],   vge[0], vmb)};
 
     // =======================================================================
     // 行缓存读地址译码（组合）
@@ -375,10 +489,10 @@ module image_bilinear_scaler #(
     // =======================================================================
     always @(*) begin
         case (em_state)
-            EM_P0:   rd_addr_c = slot_base(sy0[SLOTB-1:0]) + sx0_c;
-            EM_P1:   rd_addr_c = slot_base(sy0[SLOTB-1:0]) + sx1_c;
-            EM_P2:   rd_addr_c = slot_base(sy1[SLOTB-1:0]) + sx0_c;
-            EM_P3:   rd_addr_c = slot_base(sy1[SLOTB-1:0]) + sx1_c;
+            EM_P0:   rd_addr_c = rd_a00_r;
+            EM_P1:   rd_addr_c = rd_a01_r;
+            EM_P2:   rd_addr_c = rd_a10_r;
+            EM_P3:   rd_addr_c = rd_a11_r;
             default: rd_addr_c = 16'd0;
         endcase
     end
@@ -415,14 +529,35 @@ module image_bilinear_scaler #(
 
     wire [23:0] lb_o [0:7];
 
+    // 时序（100 MHz）：fifo_mem 是 256 深的分布式 RAM，组合读出后再扇出到 8 块
+    // BRAM 的 dia，路径过长。写端口整体打一拍（we/地址/数据同拍），
+    // 读侧的行就绪判断相应改用晚一拍的 wr_row_done。
+    reg        lb_we_q;
+    reg [2:0]  lb_sel_q;
+    reg [9:0]  lb_off_q;
+    reg [23:0] lb_wdata_q;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            lb_we_q    <= 1'b0;
+            lb_sel_q   <= 3'd0;
+            lb_off_q   <= 10'd0;
+            lb_wdata_q <= 24'd0;
+        end else begin
+            lb_we_q    <= fifo_rd;
+            lb_sel_q   <= wr_sel;
+            lb_off_q   <= wr_off;
+            lb_wdata_q <= fifo_rdata;
+        end
+    end
+
     genvar gi;
     generate
         for (gi = 0; gi < 8; gi = gi + 1) begin : g_lbuf
             lbuf_1024x24 u_lbuf (
                 .clk   (clk),
-                .we    (fifo_rd && (wr_sel == gi)),
-                .waddr (wr_off),
-                .wdata (fifo_rdata),
+                .we    (lb_we_q && (lb_sel_q == gi)),
+                .waddr (lb_off_q),
+                .wdata (lb_wdata_q),
                 .raddr (rd_addr_c[9:0]),
                 .rdata (lb_o[gi])
             );
@@ -435,29 +570,40 @@ module image_bilinear_scaler #(
     // =======================================================================
     // 主时序块
     // =======================================================================
+    // 本拍是否输出了一个像素（组合临时量，只在本 always 块内用阻塞赋值）
+    reg em_advance_px;
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             div_state <= DIV_IDLE; div_rem <= 0; div_quot <= 0;
-            div_dividend <= 0; div_divisor <= 0; div_cnt <= 0; div_is_y <= 1'b0;
+            div_dividend <= 0; div_divisor <= 0; div_cnt <= 0; div_phase <= DIV_STEP;
+            div_post <= 0; oth_raw_r <= 0; oth_size_r <= 0; oth_off_r <= 0;
             step_x <= 0; step_y <= 0; rem_x <= 0; rem_y <= 0;
+            fit_w <= 1'b1; scale_num <= 0; scale_den <= DST_WIDTH;
+            img_x0 <= 0; img_x1 <= DST_WIDTH; img_y0 <= 0; img_y1 <= DST_HEIGHT;
+            img_width <= 0; img_height <= 0; scale_x100 <= 0;
 
             cfg_w <= 0; cfg_h <= 0; cfg_latched <= 1'b0; cfg_started <= 1'b0;
 
             fifo_wp <= 0; fifo_rp <= 0; fifo_cnt <= 0;
             src_overflow_count <= 8'd0;
 
-            wr_row <= 0; wr_col <= 0; y0_cur <= 0;
+            wr_row <= 0; wr_row_done <= 0; wr_col <= 0; y0_cur <= 0;
 
             em_state <= EM_ROW_INIT; out_y <= 0; out_x <= 0;
             fix_x <= 0; fix_y <= 0; remacc_x <= 0; remacc_y <= 0;
             sy0 <= 0; sy1 <= 0; fy <= 0;
             p00 <= 0; p01 <= 0; p10 <= 0; p11 <= 0; h0 <= 0; h1 <= 0;
+            hm0r <= 0; hm0g <= 0; hm0b <= 0; hm1r <= 0; hm1g <= 0; hm1b <= 0;
+            hge0 <= 0; hge1 <= 0; ha0 <= 0; ha1 <= 0;
+            vmr <= 0; vmg <= 0; vmb <= 0; vge <= 0;
             px_count <= 0;
+            black_div <= 4'd0;
 
             dst_data <= 0; dst_valid <= 1'b0; dst_done <= 1'b0;
             error_code <= 2'd0;
         end else begin
             dst_valid <= 1'b0;
+            em_advance_px = 1'b0;
 
             // ---------------------------------------------------------------
             // 输入 FIFO
@@ -483,6 +629,7 @@ module image_bilinear_scaler #(
             // 注意：行缓存的数据写入不在这里，在 8 个 lbuf_1024x24 实例里
             // （见第 4 节「存储器实例」）。
             // ---------------------------------------------------------------
+            wr_row_done <= wr_row;
             if (fifo_rd) begin
                 if (wr_row_last) begin
                     wr_col <= 16'd0;
@@ -499,7 +646,7 @@ module image_bilinear_scaler #(
                 cfg_latched <= 1'b0;
                 cfg_started <= 1'b0;
                 step_x <= 0; step_y <= 0; rem_x <= 0; rem_y <= 0;
-                wr_row <= 0; wr_col <= 0; y0_cur <= 0;
+                wr_row <= 0; wr_row_done <= 0; wr_col <= 0; y0_cur <= 0;
                 fifo_wp <= 0; fifo_rp <= 0; fifo_cnt <= 0;
                 src_overflow_count <= 8'd0;
                 em_state <= EM_ROW_INIT; out_y <= 0; out_x <= 0;
@@ -512,10 +659,13 @@ module image_bilinear_scaler #(
                 cfg_w <= src_width;
                 cfg_h <= src_height;
                 if (!cfg_w_valid || !cfg_h_valid) error_code[0] <= 1'b1;
-                // 启动 X 轴除法
-                div_is_y     <= 1'b0;
-                div_dividend <= ({16'd0, src_width} << F);
-                div_divisor  <= DST_WIDTH;
+                // 决定哪条边贴边，然后启动步长除法 (N << F) / D
+                fit_w        <= fit_w_c;
+                scale_num    <= fit_w_c ? src_width : src_height;
+                scale_den    <= fit_w_c ? DST_WIDTH : DST_HEIGHT;
+                div_phase    <= DIV_STEP;
+                div_dividend <= ({11'd0, (fit_w_c ? src_width : src_height)} << F);
+                div_divisor  <= fit_w_c ? DST_WIDTH : DST_HEIGHT;
                 div_rem      <= 0;
                 div_quot     <= 0;
                 div_cnt      <= DIVW[5:0];
@@ -532,35 +682,74 @@ module image_bilinear_scaler #(
             // ---------------------------------------------------------------
             case (div_state)
                 DIV_RUN: begin
-                    if (div_ge) begin
+                    if (div_ge)
                         div_rem  <= div_cand - {16'd0, div_divisor};
-                        div_quot[div_cnt - 6'd1] <= 1'b1;
-                    end else begin
+                    else
                         div_rem  <= div_cand;
-                        div_quot[div_cnt - 6'd1] <= 1'b0;
-                    end
+                    div_quot     <= {div_quot[DIVW-2:0], div_ge};
+                    div_dividend <= {div_dividend[DIVW-2:0], 1'b0};
                     div_cnt <= div_cnt - 6'd1;
                     if (div_cnt == 6'd1) div_state <= DIV_DONE;
                 end
                 DIV_DONE: begin
-                    if (!div_is_y) begin
-                        step_x <= div_quot[FIXW-1:0];
-                        rem_x  <= div_rem[15:0];
-                        // 接着算 Y 轴
-                        div_is_y     <= 1'b1;
-                        div_dividend <= ({16'd0, cfg_h} << F);
-                        div_divisor  <= DST_HEIGHT;
-                        div_rem      <= 0;
-                        div_quot     <= 0;
-                        div_cnt      <= DIVW[5:0];
-                        div_state    <= DIV_RUN;
-                    end else begin
-                        step_y <= div_quot[FIXW-1:0];
-                        rem_y  <= div_rem[15:0];
-                        cfg_latched <= 1'b1;
-                        em_state <= EM_ROW_INIT;
-                        div_state <= DIV_IDLE;
-                    end
+                    div_rem   <= 0;
+                    div_quot  <= 0;
+                    div_cnt   <= DIVW[5:0];
+                    case (div_phase)
+                        DIV_STEP: begin
+                            // 两轴同一个步长 -> 等比例
+                            step_x <= div_quot[FIXW-1:0];
+                            step_y <= div_quot[FIXW-1:0];
+                            rem_x  <= div_rem[15:0];
+                            rem_y  <= div_rem[15:0];
+                            // 接着算另一条边的输出尺寸
+                            div_phase    <= DIV_OTHER;
+                            div_dividend <= other_dividend[DIVW-1:0];
+                            div_divisor  <= scale_num;
+                            div_state    <= DIV_RUN;
+                        end
+                        DIV_OTHER: begin
+                            oth_raw_r <= other_raw;
+                            div_post  <= 2'd0;
+                            div_state <= DIV_POST;
+                        end
+                        default: begin
+                            scale_x100  <= (div_quot[DIVW-1:16] != 0) ? 16'hFFFF : div_quot[15:0];
+                            cfg_latched <= 1'b1;
+                            // 第 0 行在上黑边里就先吐黑像素，否则直接进图像行
+                            em_state    <= (img_y0 == 16'd0) ? EM_ROW_INIT : EM_BLACK;
+                            div_state   <= DIV_IDLE;
+                        end
+                    endcase
+                end
+                DIV_POST: begin
+                    div_post <= div_post + 2'd1;
+                    case (div_post)
+                        2'd0: oth_size_r <= other_size;
+                        2'd1: oth_off_r  <= other_off;
+                        default: begin
+                            if (fit_w) begin
+                                img_width  <= DST_WIDTH;
+                                img_height <= oth_size_r;
+                                img_x0 <= 16'd0;
+                                img_x1 <= DST_WIDTH;
+                                img_y0 <= oth_off_r;
+                                img_y1 <= oth_off_r + oth_size_r;
+                            end else begin
+                                img_width  <= oth_size_r;
+                                img_height <= DST_HEIGHT;
+                                img_x0 <= oth_off_r;
+                                img_x1 <= oth_off_r + oth_size_r;
+                                img_y0 <= 16'd0;
+                                img_y1 <= DST_HEIGHT;
+                            end
+                            // 最后算缩放比 x100（只给 OSD 显示用）
+                            div_phase    <= DIV_SCALE;
+                            div_dividend <= scale_dividend[DIVW-1:0];
+                            div_divisor  <= scale_num;
+                            div_state    <= DIV_RUN;
+                        end
+                    endcase
                 end
                 default: ;
             endcase
@@ -585,7 +774,8 @@ module image_bilinear_scaler #(
                     EM_ROW_WAIT: begin
                         if (row_pair_ready) begin
                             out_x    <= 16'd0;
-                            em_state <= EM_P0;
+                            // 左黑边从第 0 列开始；宽贴边时 img_x0 = 0 直接进图像
+                            em_state <= (img_x0 == 16'd0) ? EM_P0 : EM_BLACK;
                         end
                     end
 
@@ -606,11 +796,36 @@ module image_bilinear_scaler #(
                     end
                     EM_P4: begin
                         p11      <= rd_data;                       // = lbuf[sy1][sx1]
+                        // 四个抽头地址都已发出，水平累加器可提前推进到下一像素
+                        // （行尾在 EM_P6 被清零覆盖）；本像素的小数先锁存。
+                        fx_r     <= fx_c;
+                        fix_x    <= fix_x_new;
+                        remacc_x <= remacc_x_new;
                         em_state <= EM_P5;
                     end
                     EM_P5: begin
+                        hm0r <= lerp_m(p00[23:16], p01[23:16], fx_r);
+                        hm0g <= lerp_m(p00[15:8],  p01[15:8],  fx_r);
+                        hm0b <= lerp_m(p00[7:0],   p01[7:0],   fx_r);
+                        hm1r <= lerp_m(p10[23:16], p11[23:16], fx_r);
+                        hm1g <= lerp_m(p10[15:8],  p11[15:8],  fx_r);
+                        hm1b <= lerp_m(p10[7:0],   p11[7:0],   fx_r);
+                        hge0 <= {p01[23:16] >= p00[23:16], p01[15:8] >= p00[15:8], p01[7:0] >= p00[7:0]};
+                        hge1 <= {p11[23:16] >= p10[23:16], p11[15:8] >= p10[15:8], p11[7:0] >= p10[7:0]};
+                        ha0  <= p00;
+                        ha1  <= p10;
+                        em_state <= EM_P5B;
+                    end
+                    EM_P5B: begin
                         h0 <= h0_c;
                         h1 <= h1_c;
+                        em_state <= EM_P6A;
+                    end
+                    EM_P6A: begin
+                        vmr <= lerp_m(h0[23:16], h1[23:16], fy);
+                        vmg <= lerp_m(h0[15:8],  h1[15:8],  fy);
+                        vmb <= lerp_m(h0[7:0],   h1[7:0],   fy);
+                        vge <= {h1[23:16] >= h0[23:16], h1[15:8] >= h0[15:8], h1[7:0] >= h0[7:0]};
                         em_state <= EM_P6;
                     end
                     EM_P6: begin
@@ -619,33 +834,19 @@ module image_bilinear_scaler #(
                             dst_data  <= dst_c;
                             dst_valid <= 1'b1;
                             px_count  <= px_count + 32'd1;
-                            if (em_x_last) begin
-                                // 本行结束：推进垂直累加器，水平累加器清零
-                                fix_y    <= fix_y_new;
-                                remacc_y <= remacc_y_new;
-                                fix_x    <= 0;
-                                remacc_x <= 0;
-                                out_x    <= 16'd0;
-                                out_y    <= out_y + 16'd1;
-                                if (em_y_last) begin
-                                    // 最后一个输出行：不再需要任何源行，放开写侧
-                                    y0_cur   <= cfg_h;
-                                    em_state <= EM_FINISH;
-                                end else begin
-                                    // 关键：y0_cur 取「**下一个**输出行」的起始源行
-                                    // fix_y_new>>F，而不是当前行的 sy0。
-                                    // 否则降采样步长为 2.25 时下一行一次跳过 3 行，
-                                    // 写侧被 wr_guard_ok 挡住 -> 死锁（已由
-                                    // tools/scaler_rtl_model.js 复现并验证修复）。
-                                    y0_cur   <= fix_y_new[FIXW-1:F];
-                                    em_state <= EM_ROW_INIT;
-                                end
-                            end else begin
-                                fix_x    <= fix_x_new;
-                                remacc_x <= remacc_x_new;
-                                out_x    <= out_x + 16'd1;
-                                em_state <= EM_P0;
-                            end
+                            em_advance_px = 1'b1;
+                        end
+                    end
+                    // 黑边像素：不读行缓存、不推进 fix_x，BLACK_INTERVAL 拍 1 个
+                    EM_BLACK: begin
+                        if (black_div != 4'd0) begin
+                            black_div <= black_div - 4'd1;
+                        end else if (!out_stall) begin
+                            black_div <= BLACK_INTERVAL - 4'd1;
+                            dst_data  <= 24'h000000;
+                            dst_valid <= 1'b1;
+                            px_count  <= px_count + 32'd1;
+                            em_advance_px = 1'b1;
                         end
                     end
                     EM_FINISH: begin
@@ -654,6 +855,37 @@ module image_bilinear_scaler #(
                     end
                     default: em_state <= EM_ROW_INIT;
                 endcase
+
+                // -----------------------------------------------------------
+                // 一个像素（图像或黑边）已输出：推进 out_x/out_y 与下一状态
+                // （写在 case 之后，覆盖 case 内对 fix_x 的推进 -> 行尾清零优先）
+                // -----------------------------------------------------------
+                if (em_advance_px) begin
+                    em_state <= em_next_px;
+                    if (em_x_last) begin
+                        // 本行结束：水平累加器清零
+                        fix_x    <= 0;
+                        remacc_x <= 0;
+                        out_x    <= 16'd0;
+                        out_y    <= out_y_nx;
+                        if (row_is_img) begin
+                            // 图像行结束才推进垂直累加器（黑边行不消耗源行）
+                            fix_y    <= fix_y_new;
+                            remacc_y <= remacc_y_new;
+                            // 关键：y0_cur 取「**下一个**输出行」的起始源行
+                            // fix_y_new>>F，而不是当前行的 sy0。
+                            // 否则降采样步长为 2.25 时下一行一次跳过 3 行，
+                            // 写侧被 wr_guard_ok 挡住 -> 死锁（已由
+                            // tools/scaler_rtl_model.js 复现并验证修复）。
+                            // 最后一个图像行之后不再需要任何源行，放开写侧。
+                            y0_cur   <= row_img_last ? cfg_h : fix_y_new[FIXW-1:F];
+                        end
+                        if (em_y_last)
+                            y0_cur <= cfg_h;
+                    end else begin
+                        out_x <= out_x_nx;
+                    end
+                end
             end
 
             end  // if (!start)

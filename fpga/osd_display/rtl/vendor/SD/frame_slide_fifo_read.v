@@ -35,8 +35,10 @@ module frame_slide_fifo_read #(
     input  wire [ADDR_BITS-1:0]         read_addr_1,
     input  wire [ADDR_BITS-1:0]         read_addr_2,
     input  wire [ADDR_BITS-1:0]         read_addr_3,
-    input  wire [1:0]                   old_buffer_index,
-    input  wire [1:0]                   new_buffer_index,
+    input  wire [ADDR_BITS-1:0]         read_addr_4,       // 6 槽缓存：槽 4、5
+    input  wire [ADDR_BITS-1:0]         read_addr_5,
+    input  wire [2:0]                   old_buffer_index,
+    input  wire [2:0]                   new_buffer_index,
     input  wire                         slide_active,
     input  wire [9:0]                   slide_position,
     output reg                          fifo_aclr,
@@ -76,12 +78,12 @@ reg [1:0] phase;
 reg read_req_d0;
 reg read_req_d1;
 reg read_req_d2;
-reg [1:0] old_index_d0;
-reg [1:0] old_index_d1;
-reg [1:0] old_index_d2;
-reg [1:0] new_index_d0;
-reg [1:0] new_index_d1;
-reg [1:0] new_index_d2;
+reg [2:0] old_index_d0;
+reg [2:0] old_index_d1;
+reg [2:0] old_index_d2;
+reg [2:0] new_index_d0;
+reg [2:0] new_index_d1;
+reg [2:0] new_index_d2;
 reg slide_active_d0;
 reg slide_active_d1;
 reg slide_active_d2;
@@ -106,9 +108,18 @@ reg [15:0] chunk_phase_offset;
 reg [15:0] chunk_length;
 reg [15:0] command_length;
 reg [15:0] issue_count;
+// 时序（125 MHz）：issue_count == command_length-1 原来直接驱动 segment_* 等
+// 一大片寄存器的 ce。改为提前一拍算好的“本拍是最后一个命令”标志。
+reg        issue_last;
+wire [15:0] command_length_start =
+    (FIXED_READ_BURST_ENABLE || (segment_remaining > MAX_BURST)) ?
+    MAX_BURST : segment_remaining;
 reg [15:0] return_count;
 reg [15:0] preroll_issue_count;
 reg [15:0] preroll_return_count;
+// 时序（125 MHz）：预读计数与常数的比较提前一拍算成标志，状态机只看 1 位
+reg        preroll_issue_last;
+reg        preroll_return_last;
 reg [ADDR_BITS:0] output_count;
 reg [ADDR_BITS-1:0] diagnostic_chunk_base;
 
@@ -153,7 +164,7 @@ reg        output_pipe_add_g_1;
 reg        output_pipe_add_b_1;
 
 wire phase_writes_fifo;
-wire fifo_has_chunk_room;
+reg  fifo_has_chunk_room;
 wire can_start_chunk;
 wire [4:0] response_overlap_index;
 wire output_pipeline_pending;
@@ -161,7 +172,14 @@ wire [31:0] scheduler_return_data;
 wire [ADDR_BITS-1:0] diagnostic_return_address;
 
 assign phase_writes_fifo = (phase != P_OLD_CACHE);
-assign fifo_has_chunk_room = (wrusedw < FIFO_START_LEVEL);
+// Registered to cut the read_buf wrusedw -> scheduler path (125 MHz).  The
+// value is one cycle old, so the threshold keeps 2 extra words of margin.
+always @(posedge mem_clk or posedge rst) begin
+    if (rst)
+        fifo_has_chunk_room <= 1'b0;
+    else
+        fifo_has_chunk_room <= (wrusedw < (FIFO_START_LEVEL - 2));
+end
 assign can_start_chunk = (segment_remaining != 16'd0) &&
                          (!phase_writes_fifo || fifo_has_chunk_room) &&
                          !App_wr_busy;
@@ -196,13 +214,15 @@ assign read_busy = (state == S_ISSUE) || (state == S_WAIT_RETURN) ||
                    (state == S_PREROLL_WAIT);
 
 function [ADDR_BITS-1:0] buffer_base;
-    input [1:0] index;
+    input [2:0] index;
     begin
         case (index)
-            2'd0: buffer_base = read_addr_0;
-            2'd1: buffer_base = read_addr_1;
-            2'd2: buffer_base = read_addr_2;
-            default: buffer_base = read_addr_3;
+            3'd0: buffer_base = read_addr_0;
+            3'd1: buffer_base = read_addr_1;
+            3'd2: buffer_base = read_addr_2;
+            3'd3: buffer_base = read_addr_3;
+            3'd4: buffer_base = read_addr_4;
+            default: buffer_base = read_addr_5;
         endcase
     end
 endfunction
@@ -286,12 +306,12 @@ always @(posedge mem_clk or posedge rst) begin
         read_req_d0       <= 1'b0;
         read_req_d1       <= 1'b0;
         read_req_d2       <= 1'b0;
-        old_index_d0      <= 2'd0;
-        old_index_d1      <= 2'd0;
-        old_index_d2      <= 2'd0;
-        new_index_d0      <= 2'd0;
-        new_index_d1      <= 2'd0;
-        new_index_d2      <= 2'd0;
+        old_index_d0      <= 3'd0;
+        old_index_d1      <= 3'd0;
+        old_index_d2      <= 3'd0;
+        new_index_d0      <= 3'd0;
+        new_index_d1      <= 3'd0;
+        new_index_d2      <= 3'd0;
         slide_active_d0   <= 1'b0;
         slide_active_d1   <= 1'b0;
         slide_active_d2   <= 1'b0;
@@ -344,9 +364,12 @@ always @(posedge mem_clk or posedge rst) begin
         chunk_length             <= 16'd0;
         command_length           <= 16'd0;
         issue_count              <= 16'd0;
+        issue_last               <= 1'b0;
         return_count             <= 16'd0;
         preroll_issue_count      <= 16'd0;
         preroll_return_count     <= 16'd0;
+        preroll_issue_last       <= 1'b0;
+        preroll_return_last      <= 1'b0;
         output_count             <= {(ADDR_BITS + 1){1'b0}};
         diagnostic_chunk_base    <= {ADDR_BITS{1'b0}};
         output_pipe_valid_raw    <= 1'b0;
@@ -512,8 +535,10 @@ always @(posedge mem_clk or posedge rst) begin
         // Repeating the chunk's first address drains stale data left behind
         // by a discontinuous SDRAM address transition.
         if (((state == S_PREROLL_ISSUE) ||
-             (state == S_PREROLL_WAIT)) && Sdr_rd_en)
+             (state == S_PREROLL_WAIT)) && Sdr_rd_en) begin
             preroll_return_count <= preroll_return_count + 16'd1;
+            preroll_return_last  <= (preroll_return_count == (READ_CHUNK_PREROLL_WORDS - 2));
+        end
 
         case (state)
             S_IDLE: begin
@@ -631,9 +656,12 @@ always @(posedge mem_clk or posedge rst) begin
                     else
                         command_length <= segment_remaining;
                     issue_count        <= 16'd0;
+                    issue_last         <= (command_length_start == 16'd1);
                     return_count       <= 16'd0;
                     preroll_issue_count  <= 16'd0;
                     preroll_return_count <= 16'd0;
+                    preroll_issue_last   <= (READ_CHUNK_PREROLL_WORDS == 1);
+                    preroll_return_last  <= (READ_CHUNK_PREROLL_WORDS == 1);
                     chunk_phase_offset <= phase_offset;
                     App_rd_addr        <= segment_addr;
                     diagnostic_chunk_base <= segment_addr;
@@ -647,24 +675,20 @@ always @(posedge mem_clk or posedge rst) begin
             S_PREROLL_ISSUE: begin
                 // Keep App_rd_addr fixed at the payload's first address.
                 if (!Sdr_busy) begin
-                    if (preroll_issue_count ==
-                        (READ_CHUNK_PREROLL_WORDS - 1)) begin
-                        if (Sdr_rd_en &&
-                            (preroll_return_count ==
-                             (READ_CHUNK_PREROLL_WORDS - 1)))
+                    if (preroll_issue_last) begin
+                        if (Sdr_rd_en && preroll_return_last)
                             state <= S_ISSUE;
                         else
                             state <= S_PREROLL_WAIT;
                     end else begin
                         preroll_issue_count <= preroll_issue_count + 16'd1;
+                        preroll_issue_last  <= (preroll_issue_count == (READ_CHUNK_PREROLL_WORDS - 2));
                     end
                 end
             end
 
             S_PREROLL_WAIT: begin
-                if (Sdr_rd_en &&
-                    (preroll_return_count ==
-                     (READ_CHUNK_PREROLL_WORDS - 1)))
+                if (Sdr_rd_en && preroll_return_last)
                     state <= S_ISSUE;
             end
 
@@ -673,7 +697,7 @@ always @(posedge mem_clk or posedge rst) begin
                 // Holding address/count during refresh keeps expected returns
                 // exactly aligned with accepted requests.
                 if (!Sdr_busy) begin
-                    if (issue_count == (command_length - 1'b1)) begin
+                    if (issue_last) begin
                         segment_remaining <= segment_remaining - chunk_length;
                         segment_addr      <= segment_addr + chunk_length;
                         phase_offset      <= phase_offset + chunk_length;
@@ -684,6 +708,7 @@ always @(posedge mem_clk or posedge rst) begin
                             state <= S_WAIT_RETURN;
                     end else begin
                         issue_count <= issue_count + 16'd1;
+                        issue_last  <= (issue_count == (command_length - 16'd2));
                         App_rd_addr <= App_rd_addr + 1'b1;
                     end
                 end

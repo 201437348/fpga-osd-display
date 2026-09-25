@@ -16,8 +16,8 @@ module video_osd_overlay (
     input  wire [7:0]  brightness_value,
     input  wire [7:0]  contrast_value,
     input  wire [1:0]  menu_channel,
-    input wire [7:0] audio_level,
-    input wire [383:0] audio_bands,
+    // 顶栏信息行（osd_info_text 生成）：40 个 ASCII，字符 i 在 [i*8 +: 8]
+    input  wire [319:0] info_text,
     output wire [23:0] rgb_out
 );
 
@@ -25,6 +25,7 @@ localparam [9:0] TOP_BAR_HEIGHT = 10'd24;
 localparam [9:0] BOTTOM_BAR_Y   = 10'd456;
 localparam [9:0] TITLE_X        = 10'd16;
 localparam [9:0] TITLE_Y        = 10'd4;
+localparam [9:0] TITLE_CHARS    = 10'd40;
 localparam [9:0] STATUS_X       = 10'd24;
 localparam [9:0] STATUS_Y       = 10'd460;
 localparam [9:0] TICKER_BAR_Y      = 10'd432;
@@ -38,7 +39,6 @@ localparam [23:0] READY_RGB    = 24'h54E3E3;
 localparam [23:0] FALLBACK_RGB = 24'hFFD166;
 localparam [23:0] WAIT_RGB     = 24'hFF6B6B;
 localparam [23:0] LOAD_RGB     = 24'h7EE787;
-localparam [23:0] AUDIO_RGB = 24'h55E6A5;
 localparam [23:0] SCAN_RGB     = 24'hA7C7FF;
 
 // ---------------------------------------------------------------------------
@@ -61,13 +61,13 @@ localparam [23:0] SCAN_RGB     = 24'hA7C7FF;
 //
 // 这一层画在亮度/对比度调节之后，所以菜单本身始终是全亮的，不会被调暗。
 // ---------------------------------------------------------------------------
-localparam [9:0] MENU_PANEL_X0 = 10'd448;
-localparam [9:0] MENU_PANEL_X1 = 10'd632;
+localparam [9:0] MENU_PANEL_X0 = 10'd16;
+localparam [9:0] MENU_PANEL_X1 = 10'd200;
 localparam [9:0] MENU_PANEL_Y0 = 10'd24;
 localparam [9:0] MENU_PANEL_Y1 = 10'd60;
-localparam [9:0] MENU_LABEL_X  = 10'd452;
-localparam [9:0] MENU_DIGIT_X  = 10'd464;
-localparam [9:0] MENU_BAR_X    = 10'd492;
+localparam [9:0] MENU_LABEL_X  = 10'd20;
+localparam [9:0] MENU_DIGIT_X  = 10'd32;
+localparam [9:0] MENU_BAR_X    = 10'd60;
 localparam [9:0] MENU_BAR_W    = 10'd128;   // 8 段 x 16
 localparam [9:0] MENU_SEG_W    = 10'd14;
 localparam [9:0] MENU_ROW0_Y   = 10'd26;    // 亮度行
@@ -93,7 +93,7 @@ wire [9:0] title_x_offset;
 wire [9:0] title_y_offset;
 wire [9:0] status_x_offset;
 wire [9:0] status_y_offset;
-wire [3:0] title_char_index;
+wire [5:0] title_char_index;
 wire [3:0] status_char_index;
 wire [2:0] title_row;
 wire [2:0] status_row;
@@ -154,27 +154,17 @@ wire        menu_seg_c_on;
 wire        menu_hl_b;
 wire        menu_hl_c;
 
-wire       audio_meter_active;
-wire       audio_meter_fill;
-wire [23:0] bars_rgb;
-wire bars_active, line_active;
-audio_bars_overlay u_audio_bars_overlay (
-    .x(x), .y(y), .de(de), .bands_display(audio_bands),
-    .bars_rgb(bars_rgb), .bars_active(bars_active), .line_active(line_active)
-);
-wire [9:0] audio_meter_offset;
-
 assign title_x_offset = x - TITLE_X;
 assign title_y_offset = y - TITLE_Y;
 assign status_x_offset = x - STATUS_X;
 assign status_y_offset = y - STATUS_Y;
-assign title_char_index = title_x_offset[6:3];
+assign title_char_index = title_x_offset[8:3];
 assign status_char_index = status_x_offset[6:3];
 assign title_row = title_y_offset[3:1];
 assign status_row = status_y_offset[3:1];
 
 assign title_active = (y >= TITLE_Y) && (y < (TITLE_Y + 10'd16)) &&
-                      (x >= TITLE_X) && (x < (TITLE_X + 10'd88));
+                      (x >= TITLE_X) && (x < (TITLE_X + TITLE_CHARS * 10'd8));
 assign status_active = (y >= STATUS_Y) && (y < (STATUS_Y + 10'd16)) &&
                        (x >= STATUS_X) && (x < (STATUS_X + 10'd80));
 assign indicator_active = (y >= (STATUS_Y + 10'd4)) &&
@@ -254,7 +244,7 @@ assign menu_seg_c_on   = menu_seg_c_area && (contrast_value   > menu_seg_thresh)
 assign menu_hl_b = (menu_channel != 2'b01);
 assign menu_hl_c = (menu_channel != 2'b00);
 
-assign title_glyph = glyph_row(title_char(title_char_index), title_row);
+assign title_glyph = glyph_row(info_text[title_char_index * 8 +: 8], title_row);
 assign status_glyph = glyph_row(status_char(status_char_index,
                                              display_valid,
                                              display_test_pattern,
@@ -268,37 +258,12 @@ assign ticker_glyph = glyph_row(ticker_char(ticker_char_index), ticker_row);
 assign title_pixel = title_active && title_glyph[7 - title_x_offset[2:0]];
 assign status_pixel = status_active && status_glyph[7 - status_x_offset[2:0]];
 assign ticker_pixel = ticker_text_active && ticker_glyph[7 - ticker_column];
-assign audio_meter_offset = x - 10'd512;
-assign audio_meter_active = (y >= 10'd8) && (y < 10'd16) &&
-                            (x >= 10'd512) && (x < 10'd632);
-assign audio_meter_fill = audio_meter_active &&
-                          (audio_meter_offset < ({2'd0, audio_level} * 10'd120 >> 8));
 assign status_rgb = display_test_pattern ? FALLBACK_RGB :
                     !storage_ready ? WAIT_RGB :
                     load_in_progress ? LOAD_RGB :
                     ((manager_state == 3'd1) || (manager_state == 3'd6) ||
                      !display_valid) ? SCAN_RGB : READY_RGB;
 assign rgb_out = rgb_out_r;
-
-function [7:0] title_char;
-    input [3:0] char_index;
-    begin
-        case (char_index)
-            4'd0: title_char = 8'h4F; // O
-            4'd1: title_char = 8'h53; // S
-            4'd2: title_char = 8'h44; // D
-            4'd3: title_char = 8'h20; // space
-            4'd4: title_char = 8'h44; // D
-            4'd5: title_char = 8'h49; // I
-            4'd6: title_char = 8'h53; // S
-            4'd7: title_char = 8'h50; // P
-            4'd8: title_char = 8'h4C; // L
-            4'd9: title_char = 8'h41; // A
-            4'd10: title_char = 8'h59; // Y
-            default: title_char = 8'h20;
-        endcase
-    end
-endfunction
 
 function [7:0] ticker_char;
     input [5:0] char_index;
@@ -778,6 +743,19 @@ function [7:0] glyph_row;
                 3'd5: glyph_row = 8'b00010000;
                 3'd6: glyph_row = 8'b00010000;
             endcase
+            8'h58: case (row) // X
+                3'd0: glyph_row = 8'b01000010;
+                3'd1: glyph_row = 8'b00100100;
+                3'd2: glyph_row = 8'b00011000;
+                3'd3: glyph_row = 8'b00011000;
+                3'd4: glyph_row = 8'b00100100;
+                3'd5: glyph_row = 8'b01000010;
+                3'd6: glyph_row = 8'b01000010;
+            endcase
+            8'h2E: case (row) // .
+                3'd5: glyph_row = 8'b00011000;
+                3'd6: glyph_row = 8'b00011000;
+            endcase
             8'h2F: case (row) // /
                 3'd0: glyph_row = 8'b00000010;
                 3'd1: glyph_row = 8'b00000100;
@@ -834,8 +812,6 @@ always @* begin
             rgb_out_r = BAR_RGB;
             if (title_pixel)
                 rgb_out_r = TITLE_RGB;
-            if (audio_meter_active)
-                rgb_out_r = audio_meter_fill ? AUDIO_RGB : 24'h244056;
         end else if (ticker_active) begin
             rgb_out_r = BAR_RGB;
             if (ticker_pixel)
@@ -846,11 +822,8 @@ always @* begin
                 rgb_out_r = status_rgb;
         end
 
-        // 参数菜单画在最上层。它落在 y 24..431 的空白带里，
+        // 参数菜单画在最上层，常驻于左上角 (x 16..199, y 24..59)，紧贴标题栏下方，
         // 与上条/滚动条/状态栏都不重叠，不会互相遮挡。
-        if (bars_active || line_active)
-            rgb_out_r = bars_rgb;
-
         if (menu_panel_active) begin
             if (menu_seg_b_area)
                 rgb_out_r = menu_seg_b_on ? (menu_hl_b ? MENU_SEG_ON : MENU_SEG_ON_DIM)

@@ -40,7 +40,7 @@ reg [23:0] captured_pixel [0:3];
 
 always #5 clk = ~clk;
 
-fat32_bmp_loader dut (
+fat32_bmp_loader #(.MIN_SRC_PIXELS(1)) dut (
     .clk(clk),
     .rst(rst),
     .start(start),
@@ -50,8 +50,8 @@ fat32_bmp_loader dut (
     .first_fat_lba(first_fat_lba),
     .first_data_lba(first_data_lba),
     .sectors_per_cluster(sectors_per_cluster),
-    .bmp_width(16'd2),
-    .bmp_height(16'd1),
+    .src_width(),
+    .src_height(), .header_valid(), .dbg_state(),
     .busy(busy),
     .done(done),
     .error(error),
