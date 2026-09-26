@@ -109,6 +109,11 @@ wire [2:0]  slide_new_buffer_index;
 wire        slide_active;
 wire [9:0]  slide_position;
 wire        transition_busy;
+wire [6:0]  fade_gain;
+// 切图效果：0 = 左右滑动，1 = 淡出到黑再淡入。
+// 以后由串口屏命令选择（经 2FF 同步到 video_clk，控制器在每次切图开始时锁存）；
+// 现在先固定为淡入淡出，方便上板看效果。
+wire        transition_mode_video = 1'b1;
 wire        frame_read_fault;
 wire [3:0]  frame_read_fifo_underflow_count_per_frame;
 reg [1:0]   frame_read_fault_video_sync;
@@ -166,6 +171,10 @@ wire        auto_request;
 wire        auto_play_enabled;
 wire [2:0]  auto_period_sec;
 wire [3:0]  cfg_volume;
+wire [3:0]  cfg_tone_volume;
+wire        playback_key_down;
+wire        menu_key_down;
+reg         key_any_down_sd;
 
 wire        audio_fifo_wr_en;
 wire [31:0] audio_fifo_wr_data;
@@ -365,7 +374,11 @@ image_storage_adapter #(
     .load_diag_flags   (load_diag_flags),
     .write_req         (sd_card_write_req),
     .write_req_ack     (sd_card_write_req_ack),
-    .write_fifo_afull  (frame_write_fifo_afull),
+    // 视频域切图（滑动）期间暂停写 SDRAM：滑动一帧要读新旧两张，
+    // 预加载时按键命中就会和写并发，再加巡检/刷新窗口，读不完一帧
+    // 就触发 read_fault（滑动中途弹回旧图，transition_busy 永久为 1，按键全失效）。
+    // loader 在扇区边界停住，SD 总线照常给音频用。
+    .write_fifo_afull  (frame_write_fifo_afull || !display_settled_sd),
     .write_en          (sd_card_write_en),
     .write_data        (sd_card_write_data),
     .audio_fifo_wr_en  (audio_fifo_wr_en),
@@ -413,6 +426,9 @@ audio_pcm_player u_audio_pcm_player (
     .rst              (rst_vid),
     .enable           (display_valid),
     .volume           (cfg_volume),       // sd 域慢变量，模块内两次采样一致才用
+    .tone_volume      (cfg_tone_volume),  // 同上
+    .key_down         (key_any_down_sd),  // sd 域寄存器电平，模块内 2FF
+    .no_card          (!osd_storage_ready), // 已同步到 video_clk；模块内再 2FF，持续 3 s 才提醒
     .fifo_empty       (audio_fifo_empty),
     .fifo_valid       (audio_fifo_valid),
     .fifo_rdusedw     (audio_fifo_rdusedw),
@@ -489,7 +505,8 @@ image_playback_control #(
     .prev_request          (prev_request),
     .auto_request          (auto_request),
     .auto_play_enabled     (auto_play_enabled),
-    .auto_period_sec       (auto_period_sec)
+    .auto_period_sec       (auto_period_sec),
+    .key_down              (playback_key_down)
 );
 
 // ---------------------------------------------------------------------------
@@ -524,8 +541,21 @@ param_menu_controller #(
     .menu_channel  (cfg_menu_channel),
     .menu_active   (cfg_menu_active),
     .cfg_toggle    (cfg_toggle_sd),
-    .volume        (cfg_volume)
+    .volume        (cfg_volume),
+    .key_down      (menu_key_down),
+    // 音量命令口：后续串口屏解码器接到这里（sd_card_clk 域单拍命令），现在先接 0
+    .vol_cmd_valid (1'b0),
+    .vol_cmd_target(1'b0),
+    .vol_cmd_op    (2'b00),
+    .vol_cmd_value (4'd0),
+    .tone_volume   (cfg_tone_volume)
 );
+
+// 按键提示音：三个按键的消抖电平合成一路，寄存后再跨到 video_clk（单比特电平）
+always @(posedge sd_card_clk or posedge rst_sd) begin
+    if (rst_sd) key_any_down_sd <= 1'b0;
+    else        key_any_down_sd <= playback_key_down || menu_key_down;
+end
 
 // Hold new playback requests while the video-domain fade owns the display
 // handoff.  The image manager remains unchanged, preserving TF recovery and
@@ -737,12 +767,14 @@ video_transition_controller video_transition_controller_m0(
     .display_valid          (display_valid_video_sync),
     .committed_buffer_index (disp_buf_idx_video_sync),
     .read_fault             (frame_read_fault_video_sync[1]),
+    .transition_mode        (transition_mode_video),
     .active_buffer_index    (active_buffer_index),
     .slide_old_buffer_index (slide_old_buffer_index),
     .slide_new_buffer_index (slide_new_buffer_index),
     .slide_active           (slide_active),
     .transition_busy        (transition_busy),
-    .slide_position         (slide_position)
+    .slide_position         (slide_position),
+    .fade_gain              (fade_gain)
 );
 
 video_delay video_delay_m0(
@@ -867,6 +899,7 @@ brightness_contrast_adjust brightness_contrast_adjust_m0(
     .menu_channel_in  (cfg_channel_v),
     .menu_active_in   (cfg_active_v),
     .cfg_toggle       (cfg_tgl_sync1),
+    .fade_gain        (fade_gain),
     .rgb_in           (vout_data),
     .rgb_out          (vout_data_bc),
     .brightness_q     (bc_brightness_committed),
@@ -912,6 +945,11 @@ video_osd_overlay video_osd_overlay_m0(
     .contrast_value       (bc_contrast_committed),
     .menu_channel         (bc_channel_committed),
     .info_text            (osd_info_text),
+    // 时钟校时：以后接串口屏 RTC；现在不校时，显示上电运行时间
+    .time_set             (1'b0),
+    .time_h               (5'd0),
+    .time_m               (6'd0),
+    .time_s               (6'd0),
     .rgb_out              (vout_data_osd)
 );
 

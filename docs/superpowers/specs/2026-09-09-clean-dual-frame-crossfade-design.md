@@ -1,3 +1,5 @@
+> **状态（2026-09-25）：未按本文落地。** 实际转场实现见 `rtl/video/video_transition_controller.v` / `video_transition_blender.v`；文中提到的 KEY4 在板上不存在。
+
 # 纯双帧交叉淡化转场设计
 
 日期：2026-09-09

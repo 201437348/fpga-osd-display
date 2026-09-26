@@ -28,6 +28,11 @@
 //   sw[1:0] = 11 时：亮度/对比度保持默认，KEY3 短按 = 音量 +1 档，长按 = -1 档
 //   （0..8 档，0 = 静音，8 = 原音量，每档 6 dB；默认 VOLUME_DEFAULT）
 //
+// 音量命令口（给串口屏用，同一时钟域的单拍命令，优先于 KEY3）：
+//   vol_cmd_valid 单拍有效；vol_cmd_target 0 = 音乐音量，1 = 提示音音量；
+//   vol_cmd_op    00 = 设为 vol_cmd_value（>8 按 8），01 = +1 档，10 = -1 档，11 = 恢复默认
+//   两路音量都是 0..8 档饱和，不回绕。
+//
 // ---------------------------------------------------------------------------
 // 三个必须守住的设计点（都是踩过坑才写进来的）：
 //
@@ -54,7 +59,8 @@ module param_menu_controller #(
     parameter integer MENU_HOLD_MS    = 5000,
     parameter [7:0]   BRIGHTNESS_DEFAULT = 8'd255,
     parameter [7:0]   CONTRAST_DEFAULT   = 8'd128,
-    parameter [3:0]   VOLUME_DEFAULT     = 4'd8
+    parameter [3:0]   VOLUME_DEFAULT     = 4'd8,
+    parameter [3:0]   TONE_VOLUME_DEFAULT = 4'd8
 )(
     input  wire       clk,
     input  wire       rst,           // 高有效异步
@@ -65,7 +71,13 @@ module param_menu_controller #(
     output wire [1:0] menu_channel,  // 当前调节通道，供 OSD 高亮
     output wire       menu_active,   // 最近一次操作后保持 MENU_HOLD_MS
     output wire       cfg_toggle,    // 每次配置变化翻转一次（跨时钟域握手）
-    output reg  [3:0] volume         // 音量档 0..8（慢变，接收端两次采样一致即可）
+    output reg  [3:0] volume,        // 音量档 0..8（慢变，接收端两次采样一致即可）
+    output wire       key_down,      // KEY3 已消抖按下（给按键提示音）
+    input  wire       vol_cmd_valid,
+    input  wire       vol_cmd_target,
+    input  wire [1:0] vol_cmd_op,
+    input  wire [3:0] vol_cmd_value,
+    output reg  [3:0] tone_volume    // 提示音音量档 0..8
 );
 
     localparam integer DEBOUNCE_CYCLES   = (CLK_FREQ_HZ / 1000) * DEBOUNCE_MS;
@@ -147,6 +159,7 @@ module param_menu_controller #(
         else     key_stable_d <= key_stable;
     end
     wire key_release = (key_stable && !key_stable_d);
+    assign key_down  = !key_stable;
 
     // ------------------------------------------------------------------
     // 长按计时：按住期间只打标记，松手才用
@@ -177,9 +190,30 @@ module param_menu_controller #(
     // 一次"操作"：拨码变化，或按键松手（11 档调音量也算，便于数码管显示）
     wire menu_event = sw_changed || key_release;
 
+    function [3:0] vol_apply;
+        input [3:0] cur;
+        input [1:0] op;
+        input [3:0] val;
+        input [3:0] dflt;
+        begin
+            case (op)
+                2'b00:   vol_apply = (val > 4'd8) ? 4'd8 : val;
+                2'b01:   vol_apply = (cur < 4'd8) ? cur + 4'd1 : 4'd8;
+                2'b10:   vol_apply = (cur != 4'd0) ? cur - 4'd1 : 4'd0;
+                default: vol_apply = dflt;
+            endcase
+        end
+    endfunction
+
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            volume <= VOLUME_DEFAULT;
+            volume      <= VOLUME_DEFAULT;
+            tone_volume <= TONE_VOLUME_DEFAULT;
+        end else if (vol_cmd_valid) begin
+            if (vol_cmd_target)
+                tone_volume <= vol_apply(tone_volume, vol_cmd_op, vol_cmd_value, TONE_VOLUME_DEFAULT);
+            else
+                volume      <= vol_apply(volume, vol_cmd_op, vol_cmd_value, VOLUME_DEFAULT);
         end else if (key_release && (sel_ch == 2'b11)) begin
             if (long_fired) begin
                 if (volume != 4'd0)

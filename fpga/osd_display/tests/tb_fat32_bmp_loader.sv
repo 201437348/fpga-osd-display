@@ -192,8 +192,10 @@ task automatic make_valid_bmp_header;
         put_byte(sector, 1, 8'h4D);
         put_le32(sector, 2, 32'd60);
         put_le32(sector, 10, 32'd54);
+        put_le32(sector, 14, 32'd40);
         put_le32(sector, 18, 32'd2);
         put_le32(sector, 22, 32'd1);
+        put_le16(sector, 26, 16'd1);
         put_le16(sector, 28, 16'd24);
         put_le32(sector, 30, 32'd0);
         put_byte(sector, 54, 8'h01);
@@ -295,6 +297,19 @@ initial begin
     expect_bit(done, 1'b0, "invalid header has no normal completion");
     expect_bit(write_req, 1'b0, "invalid header does not request frame write");
     expect_value(request_count, 32'd1, "invalid header reads only the probe sector");
+    settle_sd();
+
+    // 其余字段合法、只有 planes != 1 的头同样被拒绝
+    clear_disk();
+    clear_observations();
+    fill_sector(103, 8'h00);
+    make_valid_bmp_header(103);
+    put_le16(103, 26, 16'd0);
+    start_loader(32'd512);
+    @(posedge error);
+    #1;
+    expect_bit(write_req, 1'b0, "planes=0 header does not request frame write");
+    expect_value(request_count, 32'd1, "planes=0 header reads only the probe sector");
     settle_sd();
 
     // A premature FAT end-of-chain reaches the loader as an error, not done.

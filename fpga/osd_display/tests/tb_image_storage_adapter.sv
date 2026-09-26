@@ -115,6 +115,7 @@ task automatic start_loader;
     input [1:0] index;
     begin
         target_image_index = index;
+        repeat (2) tick();          // selected_ok_q 打了一拍，与管理器的时序一致
         load_start = 1'b1;
         tick();
         load_start = 1'b0;
@@ -199,8 +200,8 @@ initial begin
     tick();
     expect_bit(scan_done, 1'b1, "scan completion is reported after metadata capture");
     expect_value(scan_found_count, 3'd2, "two file records cached");
-    expect_value(dut.image_cluster0, 32'd10, "first file cluster cached");
-    expect_value(dut.image_size1, 32'd2000, "second file size cached");
+    expect_value(dut.image_cluster[0], 32'd10, "first file cluster cached");
+    expect_value(dut.image_size[1], 32'd2000, "second file size cached");
     expect_value(dut.volume_first_fat_lba, 32'd20, "FAT geometry cached");
     expect_value(dut.volume_first_data_lba, 32'd100, "data geometry cached");
 
@@ -249,7 +250,7 @@ initial begin
     tick();
     expect_bit(scan_done, 1'b0, "storage reinit clears scan completion");
     expect_value(scan_found_count, 3'd0, "storage reinit clears image count");
-    expect_value(dut.image_cluster0, 32'd0, "storage reinit clears file metadata");
+    expect_value(dut.image_cluster[0], 32'd0, "storage reinit clears file metadata");
 
     $display("PASS tb_image_storage_adapter");
     $finish;
@@ -273,10 +274,14 @@ module fat32_directory_scan #(
 );
 endmodule
 
-module fat32_bmp_loader(
+module fat32_bmp_loader #(
+    parameter [31:0] MIN_SRC_PIXELS = 32'd32000
+)(
     input clk, input rst, input start, input abort, input [31:0] file_first_cluster,
     input [31:0] file_size, input [31:0] first_fat_lba, input [31:0] first_data_lba,
-    input [7:0] sectors_per_cluster, input [15:0] bmp_width, input [15:0] bmp_height,
+    input [7:0] sectors_per_cluster,
+    output [15:0] src_width, output [15:0] src_height, output reg header_valid,
+    output [3:0] dbg_state,
     output reg busy, output reg done, output reg error, output reg write_req,
     input write_req_ack, input write_fifo_afull, output reg bmp_data_wr_en,
     output reg [23:0] bmp_data, output reg sd_sec_read, output reg [31:0] sd_sec_read_addr,

@@ -325,6 +325,21 @@ wire      pl_req_hit  = pl_req_prev ? prev_hit_q : next_hit_q;
 wire      pl_preempt  = pl_req && !pl_req_hit &&
                         !source_done_seen && !source_done_pulse && !source_error_pulse;
 
+// 时序（100 MHz）：两个 32 位超时比较先打一拍，不再和 VERIFY 里的切换逻辑
+// 串在同一拍（原来是 target_image_index / display_buffer_index 的违例路径）。
+// 只在 VERIFY 里计算；ST_LOAD 清计数的那一拍这里同时清零，重试后的第一拍
+// 不会拿到上一次的超时结果。10 s 超时晚一拍无所谓。
+reg load_timeout_hit_q;
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        load_timeout_hit_q <= 1'b0;
+    else if (state != ST_VERIFY)
+        load_timeout_hit_q <= 1'b0;
+    else
+        load_timeout_hit_q <= (load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 2'd2)) ||
+                              (load_abs_count    >= (LOAD_ABS_TIMEOUT_CYCLES - 2'd2));
+end
+
 always @(posedge clk or posedge rst) begin
     if (rst) begin
         target_hit_q              <= 1'b0;
@@ -564,8 +579,7 @@ always @(posedge clk or posedge rst) begin
                     end else if (source_error_pulse ||
                         (!((source_done_seen || source_done_pulse) &&
                            (write_done_seen || write_done_pulse)) &&
-                         ((load_timeout_count >= (LOAD_TIMEOUT_CYCLES - 1'b1)) ||
-                          (load_abs_count    >= (LOAD_ABS_TIMEOUT_CYCLES - 1'b1))))) begin
+                         load_timeout_hit_q)) begin
                         load_abort <= 1'b1;
                         if (!preloading)
                             error_code <= source_error_pulse ? ERR_SOURCE : ERR_TIMEOUT;

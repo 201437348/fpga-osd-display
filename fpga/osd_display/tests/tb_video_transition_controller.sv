@@ -8,6 +8,9 @@ reg video_read_req = 1'b0;
 reg display_valid = 1'b0;
 reg [1:0] committed_buffer_index = 2'd0;
 reg read_fault = 1'b0;
+reg transition_mode = 1'b0;
+wire [6:0] fade_gain;
+reg [6:0] fade_tab [0:16];
 wire [1:0] active_buffer_index;
 wire [1:0] slide_old_buffer_index;
 wire [1:0] slide_new_buffer_index;
@@ -26,12 +29,14 @@ video_transition_controller dut (
     .display_valid           (display_valid),
     .committed_buffer_index  (committed_buffer_index),
     .read_fault              (read_fault),
+    .transition_mode         (transition_mode),
     .active_buffer_index     (active_buffer_index),
     .slide_old_buffer_index  (slide_old_buffer_index),
     .slide_new_buffer_index  (slide_new_buffer_index),
     .slide_active            (slide_active),
     .transition_busy         (transition_busy),
-    .slide_position          (slide_position)
+    .slide_position          (slide_position),
+    .fade_gain               (fade_gain)
 );
 
 task automatic expect_bit;
@@ -147,7 +152,48 @@ initial begin
     expect_bit(slide_active, 1'b0, "slide disables at endpoint");
     expect_bit(transition_busy, 1'b0, "reservation releases at endpoint");
 
+    // ---------------- 淡入淡出 ----------------
+    fade_tab[0]=0;  fade_tab[1]=1;  fade_tab[2]=3;  fade_tab[3]=6;  fade_tab[4]=10;
+    fade_tab[5]=15; fade_tab[6]=20; fade_tab[7]=25; fade_tab[8]=32; fade_tab[9]=39;
+    fade_tab[10]=44; fade_tab[11]=49; fade_tab[12]=54; fade_tab[13]=58; fade_tab[14]=61;
+    fade_tab[15]=63; fade_tab[16]=64;
+    expect_position({3'd0, fade_gain}, 10'd64, "gain idle at 64");
+    transition_mode = 1'b1;
     committed_buffer_index = 2'd2;
+    @(posedge video_clk);
+    #1;
+    pulse_read_request;
+    transition_mode = 1'b0;          // 中途改模式不影响本次
+    expect_bit(slide_active, 1'b0, "fade never slides");
+    expect_bit(transition_busy, 1'b1, "fade holds busy");
+    expect_position({3'd0, fade_gain}, 10'd64, "fade starts at 64");
+    // 切图中途来的新 commit 不能被吞掉，也不能打断本次
+    committed_buffer_index = 2'd3;
+    for (step = 1; step <= 16; step = step + 1) begin
+        pulse_read_request;
+        expect_position({3'd0, fade_gain}, 10'd64 - fade_tab[step], "fade out gain");
+        expect_index(active_buffer_index, 2'd1, "old buffer during fade out");
+        expect_bit(slide_active, 1'b0, "fade out no slide");
+    end
+    pulse_read_request;
+    expect_position({3'd0, fade_gain}, 10'd0, "black hold");
+    expect_index(active_buffer_index, 2'd2, "switch inside black");
+    for (step = 1; step <= 16; step = step + 1) begin
+        expect_bit(transition_busy, 1'b1, "busy during fade in");
+        pulse_read_request;
+        expect_position({3'd0, fade_gain}, {3'd0, fade_tab[step]}, "fade in gain");
+        expect_index(active_buffer_index, 2'd2, "new buffer during fade in");
+    end
+    expect_bit(transition_busy, 1'b0, "fade releases busy");
+    // 挂起的 commit(3) 在淡入结束后按当前模式（滑动）开始
+    pulse_read_request;
+    expect_bit(slide_active, 1'b1, "pending commit slides after fade");
+    expect_index(slide_old_buffer_index, 2'd2, "slide from faded-in buffer");
+    for (step = 1; step <= 28; step = step + 1) pulse_read_request;
+    expect_index(active_buffer_index, 2'd3, "pending commit lands");
+    expect_bit(transition_busy, 1'b0, "slide done");
+
+    committed_buffer_index = 2'd1;
     @(posedge video_clk);
     #1;
     pulse_read_request;
@@ -157,10 +203,25 @@ initial begin
     #1;
     expect_bit(slide_active, 1'b0, "fault cancels slide");
     expect_bit(transition_busy, 1'b1, "fault holds busy");
-    expect_index(active_buffer_index, 2'd1, "fault keeps active buffer");
+    expect_index(active_buffer_index, 2'd3, "fault keeps active buffer");
     read_fault = 1'b0;
     repeat (2) pulse_read_request;
-    expect_index(active_buffer_index, 2'd1, "fault remains latched until reset");
+    expect_index(active_buffer_index, 2'd3, "fault remains latched until reset");
+
+    // 淡出途中出故障：增益恢复 64，不能卡在黑屏
+    rst = 1'b1; @(posedge video_clk); #1; rst = 1'b0;
+    committed_buffer_index = 2'd0;
+    pulse_read_request;
+    transition_mode = 1'b1;
+    committed_buffer_index = 2'd1;
+    @(posedge video_clk); #1;
+    repeat (6) pulse_read_request;
+    if (fade_gain >= 7'd64) $fatal(1, "FAIL fade did not start after reset");
+    read_fault = 1'b1;
+    @(posedge video_clk); #1;
+    expect_position({3'd0, fade_gain}, 10'd64, "fault restores gain");
+    expect_index(active_buffer_index, 2'd0, "fault keeps old buffer in fade");
+    read_fault = 1'b0;
 
     $display("PASS tb_video_transition_controller");
     $finish;

@@ -15,14 +15,13 @@ module fat32_bmp_loader #(
     // 允许的源分辨率范围。必须与 image_bilinear_scaler 的 MAX_SRC_* 一致。
     parameter [15:0] MAX_SRC_WIDTH  = 16'd1920,
     parameter [15:0] MAX_SRC_HEIGHT = 16'd1080,
-    // 最小源像素数。源码流速率由 SPI(25MHz) 决定 —— 每个源像素 3 字节，
-    // 即约 96 拍(@100MHz)才送来 1 个像素；而写侧缩放器每输出 1 个像素要 7 拍，
-    // 一帧要 640*480 个输出像素。因此必须满足
-    //       640*480*7 <= W*H*96   ->   W*H >= 22400
-    // 取 32000（例如 200x160、320x100）留约 1.4 倍余量。
-    // 比这更小的源图不会损坏数据（输入 FIFO 会反压），但会拖慢加载甚至触发
-    // 扇区读取看门狗，所以在头校验阶段直接拒绝更干净。
-    parameter [31:0] MIN_SRC_PIXELS = 32'd32000
+    // 最小源像素数。默认 1 = 不限制（任意 1x1 .. 1920x1080 都接受）。
+    // 小图（放大）时缩放器输出比源慢，write_fifo_afull 反压本模块：只在扇区之间
+    // 的 ST_STREAM_PAUSE 等待，此时没有挂起的扇区读，adapter 的 SD 响应看门狗
+    // 不计时；一帧输出固定约 28 ms，远小于 image_load_manager 的加载超时。
+    // tests/tb_scaler_sizes.sv 覆盖 1x1、1x480、7x1080 等极端尺寸。
+    // 以前取 32000 是按"缩放器必须跟得上 SPI 源流"估的，那个约束并不存在。
+    parameter [31:0] MIN_SRC_PIXELS = 32'd1
 )(
     input  wire        clk,
     input  wire        rst,
@@ -103,6 +102,8 @@ reg [7:0]  header_0;
 reg [7:0]  header_1;
 reg [31:0] header_file_len;
 reg [31:0] pixel_offset;
+reg [31:0] dib_size;
+reg [15:0] planes;
 reg [31:0] header_width;
 reg [31:0] header_height;
 reg [15:0] bit_count;
@@ -169,9 +170,12 @@ assign header_match = (header_0 == 8'h42) &&
                       src_w_ok &&
                       src_h_ok &&
                       src_pixels_ok &&
+                      (dib_size >= 32'd40) &&          // BITMAPINFOHEADER 及以上（排除 OS/2 12 字节头）
+                      (planes == 16'd1) &&
                       (bit_count == 16'd24) &&
                       (compression == 32'd0) &&
                       (header_file_len != 32'd0) &&
+                      (pixel_offset >= 32'd54) &&      // 像素区不能与 14+40 字节头重叠
                       (pixel_offset < header_file_len) &&
                       (header_file_len <= file_size_latched);
 
@@ -250,6 +254,8 @@ always @(posedge clk or posedge rst) begin
         header_1                      <= 8'd0;
         header_file_len               <= 32'd0;
         pixel_offset                  <= 32'd54;
+        dib_size                      <= 32'd0;
+        planes                        <= 16'd0;
         header_width                  <= 32'd0;
         header_height                 <= 32'd0;
         bit_count                     <= 16'd0;
@@ -290,6 +296,10 @@ always @(posedge clk or posedge rst) begin
                 10'd11: pixel_offset[15:8] <= hdr_cap_data;
                 10'd12: pixel_offset[23:16] <= hdr_cap_data;
                 10'd13: pixel_offset[31:24] <= hdr_cap_data;
+                10'd14: dib_size[7:0] <= hdr_cap_data;
+                10'd15: dib_size[15:8] <= hdr_cap_data;
+                10'd16: dib_size[23:16] <= hdr_cap_data;
+                10'd17: dib_size[31:24] <= hdr_cap_data;
                 10'd18: header_width[7:0] <= hdr_cap_data;
                 10'd19: header_width[15:8] <= hdr_cap_data;
                 10'd20: header_width[23:16] <= hdr_cap_data;
@@ -298,6 +308,8 @@ always @(posedge clk or posedge rst) begin
                 10'd23: header_height[15:8] <= hdr_cap_data;
                 10'd24: header_height[23:16] <= hdr_cap_data;
                 10'd25: header_height[31:24] <= hdr_cap_data;
+                10'd26: planes[7:0] <= hdr_cap_data;
+                10'd27: planes[15:8] <= hdr_cap_data;
                 10'd28: bit_count[7:0] <= hdr_cap_data;
                 10'd29: bit_count[15:8] <= hdr_cap_data;
                 10'd30: compression[7:0] <= hdr_cap_data;
@@ -345,6 +357,8 @@ always @(posedge clk or posedge rst) begin
                         header_1                   <= 8'd0;
                         header_file_len            <= 32'd0;
                         pixel_offset               <= 32'd54;
+                        dib_size                   <= 32'd0;
+                        planes                     <= 16'd0;
                         header_width               <= 32'd0;
                         header_height              <= 32'd0;
                         bit_count                  <= 16'd0;

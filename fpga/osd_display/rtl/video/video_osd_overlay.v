@@ -1,4 +1,6 @@
-module video_osd_overlay (
+module video_osd_overlay #(
+    parameter integer CLK_HZ = 25_000_000   // video_clk，时钟秒分频用
+) (
     input  wire        video_clk,
     input  wire        rst,
     input  wire        vs,
@@ -18,8 +20,16 @@ module video_osd_overlay (
     input  wire [1:0]  menu_channel,
     // 顶栏信息行（osd_info_text 生成）：40 个 ASCII，字符 i 在 [i*8 +: 8]
     input  wire [319:0] info_text,
+    // 时钟校时（预留给串口屏 RTC）：time_set 单拍有效时装入 时/分/秒（二进制，
+    // 时 0..23、分秒 0..59，超范围忽略），此后本地每秒走时。没有校时源时从上电 00:00:00
+    // 开始计，即显示上电运行时间。
+    input  wire        time_set,
+    input  wire [4:0]  time_h,
+    input  wire [5:0]  time_m,
+    input  wire [5:0]  time_s,
     output wire [23:0] rgb_out
 );
+
 
 localparam [9:0] TOP_BAR_HEIGHT = 10'd24;
 localparam [9:0] BOTTOM_BAR_Y   = 10'd456;
@@ -40,6 +50,20 @@ localparam [23:0] FALLBACK_RGB = 24'hFFD166;
 localparam [23:0] WAIT_RGB     = 24'hFF6B6B;
 localparam [23:0] LOAD_RGB     = 24'h7EE787;
 localparam [23:0] SCAN_RGB     = 24'hA7C7FF;
+localparam [23:0] CLOCK_RGB    = 24'hF4F7FB;
+
+// 状态栏右侧时钟 HH:MM:SS（8 字符 x 8px），与左侧状态文字同一行
+localparam [9:0] CLOCK_X = 10'd552;
+
+// 三条信息栏背景半透明：out = bar*3/4 + img*1/4（仅移位加法），文字仍不透明
+function [23:0] bar_blend;
+    input [23:0] img;
+    begin
+        bar_blend[23:16] = {2'b00, BAR_RGB[23:18]} + {1'b0, BAR_RGB[23:17]} + {2'b00, img[23:18]};
+        bar_blend[15:8]  = {2'b00, BAR_RGB[15:10]} + {1'b0, BAR_RGB[15:9]}  + {2'b00, img[15:10]};
+        bar_blend[7:0]   = {2'b00, BAR_RGB[7:2]}   + {1'b0, BAR_RGB[7:1]}   + {2'b00, img[7:2]};
+    end
+endfunction
 
 // ---------------------------------------------------------------------------
 // 亮度/对比度参数菜单（第13课）
@@ -153,6 +177,49 @@ wire        menu_seg_b_on;
 wire        menu_seg_c_on;
 wire        menu_hl_b;
 wire        menu_hl_c;
+
+// ---- 时钟：秒分频 + 时分秒计数 ----
+reg [24:0] sec_div;
+reg [4:0]  clk_h;
+reg [5:0]  clk_m;
+reg [5:0]  clk_s;
+wire       sec_tick = (sec_div == CLK_HZ - 1);
+
+always @(posedge video_clk or posedge rst) begin
+    if (rst) begin
+        sec_div <= 25'd0;
+        clk_h   <= 5'd0;
+        clk_m   <= 6'd0;
+        clk_s   <= 6'd0;
+    end else if (time_set && (time_h < 5'd24) && (time_m < 6'd60) && (time_s < 6'd60)) begin
+        sec_div <= 25'd0;
+        clk_h   <= time_h;
+        clk_m   <= time_m;
+        clk_s   <= time_s;
+    end else begin
+        sec_div <= sec_tick ? 25'd0 : sec_div + 25'd1;
+        if (sec_tick) begin
+            if (clk_s != 6'd59) begin
+                clk_s <= clk_s + 6'd1;
+            end else begin
+                clk_s <= 6'd0;
+                if (clk_m != 6'd59) begin
+                    clk_m <= clk_m + 6'd1;
+                end else begin
+                    clk_m <= 6'd0;
+                    clk_h <= (clk_h == 5'd23) ? 5'd0 : clk_h + 5'd1;
+                end
+            end
+        end
+    end
+end
+
+wire [9:0] clock_x_offset = x - CLOCK_X;
+wire       clock_active   = (y >= STATUS_Y) && (y < (STATUS_Y + 10'd16)) &&
+                            (x >= CLOCK_X) && (clock_x_offset < 10'd64);
+wire [7:0] clock_char     = clock_digit(clock_x_offset[5:3], clk_h, clk_m, clk_s);
+wire [7:0] clock_glyph    = glyph_row(clock_char, status_row);
+wire       clock_pixel    = clock_active && clock_glyph[7 - clock_x_offset[2:0]];
 
 assign title_x_offset = x - TITLE_X;
 assign title_y_offset = y - TITLE_Y;
@@ -325,6 +392,43 @@ function [7:0] ticker_char;
             6'd53: ticker_char = 8'h2F; // /
             6'd54: ticker_char = 8'h20; // space
             default: ticker_char = 8'h20;
+        endcase
+    end
+endfunction
+
+// 0..59 -> 十位 / 个位字符码（值域小，直接比较，不用除法器）
+function [7:0] tens_char;
+    input [5:0] v;
+    begin
+        tens_char = (v >= 6'd50) ? 8'h35 : (v >= 6'd40) ? 8'h34 :
+                    (v >= 6'd30) ? 8'h33 : (v >= 6'd20) ? 8'h32 :
+                    (v >= 6'd10) ? 8'h31 : 8'h30;
+    end
+endfunction
+
+function [7:0] units_char;
+    input [5:0] v;
+    begin
+        units_char = 8'h30 + ((v >= 6'd50) ? v - 6'd50 : (v >= 6'd40) ? v - 6'd40 :
+                              (v >= 6'd30) ? v - 6'd30 : (v >= 6'd20) ? v - 6'd20 :
+                              (v >= 6'd10) ? v - 6'd10 : v);
+    end
+endfunction
+
+function [7:0] clock_digit;       // 位置 0..7 -> "HH:MM:SS"
+    input [2:0] pos;
+    input [4:0] h;
+    input [5:0] m;
+    input [5:0] sec;
+    begin
+        case (pos)
+            3'd0:    clock_digit = tens_char({1'b0, h});
+            3'd1:    clock_digit = units_char({1'b0, h});
+            3'd3:    clock_digit = tens_char(m);
+            3'd4:    clock_digit = units_char(m);
+            3'd6:    clock_digit = tens_char(sec);
+            3'd7:    clock_digit = units_char(sec);
+            default: clock_digit = 8'h3A;   // ':'
         endcase
     end
 endfunction
@@ -756,6 +860,12 @@ function [7:0] glyph_row;
                 3'd5: glyph_row = 8'b00011000;
                 3'd6: glyph_row = 8'b00011000;
             endcase
+            8'h3A: case (row) // :
+                3'd1: glyph_row = 8'b00011000;
+                3'd2: glyph_row = 8'b00011000;
+                3'd4: glyph_row = 8'b00011000;
+                3'd5: glyph_row = 8'b00011000;
+            endcase
             8'h2F: case (row) // /
                 3'd0: glyph_row = 8'b00000010;
                 3'd1: glyph_row = 8'b00000100;
@@ -809,17 +919,19 @@ always @* begin
 
     if (de) begin
         if (y < TOP_BAR_HEIGHT) begin
-            rgb_out_r = BAR_RGB;
+            rgb_out_r = bar_blend(rgb_in);
             if (title_pixel)
                 rgb_out_r = TITLE_RGB;
         end else if (ticker_active) begin
-            rgb_out_r = BAR_RGB;
+            rgb_out_r = bar_blend(rgb_in);
             if (ticker_pixel)
                 rgb_out_r = TICKER_RGB;
         end else if (y >= BOTTOM_BAR_Y) begin
-            rgb_out_r = BAR_RGB;
+            rgb_out_r = bar_blend(rgb_in);
             if (indicator_active || status_pixel)
                 rgb_out_r = status_rgb;
+            else if (clock_pixel)
+                rgb_out_r = CLOCK_RGB;
         end
 
         // 参数菜单画在最上层，常驻于左上角 (x 16..199, y 24..59)，紧贴标题栏下方，

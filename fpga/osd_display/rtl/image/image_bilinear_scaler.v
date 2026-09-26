@@ -34,9 +34,23 @@
 //   输出回路每个输出像素 9 拍（EM_P0..EM_P6 + 插值流水 EM_P5B/EM_P6A；
 //   改流水前 tools/scaler_cycle_model.js 实测为 7.008 拍/像素）。
 //   源码流速率由 SPI(25MHz) 决定：每像素 3 字节 ≈ 96 拍@100MHz 才来 1 个。
-//   一帧要 640*480 个输出像素，故必须满足
-//         640*480*9 <= srcW*srcH*96   ->   srcW*srcH >= 28800
-//   fat32_bmp_loader 的 MIN_SRC_PIXELS = 32000 留了约 1.1 倍余量。
+//   小图（放大）时输出比源慢，输入 FIFO 反压 loader：loader 只在扇区之间
+//   （ST_STREAM_PAUSE，此时没有挂起的扇区读，SD 看门狗不计时）停下来等，
+//   每次最多等几行输出（< 1 ms）。所以源图再小也不会丢数据或超时，
+//   只是一帧固定要 640*480*9 拍 ≈ 28 ms 输出时间。loader 的 MIN_SRC_PIXELS
+//   因此已放宽到 1（tests/tb_scaler_sizes.sv 覆盖 1x1 .. 1920x1080）。
+//
+// ---------------------------------------------------------------------------
+// 抗锯齿（降采样比 >= 1.5 时自动启用，AA_ENABLE=0 可关）
+// ---------------------------------------------------------------------------
+//   纯双线性在 1920->640 这类 3 倍缩小时每 3 个源像素只取 2 个，细线/文字会
+//   断续闪烁（混叠）。启用后每个图像像素读 4x4 源窗口
+//       行 sy0-1, sy0, sy0+1, sy0+2  x  列 sx0-1, sx0, sx0+1, sx0+2（边缘钳位）
+//   先做 [1 2 1]x[1 2 1]/16 的帐篷预滤波得到 4 个抽头 q00/q01/q10/q11，
+//   再走原来的双线性。预滤波全是移位加法，不占 DSP（DSP 已 29/29），不加 BRAM。
+//   代价：图像像素 9 -> 25 拍；降采样时源流速 >= 96 拍/像素，输出永远更快，
+//   加载时间不变。行缓存仍是 4 槽：读窗口正好 4 行，写侧节流改为
+//   wr_row < y0_cur + 3（y0_cur 仍是当前 sy0，窗口最低行为 sy0-1）。
 //
 // ---------------------------------------------------------------------------
 // 资源
@@ -68,7 +82,9 @@ module image_bilinear_scaler #(
     // 写 FIFO 会连续突发把 SDRAM 带宽占满，读侧（显示/滑动转场）断流
     // -> read_fault 锁死（1920x1080 上下各 60 行黑边实测复现）。
     // 取 8：与图像像素 EM_P0..P6 的 7 拍/像素同量级。
-    parameter [3:0]  BLACK_INTERVAL = 4'd8
+    parameter [3:0]  BLACK_INTERVAL = 4'd8,
+    // 降采样抗锯齿（见文件头）。1 = 缩小比 >= 1.5 时启用，0 = 始终纯双线性
+    parameter        AA_ENABLE      = 1'b1
 )(
     input  wire        clk,             // sd_card_clk (100 MHz)
     input  wire        rst,
@@ -133,7 +149,10 @@ module image_bilinear_scaler #(
     // 若只靠 !cfg_latched 判断，而在 cfg_latched 拉高之前的每一拍都会重新
     // 进入配置块，把 div_rem/div_quot 清零 -> 串行除法器的余数链被破坏。
     reg        cfg_started;
-    wire       cfg_ready   = cfg_valid;
+    // cfg_valid 晚一拍使用：fit_w_c 打了一拍（见下），保证配置时采到的是
+    // 当前 src_width/src_height 算出的结果（header_valid 是电平，晚一拍无影响）。
+    reg        cfg_valid_q;
+    wire       cfg_ready   = cfg_valid && cfg_valid_q;
     wire       cfg_w_valid = (src_width != 16'd0) && (src_width <= MAX_SRC_WIDTH);
     wire       cfg_h_valid = (src_height != 16'd0) && (src_height <= MAX_SRC_HEIGHT);
 
@@ -158,7 +177,17 @@ module image_bilinear_scaler #(
     // =======================================================================
     wire [31:0] cross_w = {16'd0, src_width}  * {16'd0, DST_HEIGHT};
     wire [31:0] cross_h = {16'd0, src_height} * {16'd0, DST_WIDTH};
-    wire        fit_w_c = (cross_w >= cross_h);
+    // 乘法 + 比较打一拍再用（时序：src_width -> MULT -> 比较 -> div_dividend 原本一拍做完）
+    reg         fit_w_c;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            fit_w_c     <= 1'b1;
+            cfg_valid_q <= 1'b0;
+        end else begin
+            fit_w_c     <= (cross_w >= cross_h);
+            cfg_valid_q <= cfg_valid;
+        end
+    end
 
     reg         fit_w;          // 1 = 宽贴边，0 = 高贴边
     reg  [15:0] scale_num;      // N
@@ -310,7 +339,16 @@ module image_bilinear_scaler #(
     // 写第 wr_row 行会覆盖第 (wr_row - 4) 行；只要它还 < y0_cur 就安全。
     // 放大时该条件会拉低 wr_accept，把写侧节流住而不会覆盖未消费的行。
     // 不会死锁：写侧被挡住时，消费侧所需的两行必然已经就绪，它会推进 y0_cur。
-    wire wr_guard_ok = (wr_row < (y0_cur + 16'd4));
+    // 抗锯齿时读窗口从 sy0-1 开始，只能领先 3 行。限值寄存一拍（时序）：
+    // y0_cur 只增不减（start 时虽清零，但那一拍 FIFO 同时清空，不会误写），
+    // 晚一拍只会让节流更保守。
+    reg        aa_en;
+    reg [15:0] wr_row_lim;
+    always @(posedge clk or posedge rst) begin
+        if (rst) wr_row_lim <= 16'd0;
+        else     wr_row_lim <= y0_cur + (aa_en ? 16'd3 : 16'd4);
+    end
+    wire wr_guard_ok = (wr_row < wr_row_lim);
     wire wr_row_last = (wr_col == (cfg_w - 16'd1));
     assign wr_accept = !fifo_empty && wr_guard_ok && (wr_row < cfg_h);
 
@@ -359,12 +397,16 @@ module image_bilinear_scaler #(
                      EM_FINISH   = 4'd9,
                      EM_BLACK    = 4'd10,  // 黑边像素：BLACK_INTERVAL 拍 1 个，不读行缓存
                      EM_P5B      = 4'd11,  // 水平插值第 2 级：移位/加减 -> h0/h1
-                     EM_P6A      = 4'd12;  // 垂直插值第 1 级：乘法 -> vm*
+                     EM_P6A      = 4'd12,  // 垂直插值第 1 级：乘法 -> vm*
+                     EM_AS       = 4'd13,  // 抗锯齿：锁存 4 列、发第 1 个地址、清累加器
+                     EM_AR       = 4'd14,  // 抗锯齿：连发 16 个地址 + 3 级滤波流水（19 拍）
+                     EM_AQ       = 4'd15;  // 抗锯齿：累加结果 -> p00..p11，推进 fix_x
 
     reg [3:0]  em_state;
     reg [15:0] out_y, out_x;
 
     reg [15:0] sy0, sy1;        // 本输出行锁存的源行对
+    reg [15:0] sym, sy3;        // 抗锯齿窗口的上/下行：clamp(sy0-1), clamp(sy0+2)
     reg [F-1:0] fy;
 
     reg [23:0] p00, p01, p10, p11, h0, h1;
@@ -390,6 +432,33 @@ module image_bilinear_scaler #(
     // rd_data（8 选 1 的结果）在存储器实例之后定义。
     reg  [15:0] rd_addr_c;
 
+    // ---- 抗锯齿 4x4 窗口 ----
+    // 行缓存地址 = slot*2048 + col = {slot[1:0], col[10:0]}（col < 2048），拼接即可。
+    reg  [10:0] aa_cx0, aa_cx1, aa_cx2, aa_cx3;   // 4 列（已钳位）
+    reg  [4:0]  aa_cnt;                           // EM_AR 内 0..18
+    reg  [15:0] aa_addr_r;                        // 本拍送 RAM 的地址（提前一拍算好）
+    wire [4:0]  aa_kn = aa_cnt + 5'd1;            // 下一拍要发的窗口序号（行=kn[3:2]，列=kn[1:0]）
+    wire [15:0] sx0p2 = sx0_c + 16'd2;
+    wire [15:0] aa_cx0_c = (sx0_c == 16'd0) ? 16'd0 : (sx0_c - 16'd1);
+    wire [15:0] aa_cx3_c = (sx0p2 >= cfg_w) ? (cfg_w - 16'd1) : sx0p2;
+    wire [15:0] sy0p2 = sy0_c + 16'd2;
+    reg  [1:0]  aa_row_slot;
+    reg  [10:0] aa_col;
+    always @(*) begin
+        case (aa_kn[3:2])
+            2'd0:    aa_row_slot = sym[1:0];
+            2'd1:    aa_row_slot = sy0[1:0];
+            2'd2:    aa_row_slot = sy1[1:0];
+            default: aa_row_slot = sy3[1:0];
+        endcase
+        case (aa_kn[1:0])
+            2'd0:    aa_col = aa_cx0;
+            2'd1:    aa_col = aa_cx1;
+            2'd2:    aa_col = aa_cx2;
+            default: aa_col = aa_cx3;
+        endcase
+    end
+
     // 时序（100 MHz）：四个抽头地址预先打一拍。原来 cfg_w-1 比较 -> sx1 选择 ->
     // 加槽基址 -> RAM 地址脚是一条组合长路径。fix_x 在 EM_P4 推进、sy0/sy1 在
     // EM_ROW_INIT 更新，距离下一次 EM_P0 至少隔 1 拍，所以寄存器版本在 EM_P0..P3
@@ -404,8 +473,10 @@ module image_bilinear_scaler #(
 
     wire em_x_last = (out_x == (DST_WIDTH  - 16'd1));
     wire em_y_last = (out_y == (DST_HEIGHT - 16'd1));
-    // sy1 行写完的条件：已完成的行数 wr_row 必须 > sy1
-    wire row_pair_ready = (wr_row_done > sy1);
+    // sy1 行写完的条件：已完成的行数 wr_row 必须 > sy1（抗锯齿时要到 sy3）
+    wire row_pair_ready = (wr_row_done > (aa_en ? sy3 : sy1));
+    // 图像像素的入口状态
+    wire [3:0] em_img_px = aa_en ? EM_AS : EM_P0;
 
     // ---- letterbox 区域判断 ----
     // 当前行是否图像行；下一个像素（同一行 out_x+1）是否图像像素；
@@ -419,7 +490,7 @@ module image_bilinear_scaler #(
     // 一个像素输出后的下一状态（黑边与图像像素共用）
     wire [3:0]  em_next_px    = em_x_last ? (em_y_last ? EM_FINISH :
                                               (ny_is_img ? EM_ROW_INIT : EM_BLACK))
-                                          : (nx_is_img ? EM_P0 : EM_BLACK);
+                                          : (nx_is_img ? em_img_px : EM_BLACK);
 
     // ---- 逐通道线性插值 ----
     //
@@ -493,6 +564,7 @@ module image_bilinear_scaler #(
             EM_P1:   rd_addr_c = rd_a01_r;
             EM_P2:   rd_addr_c = rd_a10_r;
             EM_P3:   rd_addr_c = rd_a11_r;
+            EM_AR:   rd_addr_c = aa_addr_r;
             default: rd_addr_c = 16'd0;
         endcase
     end
@@ -568,6 +640,92 @@ module image_bilinear_scaler #(
     wire [23:0] rd_data = lb_o[rd_sel_d];
 
     // =======================================================================
+    // 抗锯齿滤波流水（只在 EM_AR 里有数据流过）
+    //   EM_AR 第 c 拍发窗口第 c 个地址（c = 0..15），第 c+1 拍 rd_data 有效：
+    //   级 1：按列存 aa_px0..3，一行 4 列到齐 -> s1_v
+    //   级 2：水平 [1 2 1]：ha = c0+2c1+c2（给 sx0），hb = c1+2c2+c3（给 sx1）
+    //   级 3：垂直 [1 2 1] 累加：窗口行 0..3 对上抽头行（sy0）权重 1,2,1,0，
+    //         对下抽头行（sy1）权重 0,1,2,1
+    //   最后一行第 3 列在 c=16 到，c=17 过级 2，c=18 过级 3，EM_AQ 取结果。
+    // =======================================================================
+    wire       aa_cap_v   = (em_state == EM_AR) && (aa_cnt != 5'd0) && (aa_cnt <= 5'd16);
+    wire [3:0] aa_cap_idx = aa_cnt[3:0] - 4'd1;      // cnt=16 -> 15
+
+    reg [23:0] aa_px0, aa_px1, aa_px2, aa_px3;
+    reg        aa_s1_v, aa_s2_v;
+    reg [1:0]  aa_s1_row, aa_s2_row;
+    reg [29:0] aa_ha, aa_hb;                          // 3 通道 x 10 bit
+    reg [35:0] aa_a0a, aa_a0b, aa_a1a, aa_a1b;        // 3 通道 x 12 bit
+
+    function [9:0] aa_tap3;                           // a + 2b + c
+        input [7:0] a, b, c;
+        aa_tap3 = {2'd0, a} + {1'b0, b, 1'b0} + {2'd0, c};
+    endfunction
+
+    function [29:0] aa_h3;
+        input [23:0] a, b, c;
+        aa_h3 = {aa_tap3(a[23:16], b[23:16], c[23:16]),
+                 aa_tap3(a[15:8],  b[15:8],  c[15:8]),
+                 aa_tap3(a[7:0],   b[7:0],   c[7:0])};
+    endfunction
+
+    // acc += h * w，w = 0/1/2
+    function [35:0] aa_acc;
+        input [35:0] acc;
+        input [29:0] h;
+        input [1:0]  w;
+        reg   [11:0] t2, t1, t0;
+        begin
+            t2 = (w == 2'd2) ? {1'b0, h[29:20], 1'b0} : (w == 2'd1) ? {2'd0, h[29:20]} : 12'd0;
+            t1 = (w == 2'd2) ? {1'b0, h[19:10], 1'b0} : (w == 2'd1) ? {2'd0, h[19:10]} : 12'd0;
+            t0 = (w == 2'd2) ? {1'b0, h[9:0],   1'b0} : (w == 2'd1) ? {2'd0, h[9:0]}   : 12'd0;
+            aa_acc = {acc[35:24] + t2, acc[23:12] + t1, acc[11:0] + t0};
+        end
+    endfunction
+
+    // 12 bit 累加值 /16 四舍五入：最大 (4080+8)>>4 = 255
+    function [23:0] aa_q;
+        input [35:0] a;
+        reg   [12:0] r, g, b;
+        begin
+            r = {1'b0, a[35:24]} + 13'd8;
+            g = {1'b0, a[23:12]} + 13'd8;
+            b = {1'b0, a[11:0]}  + 13'd8;
+            aa_q = {r[11:4], g[11:4], b[11:4]};
+        end
+    endfunction
+
+    wire [1:0] aa_w_top = (aa_s2_row == 2'd1) ? 2'd2 : (aa_s2_row == 2'd3) ? 2'd0 : 2'd1;
+    wire [1:0] aa_w_bot = (aa_s2_row == 2'd2) ? 2'd2 : (aa_s2_row == 2'd0) ? 2'd0 : 2'd1;
+
+    always @(posedge clk) begin
+        if (aa_cap_v) begin
+            case (aa_cap_idx[1:0])
+                2'd0:    aa_px0 <= rd_data;
+                2'd1:    aa_px1 <= rd_data;
+                2'd2:    aa_px2 <= rd_data;
+                default: aa_px3 <= rd_data;
+            endcase
+        end
+        aa_s1_v   <= aa_cap_v && (aa_cap_idx[1:0] == 2'd3);
+        aa_s1_row <= aa_cap_idx[3:2];
+        aa_s2_v   <= aa_s1_v;
+        aa_s2_row <= aa_s1_row;
+        if (aa_s1_v) begin
+            aa_ha <= aa_h3(aa_px0, aa_px1, aa_px2);
+            aa_hb <= aa_h3(aa_px1, aa_px2, aa_px3);
+        end
+        if (em_state == EM_AS) begin
+            aa_a0a <= 36'd0; aa_a0b <= 36'd0; aa_a1a <= 36'd0; aa_a1b <= 36'd0;
+        end else if (aa_s2_v) begin
+            aa_a0a <= aa_acc(aa_a0a, aa_ha, aa_w_top);
+            aa_a0b <= aa_acc(aa_a0b, aa_hb, aa_w_top);
+            aa_a1a <= aa_acc(aa_a1a, aa_ha, aa_w_bot);
+            aa_a1b <= aa_acc(aa_a1b, aa_hb, aa_w_bot);
+        end
+    end
+
+    // =======================================================================
     // 主时序块
     // =======================================================================
     // 本拍是否输出了一个像素（组合临时量，只在本 always 块内用阻塞赋值）
@@ -578,7 +736,7 @@ module image_bilinear_scaler #(
             div_dividend <= 0; div_divisor <= 0; div_cnt <= 0; div_phase <= DIV_STEP;
             div_post <= 0; oth_raw_r <= 0; oth_size_r <= 0; oth_off_r <= 0;
             step_x <= 0; step_y <= 0; rem_x <= 0; rem_y <= 0;
-            fit_w <= 1'b1; scale_num <= 0; scale_den <= DST_WIDTH;
+            fit_w <= 1'b1; scale_num <= 0; scale_den <= DST_WIDTH; aa_en <= 1'b0;
             img_x0 <= 0; img_x1 <= DST_WIDTH; img_y0 <= 0; img_y1 <= DST_HEIGHT;
             img_width <= 0; img_height <= 0; scale_x100 <= 0;
 
@@ -591,7 +749,9 @@ module image_bilinear_scaler #(
 
             em_state <= EM_ROW_INIT; out_y <= 0; out_x <= 0;
             fix_x <= 0; fix_y <= 0; remacc_x <= 0; remacc_y <= 0;
-            sy0 <= 0; sy1 <= 0; fy <= 0;
+            sy0 <= 0; sy1 <= 0; fy <= 0; sym <= 0; sy3 <= 0;
+            aa_cnt <= 0; aa_addr_r <= 0;
+            aa_cx0 <= 0; aa_cx1 <= 0; aa_cx2 <= 0; aa_cx3 <= 0;
             p00 <= 0; p01 <= 0; p10 <= 0; p11 <= 0; h0 <= 0; h1 <= 0;
             hm0r <= 0; hm0g <= 0; hm0b <= 0; hm1r <= 0; hm1g <= 0; hm1b <= 0;
             hge0 <= 0; hge1 <= 0; ha0 <= 0; ha1 <= 0;
@@ -646,6 +806,7 @@ module image_bilinear_scaler #(
                 cfg_latched <= 1'b0;
                 cfg_started <= 1'b0;
                 step_x <= 0; step_y <= 0; rem_x <= 0; rem_y <= 0;
+                aa_en <= 1'b0;
                 wr_row <= 0; wr_row_done <= 0; wr_col <= 0; y0_cur <= 0;
                 fifo_wp <= 0; fifo_rp <= 0; fifo_cnt <= 0;
                 src_overflow_count <= 8'd0;
@@ -702,6 +863,9 @@ module image_bilinear_scaler #(
                             step_y <= div_quot[FIXW-1:0];
                             rem_x  <= div_rem[15:0];
                             rem_y  <= div_rem[15:0];
+                            // 缩小比 N/D >= 1.5  <=>  2N >= 3D
+                            aa_en  <= AA_ENABLE &&
+                                      ({1'b0, scale_num, 1'b0} >= ({2'd0, scale_den} + {1'b0, scale_den, 1'b0}));
                             // 接着算另一条边的输出尺寸
                             div_phase    <= DIV_OTHER;
                             div_dividend <= other_dividend[DIVW-1:0];
@@ -763,6 +927,8 @@ module image_bilinear_scaler #(
                     EM_ROW_INIT: begin
                         sy0 <= sy0_c;
                         sy1 <= sy1_c;
+                        sym <= (sy0_c == 16'd0) ? 16'd0 : (sy0_c - 16'd1);
+                        sy3 <= (sy0p2 >= cfg_h) ? (cfg_h - 16'd1) : sy0p2;
                         fy  <= fy_c;
                         em_state <= EM_ROW_WAIT;
                     end
@@ -775,7 +941,7 @@ module image_bilinear_scaler #(
                         if (row_pair_ready) begin
                             out_x    <= 16'd0;
                             // 左黑边从第 0 列开始；宽贴边时 img_x0 = 0 直接进图像
-                            em_state <= (img_x0 == 16'd0) ? EM_P0 : EM_BLACK;
+                            em_state <= (img_x0 == 16'd0) ? em_img_px : EM_BLACK;
                         end
                     end
 
@@ -798,6 +964,31 @@ module image_bilinear_scaler #(
                         p11      <= rd_data;                       // = lbuf[sy1][sx1]
                         // 四个抽头地址都已发出，水平累加器可提前推进到下一像素
                         // （行尾在 EM_P6 被清零覆盖）；本像素的小数先锁存。
+                        fx_r     <= fx_c;
+                        fix_x    <= fix_x_new;
+                        remacc_x <= remacc_x_new;
+                        em_state <= EM_P5;
+                    end
+                    // ---- 抗锯齿路径：EM_AS -> EM_AR(19 拍) -> EM_AQ -> EM_P5 ----
+                    EM_AS: begin
+                        aa_cx0    <= aa_cx0_c[10:0];
+                        aa_cx1    <= sx0_c[10:0];
+                        aa_cx2    <= sx1_c[10:0];
+                        aa_cx3    <= aa_cx3_c[10:0];
+                        aa_addr_r <= {3'd0, sym[1:0], aa_cx0_c[10:0]};
+                        aa_cnt    <= 5'd0;
+                        em_state  <= EM_AR;
+                    end
+                    EM_AR: begin
+                        aa_addr_r <= {3'd0, aa_row_slot, aa_col};
+                        aa_cnt    <= aa_kn;
+                        if (aa_cnt == 5'd18) em_state <= EM_AQ;
+                    end
+                    EM_AQ: begin
+                        p00      <= aa_q(aa_a0a);
+                        p01      <= aa_q(aa_a0b);
+                        p10      <= aa_q(aa_a1a);
+                        p11      <= aa_q(aa_a1b);
                         fx_r     <= fx_c;
                         fix_x    <= fix_x_new;
                         remacc_x <= remacc_x_new;

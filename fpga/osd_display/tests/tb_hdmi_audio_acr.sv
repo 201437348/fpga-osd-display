@@ -24,12 +24,23 @@ hdmi_audio_acr #(
     .acr_n(acr_n)
 );
 
-always @(posedge acr_valid) begin
-    if (acr_n !== 20'd6144)
-        $fatal(1, "FAIL ACR N value: got %0d", acr_n);
-    if (acr_cts == 20'd0)
-        $fatal(1, "FAIL ACR CTS must be nonzero");
-    acr_count = acr_count + 1;
+// CTS 必须等于相邻两个 ACR 包之间的实际 clk 周期数（第一个包从复位算起，不核对）
+integer clk_since_acr = 0;
+always @(posedge clk) begin
+    if (rst) begin
+        clk_since_acr = 0;
+    end else if (acr_valid) begin
+        if (acr_n !== 20'd6144)
+            $fatal(1, "FAIL ACR N value: got %0d", acr_n);
+        if (acr_cts == 20'd0)
+            $fatal(1, "FAIL ACR CTS must be nonzero");
+        if (acr_count > 0 && acr_cts != clk_since_acr)
+            $fatal(1, "FAIL ACR CTS %0d != measured %0d clocks", acr_cts, clk_since_acr);
+        acr_count = acr_count + 1;
+        clk_since_acr = 1;
+    end else begin
+        clk_since_acr = clk_since_acr + 1;
+    end
 end
 
 integer index;

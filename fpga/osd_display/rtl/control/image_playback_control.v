@@ -29,7 +29,8 @@ module image_playback_control #(
     output reg        prev_request,
     output reg        auto_request,
     output reg        auto_play_enabled,
-    output reg [2:0]  auto_period_sec
+    output reg [2:0]  auto_period_sec,
+    output wire       key_down          // KEY1/KEY2 任一已消抖按下（给按键提示音）
 );
 
 localparam integer MS_CYCLES        = CLK_FREQ_HZ / 1000;
@@ -40,6 +41,8 @@ localparam integer SEC_W            = $clog2(SEC_CYCLES + 1);
 
 wire next_down, next_press, next_release;
 wire auto_down, auto_press, auto_release;
+
+assign key_down = next_down || auto_down;
 
 key_debounce_level #(.DEBOUNCE_CYCLES(MS_CYCLES * DEBOUNCE_MS)) u_key_next (
     .clk(clk), .rst(rst), .key_n(key_next),

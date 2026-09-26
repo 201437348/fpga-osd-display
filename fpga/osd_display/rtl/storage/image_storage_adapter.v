@@ -4,11 +4,8 @@ module image_storage_adapter #(
     parameter [3:0]  SCAN_TARGET_COUNT = 4'd8,
     parameter integer SD_CLK_FREQ_HZ = 100_000_000,
     parameter integer SD_RESPONSE_TIMEOUT_MS = 250,
-    // 最小源像素数，透传给 fat32_bmp_loader。见该模块的注释：源码流速率受
-    // SPI 限制（每像素约 96 拍），写侧缩放器每输出像素要 7 拍，所以
-    // 源图必须有 W*H*96 >= 640*480*7，即 W*H >= 22400。这里默认 32000
-    // （约 1.4 倍余量）。做成参数是为了让集成测试能用小图。
-    parameter [31:0] MIN_SRC_PIXELS = 32'd32000
+    // 最小源像素数，透传给 fat32_bmp_loader。默认 1 = 不限制（原因见该模块注释）。
+    parameter [31:0] MIN_SRC_PIXELS = 32'd1
 )(
     input  wire        clk,
     input  wire        rst,

@@ -98,13 +98,41 @@ reg        header_limit_hit;
 reg [1:0]  chunk_size_mod3;
 
 wire        reader_busy;
-wire        reader_done;
-wire        reader_error;
 wire        reader_file_sec_read_ack;
-wire [7:0]  reader_file_sec_data;
-wire        reader_file_sec_data_valid;
-wire        reader_file_sec_read_end;
-wire        reader_file_complete;
+// 时序（100 MHz）：reader 输出字节直接进 WAV 头解析（6 级 LUT + 长走线）是
+// sd_card_clk 的最差路径。reader 送来的单拍脉冲（字节 / 扇区结束 / done /
+// error / file_complete）整组打一拍再给解析器，相互先后关系不变；
+// busy、read_ack 是握手电平，不延迟。
+wire        reader_done_raw;
+wire        reader_error_raw;
+wire [7:0]  reader_file_sec_data_raw;
+wire        reader_file_sec_data_valid_raw;
+wire        reader_file_sec_read_end_raw;
+wire        reader_file_complete_raw;
+reg         reader_done;
+reg         reader_error;
+reg  [7:0]  reader_file_sec_data;
+reg         reader_file_sec_data_valid;
+reg         reader_file_sec_read_end;
+reg         reader_file_complete;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        reader_done                <= 1'b0;
+        reader_error               <= 1'b0;
+        reader_file_sec_data       <= 8'd0;
+        reader_file_sec_data_valid <= 1'b0;
+        reader_file_sec_read_end   <= 1'b0;
+        reader_file_complete       <= 1'b0;
+    end else begin
+        reader_done                <= reader_done_raw;
+        reader_error               <= reader_error_raw;
+        reader_file_sec_data       <= reader_file_sec_data_raw;
+        reader_file_sec_data_valid <= reader_file_sec_data_valid_raw;
+        reader_file_sec_read_end   <= reader_file_sec_read_end_raw;
+        reader_file_complete       <= reader_file_complete_raw;
+    end
+end
 wire        reader_sd_sec_read;
 wire [31:0] reader_sd_sec_read_addr;
 
@@ -156,15 +184,15 @@ fat32_file_sector_reader #(
     .first_data_lba         (first_data_lba),
     .sectors_per_cluster    (sectors_per_cluster),
     .busy                   (reader_busy),
-    .done                   (reader_done),
-    .error                  (reader_error),
+    .done                   (reader_done_raw),
+    .error                  (reader_error_raw),
     .file_sec_read          (reader_file_sec_read),
     .file_sec_index         (file_sec_index),
     .file_sec_read_ack      (reader_file_sec_read_ack),
-    .file_sec_data          (reader_file_sec_data),
-    .file_sec_data_valid    (reader_file_sec_data_valid),
-    .file_sec_read_end      (reader_file_sec_read_end),
-    .file_complete          (reader_file_complete),
+    .file_sec_data          (reader_file_sec_data_raw),
+    .file_sec_data_valid    (reader_file_sec_data_valid_raw),
+    .file_sec_read_end      (reader_file_sec_read_end_raw),
+    .file_complete          (reader_file_complete_raw),
     .sd_sec_read            (reader_sd_sec_read),
     .sd_sec_read_addr       (reader_sd_sec_read_addr),
     .sd_sec_read_data       (sd_sec_read_data),

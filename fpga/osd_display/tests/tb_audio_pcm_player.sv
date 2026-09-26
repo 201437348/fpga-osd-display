@@ -30,6 +30,9 @@ audio_pcm_player #(
 ) dut (
     .clk(clk),
     .volume(4'd8),
+    .tone_volume(4'd8),
+    .key_down(1'b0),
+    .no_card(1'b0),
     .rst(rst),
     .enable(enable),
     .fifo_empty(fifo_empty),

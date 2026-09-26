@@ -7,6 +7,8 @@ reg rst = 1'b1;
 reg vs = 1'b0;
 reg de = 1'b0;
 reg [23:0] rgb_in = 24'h123456;
+integer i;
+wire [63:0] clock_str = "12:34:56";
 reg display_valid = 1'b0;
 reg display_test_pattern = 1'b0;
 reg storage_ready = 1'b0;
@@ -20,10 +22,14 @@ reg  [7:0] brightness_value = 8'd255;
 reg  [7:0] contrast_value = 8'd128;
 reg  [1:0] menu_channel = 2'b00;
 wire [23:0] rgb_out;
+reg        time_set = 1'b0;
+reg  [4:0] time_h = 5'd0;
+reg  [5:0] time_m = 6'd0;
+reg  [5:0] time_s = 6'd0;
 
 always #5 video_clk = ~video_clk;
 
-video_osd_overlay dut (
+video_osd_overlay #(.CLK_HZ(10)) dut (
     .video_clk           (video_clk),
     .rst                 (rst),
     .vs                  (vs),
@@ -42,6 +48,10 @@ video_osd_overlay dut (
     .contrast_value      (contrast_value),
     .menu_channel        (menu_channel),
     .info_text           (320'h202033332e3020454c414353202030383031583032393120474d492020303834583034362054554f),
+    .time_set            (time_set),
+    .time_h              (time_h),
+    .time_m              (time_m),
+    .time_s              (time_s),
     .rgb_out             (rgb_out)
 );
 
@@ -88,7 +98,7 @@ initial begin
     force dut.x = 10'd10;
     force dut.y = 10'd10;
     #1;
-    expect_rgb(rgb_out, 24'h10213A, "top bar background");
+    expect_rgb(rgb_out, 24'h102540, "top bar background");
     force dut.x = 10'd18;
     force dut.y = 10'd4;
     #1;
@@ -98,7 +108,7 @@ initial begin
     force dut.x = 10'd0;
     force dut.y = 10'd432;
     #1;
-    expect_rgb(rgb_out, 24'h10213A, "ticker band background");
+    expect_rgb(rgb_out, 24'h102540, "ticker band background");
     force dut.x = 10'd9;
     force dut.y = 10'd436;
     #1;
@@ -106,7 +116,7 @@ initial begin
     force dut.x = 10'd8;
     force dut.y = 10'd436;
     #1;
-    expect_rgb(rgb_out, 24'h10213A, "ticker glyph transparent pixel");
+    expect_rgb(rgb_out, 24'h102540, "ticker glyph transparent pixel");
     force dut.x = 10'd100;
     force dut.y = 10'd431;
     #1;
@@ -114,7 +124,7 @@ initial begin
     force dut.x = 10'd100;
     force dut.y = 10'd456;
     #1;
-    expect_rgb(rgb_out, 24'h10213A, "bottom bar remains above ticker priority");
+    expect_rgb(rgb_out, 24'h102540, "bottom bar remains above ticker priority");
 
     // Fallback has highest priority, then absent storage.
     display_valid = 1'b0;
@@ -221,7 +231,7 @@ initial begin
     force dut.x = 10'd100;
     force dut.y = 10'd436;
     #1;
-    expect_rgb(rgb_out, 24'h10213A, "ticker remains stable after image change");
+    expect_rgb(rgb_out, 24'h102540, "ticker remains stable after image change");
     force dut.x = 10'd8;
     force dut.y = 10'd464;
     #1;
@@ -401,6 +411,48 @@ initial begin
     brightness_value = 8'd255;
     contrast_value = 8'd128;
 
+
+    // ---- 时钟 HH:MM:SS（CLK_HZ=10：每 10 拍走 1 秒）----
+    release dut.x;
+    release dut.y;
+    @(negedge video_clk);
+    time_h = 5'd23; time_m = 6'd59; time_s = 6'd58; time_set = 1'b1;
+    @(negedge video_clk);
+    time_set = 1'b0;
+    if (dut.clk_h !== 5'd23 || dut.clk_m !== 6'd59 || dut.clk_s !== 6'd58)
+        $fatal(1, "FAIL time_set load");
+    repeat (10) @(negedge video_clk);
+    if (dut.clk_s !== 6'd59) $fatal(1, "FAIL second tick: %0d", dut.clk_s);
+    repeat (10) @(negedge video_clk);
+    if (dut.clk_h !== 5'd0 || dut.clk_m !== 6'd0 || dut.clk_s !== 6'd0)
+        $fatal(1, "FAIL midnight wrap %0d:%0d:%0d", dut.clk_h, dut.clk_m, dut.clk_s);
+    // 超范围校时忽略
+    time_h = 5'd24; time_m = 6'd0; time_s = 6'd0; time_set = 1'b1;
+    @(negedge video_clk);
+    time_set = 1'b0;
+    if (dut.clk_h === 5'd24) $fatal(1, "FAIL out-of-range time accepted");
+    // 12:34:56 的字符与像素
+    time_h = 5'd12; time_m = 6'd34; time_s = 6'd56; time_set = 1'b1;
+    @(negedge video_clk);
+    time_set = 1'b0;
+    force dut.y = 10'd462;      // status_row = 1
+    for (i = 0; i < 8; i = i + 1) begin
+        force dut.x = 10'd552 + i * 8;
+        #1;
+        if (dut.clock_char !== clock_str[(7 - i) * 8 +: 8])
+            $fatal(1, "FAIL clock char %0d = %h", i, dut.clock_char);
+    end
+    // ':' 第 1 行 = 00011000：x 偏移 3 是字形像素，偏移 0 是半透明背景
+    force dut.x = 10'd552 + 16 + 3;
+    #1;
+    expect_rgb(rgb_out, 24'hF4F7FB, "clock colon pixel");
+    force dut.x = 10'd552 + 16;
+    #1;
+    expect_rgb(rgb_out, 24'h102540, "clock colon background");
+    force dut.x = 10'd551;
+    force dut.y = 10'd466;
+    #1;
+    expect_rgb(rgb_out, 24'h102540, "left of clock is bar");
     release dut.x;
     release dut.y;
     $display("PASS tb_video_osd_overlay");
