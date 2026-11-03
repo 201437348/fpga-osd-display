@@ -33,3 +33,6 @@ tmp_pinout/
 演示素材/
 __pycache__/
 *.pyc
+
+# Playwright MCP artifacts
+.playwright-mcp/
