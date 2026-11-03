@@ -12,10 +12,14 @@
 //      旧版因为 640*3=1920 恰好 4 字节对齐，完全没有这段逻辑。
 //   3) 结束条件由「字节数是 3 的倍数」改为「已输出恰好 W*H 个像素」。
 module fat32_bmp_loader #(
-    // 允许的源分辨率范围。必须与 image_bilinear_scaler 的 MAX_SRC_* 一致。
-    parameter [15:0] MAX_SRC_WIDTH  = 16'd1920,
-    parameter [15:0] MAX_SRC_HEIGHT = 16'd1080,
-    // 最小源像素数。默认 1 = 不限制（任意 1x1 .. 1920x1080 都接受）。
+    // 允许的源分辨率范围：32x32 .. 1280x960。上限必须与 image_bilinear_scaler 的
+    // MAX_SRC_* 一致。下限：小于 32 的图放大到 640x480 只剩色块，没有展示意义；
+    // 上限：1080p 文件 6.2 MB，SPI 读一张要十几秒，演示时切图太慢。
+    parameter [15:0] MIN_SRC_WIDTH  = 16'd32,
+    parameter [15:0] MIN_SRC_HEIGHT = 16'd32,
+    parameter [15:0] MAX_SRC_WIDTH  = 16'd1280,
+    parameter [15:0] MAX_SRC_HEIGHT = 16'd960,
+    // 最小源像素数（宽高下限之外的额外约束）。默认 1 = 不额外限制。
     // 小图（放大）时缩放器输出比源慢，write_fifo_afull 反压本模块：只在扇区之间
     // 的 ST_STREAM_PAUSE 等待，此时没有挂起的扇区读，adapter 的 SD 响应看门狗
     // 不计时；一帧输出固定约 28 ms，远小于 image_load_manager 的加载超时。
@@ -143,10 +147,10 @@ assign sd_sec_read_addr = reader_sd_sec_read_addr;
 // 尺寸校验：拒绝 0、超上限，以及高 16 位非零
 // （负高度 = top-down BMP 会让 header_height[31] 为 1，在这里被一并拒绝）
 wire src_w_ok = (header_width[31:16]  == 16'd0) &&
-                (header_width[15:0]   >= 16'd1) &&
+                (header_width[15:0]   >= MIN_SRC_WIDTH) &&
                 (header_width[15:0]   <= MAX_SRC_WIDTH);
 wire src_h_ok = (header_height[31:16] == 16'd0) &&
-                (header_height[15:0]  >= 16'd1) &&
+                (header_height[15:0]  >= MIN_SRC_HEIGHT) &&
                 (header_height[15:0]  <= MAX_SRC_HEIGHT);
 // 像素总数下限：保证写侧缩放器有足够时钟消费源码流（见文件头注释）
 // 注意显式补零到 32 位再做乘法 —— 16bit*16bit 在 Verilog 里会按 16 位截断，

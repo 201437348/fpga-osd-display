@@ -32,6 +32,11 @@ module image_storage_adapter #(
     output reg [15:0]  shown_img_height,
     output reg [15:0]  shown_scale_x100,
     output reg         shown_info_pulse,
+    // 扫描登记第 n 张图时给出它的 8.3 短文件名（单拍，槽号 = 图片序号），
+    // 给串口屏显示当前文件名用；纯观察信号，不参与本模块控制流。
+    output wire        name_wr,
+    output wire [2:0]  name_slot,
+    output wire [87:0] name_data,
 
     // ---- 上板诊断（全部只读，不参与任何控制流）----
     // load_diag_state  : fat32_bmp_loader 状态码
@@ -59,6 +64,12 @@ module image_storage_adapter #(
     input  wire [9:0]  audio_fifo_wrusedw,
     input  wire        audio_fifo_full,
     output wire        audio_fifo_rst,
+    // 背景音乐双曲目：bgm_track_sel 电平选曲（0 = BGM.WAV/BGM1.WAV，1 = BGM2.WAV），
+    // 变化后中止当前曲目、清 FIFO，约 10 ms 后从头播放新曲目；所选曲目不存在时不动。
+    // bgm_track_now = 实际在播的曲目，bgm_track_count = 卡上找到的曲目数 0..2。
+    input  wire        bgm_track_sel,
+    output reg         bgm_track_now,
+    output wire [1:0]  bgm_track_count,
 
     output wire        SD_nCS,
     output wire        SD_DCLK,
@@ -102,6 +113,13 @@ reg [31:0] volume_first_data_lba;
 reg [7:0]  volume_sectors_per_cluster;
 reg [31:0] bgm_first_cluster;
 reg [31:0] bgm_file_size;
+reg        bgm1_valid, bgm2_valid;
+reg [31:0] bgm1_cluster, bgm1_size;
+reg [31:0] bgm2_cluster, bgm2_size;
+// 切歌：abort 后 wav_loader 立刻回 IDLE，但底层扇区读取器可能还在收尾，
+// 等 2^20 拍（100 MHz 下约 10 ms）再 start，避免新 start 撞上旧读请求。
+reg        bgm_switch_wait;
+reg [19:0] bgm_switch_cnt;
 
 wire        directory_busy;
 wire        directory_done;
@@ -119,6 +137,9 @@ wire [7:0]  directory_volume_sectors_per_cluster;
 wire        directory_bgm_found;
 wire [31:0] directory_bgm_first_cluster;
 wire [31:0] directory_bgm_size;
+wire        directory_bgm2_found;
+wire [31:0] directory_bgm2_first_cluster;
+wire [31:0] directory_bgm2_size;
 
 wire        loader_busy;
 wire        loader_done;
@@ -149,7 +170,7 @@ wire        scan_grant;
 wire        audio_grant;
 wire        image_grant;
 
-// ---- 写侧双线性缩放器接口（1920x1080 以内的任意 24bit BI_RGB BMP -> 640x480）----
+// ---- 写侧双线性缩放器接口（32x32 .. 1280x960 的任意 24bit BI_RGB BMP -> 640x480）----
 // 数据通路变成： fat32_bmp_loader -> image_bilinear_scaler -> write_buf -> SDRAM
 // loader 的 write_fifo_afull 改接缩放器的输入缓冲，缩放器的输出反压来自
 // write_buf 的 afull。write_en/write_data 的下游语义完全不变。
@@ -218,6 +239,11 @@ assign write_data    = {scaler_dst_data, 8'b0};
 assign audio_fifo_wr_en = audio_frame_wr_en;
 assign audio_fifo_wr_data = audio_frame_wr_data;
 assign audio_fifo_rst = core_rst | audio_fifo_clear;
+assign bgm_track_count = {1'b0, bgm1_valid} + {1'b0, bgm2_valid};
+// 所选曲目存在且不是正在播的那首，才需要切换
+wire bgm_switch_req = scan_done && !bgm_switch_wait &&
+                      (bgm_track_sel != bgm_track_now) &&
+                      (bgm_track_sel ? bgm2_valid : bgm1_valid);
 
 assign scan_owner_active = (state == ST_SCAN_START) ||
                            (state == ST_SCAN_ACTIVE) ||
@@ -284,6 +310,15 @@ always @(posedge clk or posedge core_rst) begin
         volume_sectors_per_cluster <= 8'd0;
         bgm_first_cluster          <= 32'd0;
         bgm_file_size              <= 32'd0;
+        bgm1_valid                 <= 1'b0;
+        bgm2_valid                 <= 1'b0;
+        bgm1_cluster               <= 32'd0;
+        bgm1_size                  <= 32'd0;
+        bgm2_cluster               <= 32'd0;
+        bgm2_size                  <= 32'd0;
+        bgm_track_now              <= 1'b0;
+        bgm_switch_wait            <= 1'b0;
+        bgm_switch_cnt             <= 20'd0;
     end else begin
         directory_start    <= 1'b0;
         loader_start       <= 1'b0;
@@ -329,11 +364,31 @@ always @(posedge clk or posedge core_rst) begin
             volume_sectors_per_cluster <= 8'd0;
             bgm_first_cluster          <= 32'd0;
             bgm_file_size              <= 32'd0;
+            bgm1_valid                 <= 1'b0;
+            bgm2_valid                 <= 1'b0;
+            bgm_switch_wait            <= 1'b0;
             storage_fault_latched      <= 1'b0;
             sd_response_watchdog       <= 25'd0;
         end else begin
             if (audio_loader_error)
                 audio_fifo_clear <= 1'b1;
+
+            // 切歌：先 abort + 清 FIFO，等读取器收尾后换簇号重新 start
+            if (bgm_switch_req) begin
+                audio_abort      <= 1'b1;
+                audio_fifo_clear <= 1'b1;
+                bgm_switch_wait  <= 1'b1;
+                bgm_switch_cnt   <= 20'd0;
+            end else if (bgm_switch_wait) begin
+                bgm_switch_cnt <= bgm_switch_cnt + 20'd1;
+                if (&bgm_switch_cnt) begin
+                    bgm_switch_wait   <= 1'b0;
+                    bgm_track_now     <= bgm_track_sel;
+                    bgm_first_cluster <= bgm_track_sel ? bgm2_cluster : bgm1_cluster;
+                    bgm_file_size     <= bgm_track_sel ? bgm2_size    : bgm1_size;
+                    audio_start       <= 1'b1;
+                end
+            end
 
             if (scan_owner_active && directory_file_found &&
                 (scan_found_count < SCAN_TARGET_COUNT)) begin
@@ -358,6 +413,9 @@ always @(posedge clk or posedge core_rst) begin
                         volume_sectors_per_cluster <= 8'd0;
                         bgm_first_cluster          <= 32'd0;
                         bgm_file_size              <= 32'd0;
+                        bgm1_valid                 <= 1'b0;
+                        bgm2_valid                 <= 1'b0;
+                        bgm_switch_wait            <= 1'b0;
                         audio_abort                <= 1'b1;
                         audio_fifo_clear           <= 1'b1;
                         directory_start            <= 1'b1;
@@ -399,7 +457,21 @@ always @(posedge clk or posedge core_rst) begin
                         volume_first_fat_lba       <= directory_volume_first_fat_lba;
                         volume_first_data_lba      <= directory_volume_first_data_lba;
                         volume_sectors_per_cluster <= directory_volume_sectors_per_cluster;
-                        if (directory_bgm_found) begin
+                        bgm1_valid   <= directory_bgm_found;
+                        bgm1_cluster <= directory_bgm_first_cluster;
+                        bgm1_size    <= directory_bgm_size;
+                        bgm2_valid   <= directory_bgm2_found;
+                        bgm2_cluster <= directory_bgm2_first_cluster;
+                        bgm2_size    <= directory_bgm2_size;
+                        // 优先按 bgm_track_sel 选；所选不存在时退回另一首
+                        if (directory_bgm2_found &&
+                            (bgm_track_sel || !directory_bgm_found)) begin
+                            bgm_track_now     <= 1'b1;
+                            bgm_first_cluster <= directory_bgm2_first_cluster;
+                            bgm_file_size     <= directory_bgm2_size;
+                            audio_start       <= 1'b1;
+                        end else if (directory_bgm_found) begin
+                            bgm_track_now     <= 1'b0;
                             bgm_first_cluster <= directory_bgm_first_cluster;
                             bgm_file_size     <= directory_bgm_size;
                             audio_start       <= 1'b1;
@@ -480,7 +552,10 @@ fat32_directory_scan #(
     .volume_sectors_per_cluster(directory_volume_sectors_per_cluster),
     .bgm_found                 (directory_bgm_found),
     .bgm_first_cluster         (directory_bgm_first_cluster),
-    .bgm_size                  (directory_bgm_size)
+    .bgm_size                  (directory_bgm_size),
+    .bgm2_found                (directory_bgm2_found),
+    .bgm2_first_cluster        (directory_bgm2_first_cluster),
+    .bgm2_size                 (directory_bgm2_size)
 );
 
 wire [3:0] loader_dbg_state;
@@ -539,7 +614,7 @@ assign load_progress_pulse = image_grant && sd_sec_read_end;
 
 // ---------------------------------------------------------------------------
 // 写侧双线性缩放器
-//   把任意 (<=1920x1080) 24bit BI_RGB BMP 的源像素流实时缩成 640x480。
+//   把 32x32 .. 1280x960 的 24bit BI_RGB BMP 的源像素流实时缩成 640x480。
 //   放在 loader 与 write_buf 之间，于是 SDRAM 里永远只存 640x480
 //   （307200 字 = 14.7%，双缓冲后 29.4%），读回路 / 滑动动效 / OSD / HDMI
 //   以及 frame_fifo_write 的 256 字突发、frame_slide_fifo_read 的
@@ -553,8 +628,8 @@ assign load_progress_pulse = image_grant && sd_sec_read_end;
 image_bilinear_scaler #(
     .DST_WIDTH      (16'd640),
     .DST_HEIGHT     (16'd480),
-    .MAX_SRC_WIDTH  (16'd1920),
-    .MAX_SRC_HEIGHT (16'd1080),
+    .MAX_SRC_WIDTH  (16'd1280),
+    .MAX_SRC_HEIGHT (16'd960),
     .FRAC_BITS      (4'd10),
     .IN_FIFO_DEPTH  (16'd256)
 ) u_image_bilinear_scaler (
@@ -657,5 +732,11 @@ sd_card_top u_sd_card_top (
     .sd_sec_write_data_req  (),
     .sd_sec_write_end       ()
 );
+
+// 与上面 image_cluster 登记用同一个条件，槽号一一对应
+assign name_wr   = scan_owner_active && directory_file_found &&
+                   (scan_found_count < SCAN_TARGET_COUNT);
+assign name_slot = scan_found_count[2:0];
+assign name_data = directory_file_name;
 
 endmodule

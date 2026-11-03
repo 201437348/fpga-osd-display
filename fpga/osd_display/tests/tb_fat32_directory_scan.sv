@@ -24,6 +24,9 @@ wire [7:0] volume_sectors_per_cluster;
 wire bgm_found;
 wire [31:0] bgm_first_cluster;
 wire [31:0] bgm_size;
+wire bgm2_found;
+wire [31:0] bgm2_first_cluster;
+wire [31:0] bgm2_size;
 
 reg [7:0] disk [0:32767];
 reg serving = 1'b0;
@@ -68,7 +71,10 @@ fat32_directory_scan #(
     .volume_sectors_per_cluster(volume_sectors_per_cluster),
     .bgm_found(bgm_found),
     .bgm_first_cluster(bgm_first_cluster),
-    .bgm_size(bgm_size)
+    .bgm_size(bgm_size),
+    .bgm2_found(bgm2_found),
+    .bgm2_first_cluster(bgm2_first_cluster),
+    .bgm2_size(bgm2_size)
 );
 
 // Model the established SD-layer contract: 512 valid bytes, then one end pulse.
@@ -329,7 +335,8 @@ initial begin
     make_bmp_entry(4, 2, "IMAGE003BMP", 32'd12, 32'd3000);
     make_bmp_entry(4, 3, "IMAGE004BMP", 32'd13, 32'd4000);
     make_bmp_entry(4, 4, "BGM     WAV", 32'd30, 32'd606);
-    put_byte(4, 160, 8'h00);
+    make_bmp_entry(4, 5, "BGM2    WAV", 32'd31, 32'd707);
+    put_byte(4, 192, 8'h00);
 
     start_scan();
     wait_for_done();
@@ -344,6 +351,9 @@ initial begin
     expect_bit(bgm_found, 1'b1, "BGM after four BMP entries is discovered");
     expect_value(bgm_first_cluster, 32'd30, "BGM first cluster");
     expect_value(bgm_size, 32'd606, "BGM size");
+    expect_bit(bgm2_found, 1'b1, "BGM2 is discovered");
+    expect_value(bgm2_first_cluster, 32'd31, "BGM2 first cluster");
+    expect_value(bgm2_size, 32'd707, "BGM2 size");
     expect_value(volume_first_fat_lba, 32'd2, "MBR volume FAT LBA");
     expect_value(volume_first_data_lba, 32'd3, "MBR volume data LBA");
     expect_value({24'd0, volume_sectors_per_cluster}, 32'd1,

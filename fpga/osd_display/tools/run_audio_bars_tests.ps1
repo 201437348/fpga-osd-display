@@ -3,6 +3,8 @@ $ErrorActionPreference='Stop'
 $projectRoot=Split-Path $PSScriptRoot -Parent
 if(!$OutputDirectory){$OutputDirectory=Join-Path $projectRoot 'audio_bars_Runs/tests'}
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
+# osd_font_rom 的仿真模型按相对工程目录的路径读字库
+Set-Location $projectRoot
 $tests=@{
  'tb_audio_spectrum_fft'=@('rtl/audio/audio_spectrum_fft.v');
  'tb_audio_spectrum_bands'=@('rtl/audio/audio_spectrum_bands.v');
@@ -14,7 +16,9 @@ $tests=@{
  'tb_audio_pcm_player'=@('rtl/audio/audio_pcm_player.v');
  'tb_hdmi_audio_acr'=@('rtl/audio/hdmi_audio_acr.v');
  'tb_brightness_contrast_adjust'=@('rtl/video/brightness_contrast_adjust.v');
- 'tb_param_menu_controller'=@('rtl/control/param_menu_controller.v')
+ 'tb_param_menu_controller'=@('rtl/control/param_menu_controller.v');
+ 'tb_screen_uart_link'=@('rtl/control/param_menu_controller.v');
+ 'tb_osd_settings_panel'=@('rtl/video/osd_settings_panel.v','rtl/video/osd_font_rom.v')
 }
 $results=@()
 foreach($name in ($tests.Keys | Sort-Object)){

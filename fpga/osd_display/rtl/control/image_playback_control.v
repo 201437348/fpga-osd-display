@@ -9,6 +9,10 @@
 //   短按 -> 开/关自动播放
 //   长按 -> 自动播放间隔在 1/2/3/5 秒之间循环（auto_period_sec），不改开关状态
 //
+// 串口屏命令（同域单拍）：cmd_next / cmd_prev / cmd_auto_toggle 与按键动作等效；
+// cmd_period_valid 把间隔直接设为 cmd_period（只接受 1/2/3/5）；
+// hold = 1（定时息屏）时暂停自动播放计时，开关状态保留，hold 撤销后继续。
+//
 // 自动播放计时：1 秒节拍计数 + 秒计数，不用 32 位大比较器（时序）。
 // 任何按键动作都让计时从头开始，且同一拍不会再发自动请求。
 // ===========================================================================
@@ -25,6 +29,12 @@ module image_playback_control #(
     input  wire       display_valid,
     input  wire [3:0] image_count,
     input  wire       manager_idle,
+    input  wire       cmd_next,
+    input  wire       cmd_prev,
+    input  wire       cmd_auto_toggle,
+    input  wire       cmd_period_valid,
+    input  wire [2:0] cmd_period,
+    input  wire       hold,
     output reg        next_request,
     output reg        prev_request,
     output reg        auto_request,
@@ -91,8 +101,14 @@ end
 
 wire next_short = next_release && !next_long_fired;
 wire auto_short = auto_release && !auto_long_fired;
+wire go_next    = next_short || cmd_next;
+wire go_prev    = next_long_hit || cmd_prev;
+wire go_toggle  = auto_short || cmd_auto_toggle;
+wire period_ok  = (cmd_period == 3'd1) || (cmd_period == 3'd2) ||
+                  (cmd_period == 3'd3) || (cmd_period == 3'd5);
 wire key_action = next_press || next_release || auto_press || auto_release ||
-                  next_long_hit || auto_long_hit;
+                  next_long_hit || auto_long_hit ||
+                  cmd_next || cmd_prev || cmd_auto_toggle || cmd_period_valid;
 
 function [2:0] next_period;
     input [2:0] p;
@@ -110,7 +126,8 @@ endfunction
 reg [SEC_W-1:0] sec_counter;
 reg [2:0]       sec_elapsed;
 wire sec_tick = (sec_counter == SEC_CYCLES - 1);
-wire auto_run = auto_play_enabled && display_valid && manager_idle && (image_count > 4'd1);
+wire auto_run = auto_play_enabled && display_valid && manager_idle && !hold &&
+                (image_count > 4'd1);
 
 always @(posedge clk or posedge rst) begin
     if (rst) begin
@@ -126,14 +143,16 @@ always @(posedge clk or posedge rst) begin
         prev_request <= 1'b0;
         auto_request <= 1'b0;
 
-        if (next_short && manager_idle && (image_count != 4'd0))
+        if (go_next && manager_idle && (image_count != 4'd0))
             next_request <= 1'b1;
-        if (next_long_hit && manager_idle && (image_count > 4'd1))
+        else if (go_prev && manager_idle && (image_count > 4'd1))
             prev_request <= 1'b1;
 
-        if (auto_short && (image_count > 4'd1))
+        if (go_toggle && (image_count > 4'd1))
             auto_play_enabled <= ~auto_play_enabled;
-        if (auto_long_hit)
+        if (cmd_period_valid && period_ok)
+            auto_period_sec <= cmd_period;
+        else if (auto_long_hit)
             auto_period_sec <= next_period(auto_period_sec);
 
         if (key_action || !auto_run) begin

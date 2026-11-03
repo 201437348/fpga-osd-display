@@ -2,7 +2,9 @@
 // osd_info_text
 // 生成 OSD 顶栏信息行，例如：
 //     "OUT 640X480  IMG 1920X1080  SCALE 0.33"
-// 固定 CHARS 个字符（ASCII），不足补空格，打平成 text_flat 给 OSD 逐字取模。
+// 固定 CHARS 个字符（ASCII，CHARS <= 64），不足补空格。
+// 文本放在 2 x 64 字节的分布式 RAM 里做双缓冲：OSD 用 rd_addr 组合读当前显示页，
+// 组装写另一页，vs 上升沿翻页（不撕裂）。比打平成寄存器省掉约 640 个触发器。
 //
 // 数据来源：image_storage_adapter 在 source_done_pulse（新图开始显示）时
 // 锁存的源宽/源高/缩放比 x100，位于 sd_card_clk 域。
@@ -10,7 +12,7 @@
 // 数据在翻转后要等到下一张图加载完成（秒级）才会再变，采样时早已稳定。
 //
 // 流程：检出新信息 -> 逐个做 14 位 double-dabble（钳到 9999）
-//       -> 逐字符组装到 stage_buf -> vs 上升沿整行提交到 text_flat（不撕裂）
+//       -> 逐字符写入后台页 -> vs 上升沿翻页
 // ============================================================================
 module osd_info_text #(
     parameter integer OUT_WIDTH  = 640,
@@ -24,7 +26,8 @@ module osd_info_text #(
     input  wire [15:0]          info_width,      // 控制域，翻转后保持稳定
     input  wire [15:0]          info_height,
     input  wire [15:0]          info_scale_x100,
-    output reg  [CHARS*8-1:0]   text_flat        // 字符 i 在 [i*8 +: 8]
+    input  wire [5:0]           rd_addr,         // 字符序号
+    output wire [7:0]           rd_char          // 组合读出，上电首次翻页前为空格
 );
 
 // ---------------------------------------------------------------------------
@@ -88,11 +91,12 @@ reg [3:0]  sh_cnt;
 reg [15:0] img_w_bcd, img_h_bcd, scale_bcd;
 reg [5:0]  tok;                     // 组装进度（token 序号）
 reg [5:0]  wp;                      // 写指针
-reg [7:0]  stage_buf [0:CHARS-1];
+reg [7:0]  txt_ram [0:127];         // {页, 字符序号}
+reg        disp_bank;               // OSD 正在读的页
+reg        shown;                   // 已翻过至少一次页
 reg        stage_ready;
 reg        vs_d;
 reg        pending;                 // 忙时又来了新图：做完这次再重做
-integer    i;
 
 wire [15:0] cv_src   = (cv_idx == 2'd0) ? cap_w : (cv_idx == 2'd1) ? cap_h : cap_s;
 wire [13:0] cv_clamp = (cv_src > 16'd9999) ? 14'd9999 : cv_src[13:0];
@@ -205,6 +209,18 @@ always @(*) begin
     endcase
 end
 
+// 组装写口：每拍最多写一个字符到后台页
+wire       wr_tok = (tok <= TOK_END);
+wire       ram_we = (st == ST_BUILD) && (wp < CHARS) && (!wr_tok || tok_emit);
+wire [7:0] ram_wd = wr_tok ? tok_char : 8'h20;
+
+always @(posedge video_clk) begin
+    if (ram_we)
+        txt_ram[{~disp_bank, wp}] <= ram_wd;
+end
+
+assign rd_char = shown ? txt_ram[{disp_bank, rd_addr}] : 8'h20;
+
 always @(posedge video_clk or posedge rst) begin
     if (rst) begin
         st          <= ST_BUILD;   // 上电先组装一次（仅输出分辨率）
@@ -220,9 +236,8 @@ always @(posedge video_clk or posedge rst) begin
         stage_ready <= 1'b0;
         vs_d        <= 1'b0;
         pending     <= 1'b0;
-        text_flat   <= {CHARS{8'h20}};
-        for (i = 0; i < CHARS; i = i + 1)
-            stage_buf[i] <= 8'h20;
+        disp_bank   <= 1'b0;
+        shown       <= 1'b0;
     end else begin
         vs_d <= vs;
         if (new_info)
@@ -231,8 +246,8 @@ always @(posedge video_clk or posedge rst) begin
         // 帧边界整行提交
         if (vs && !vs_d && stage_ready) begin
             stage_ready <= 1'b0;
-            for (i = 0; i < CHARS; i = i + 1)
-                text_flat[i*8 +: 8] <= stage_buf[i];
+            disp_bank   <= ~disp_bank;
+            shown       <= 1'b1;
         end
 
         case (st)
@@ -272,15 +287,11 @@ always @(posedge video_clk or posedge rst) begin
             end
             ST_BUILD: begin
                 // 每拍处理一个 token；token 用完后剩余位置补空格
-                if (tok <= TOK_END) begin
-                    if (tok_emit) begin
-                        if (wp < CHARS)
-                            stage_buf[wp] <= tok_char;
+                if (wr_tok) begin
+                    if (tok_emit)
                         wp <= wp + 6'd1;
-                    end
                     tok <= tok + 6'd1;
                 end else if (wp < CHARS) begin
-                    stage_buf[wp] <= 8'h20;
                     wp <= wp + 6'd1;
                 end else begin
                     stage_ready <= 1'b1;

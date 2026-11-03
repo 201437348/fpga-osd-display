@@ -28,7 +28,11 @@ module fat32_directory_scan #(
     output reg [7:0]   volume_sectors_per_cluster,
     output reg         bgm_found,
     output reg [31:0]  bgm_first_cluster,
-    output reg [31:0]  bgm_size
+    output reg [31:0]  bgm_size,
+    // 第二首背景音乐 BGM2.WAV（串口屏切歌用；不存在时 bgm2_found=0）
+    output reg         bgm2_found,
+    output reg [31:0]  bgm2_first_cluster,
+    output reg [31:0]  bgm2_size
 );
 
 localparam [3:0] ST_IDLE         = 4'd0;
@@ -119,17 +123,21 @@ function is_regular_bmp;
     end
 endfunction
 
+// 曲目 1：BGM.WAV 或 BGM1.WAV；曲目 2：BGM2.WAV（8.3 短名，空格补齐）
 function is_bgm_wav;
     input [7:0]  first_byte;
     input [7:0]  attr;
     input [87:0] short_name;
     input [31:0] first_cluster;
     input [31:0] size;
+    input        track2;
     begin
         is_bgm_wav = (first_byte != 8'h00) &&
                      (first_byte != 8'hE5) &&
                      ((attr & 8'h18) == 8'h00) &&
-                     (short_name == 88'h42_47_4D_20_20_20_20_20_57_41_56) &&
+                     (track2 ? (short_name == 88'h42_47_4D_32_20_20_20_20_57_41_56)
+                             : ((short_name == 88'h42_47_4D_20_20_20_20_20_57_41_56) ||
+                                (short_name == 88'h42_47_4D_31_20_20_20_20_57_41_56))) &&
                      (first_cluster >= 32'd2) &&
                      (size != 32'd0);
     end
@@ -154,6 +162,9 @@ always @(posedge clk or posedge rst) begin
         bgm_found              <= 1'b0;
         bgm_first_cluster      <= 32'd0;
         bgm_size               <= 32'd0;
+        bgm2_found             <= 1'b0;
+        bgm2_first_cluster     <= 32'd0;
+        bgm2_size              <= 32'd0;
         sector_byte_index      <= 9'd0;
         mbr_signature_55       <= 1'b0;
         mbr_signature_aa       <= 1'b0;
@@ -219,6 +230,9 @@ always @(posedge clk or posedge rst) begin
                     bgm_found               <= 1'b0;
                     bgm_first_cluster       <= 32'd0;
                     bgm_size                <= 32'd0;
+                    bgm2_found              <= 1'b0;
+                    bgm2_first_cluster      <= 32'd0;
+                    bgm2_size               <= 32'd0;
                     mbr_signature_55        <= 1'b0;
                     mbr_signature_aa        <= 1'b0;
                     mbr_entry_type          <= 8'd0;
@@ -450,10 +464,18 @@ always @(posedge clk or posedge rst) begin
                             if (!bgm_found &&
                                 is_bgm_wav(dir_entry_first_byte, dir_entry_attr,
                                            dir_entry_name, dir_entry_first_cluster,
-                                           {sd_sec_read_data, dir_entry_size[23:0]})) begin
+                                           {sd_sec_read_data, dir_entry_size[23:0]}, 1'b0)) begin
                                 bgm_found         <= 1'b1;
                                 bgm_first_cluster <= dir_entry_first_cluster;
                                 bgm_size          <= {sd_sec_read_data, dir_entry_size[23:0]};
+                            end
+                            if (!bgm2_found &&
+                                is_bgm_wav(dir_entry_first_byte, dir_entry_attr,
+                                           dir_entry_name, dir_entry_first_cluster,
+                                           {sd_sec_read_data, dir_entry_size[23:0]}, 1'b1)) begin
+                                bgm2_found         <= 1'b1;
+                                bgm2_first_cluster <= dir_entry_first_cluster;
+                                bgm2_size          <= {sd_sec_read_data, dir_entry_size[23:0]};
                             end
                         end
                         default: ;

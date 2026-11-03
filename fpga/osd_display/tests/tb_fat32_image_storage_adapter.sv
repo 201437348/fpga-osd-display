@@ -61,6 +61,7 @@ image_storage_adapter #(.MIN_SRC_PIXELS(32'd1)) dut (
     .audio_fifo_wrusedw(audio_fifo_wrusedw),
     .audio_fifo_full(audio_fifo_full),
     .audio_fifo_rst(audio_fifo_rst),
+    .bgm_track_sel(1'b0),
     .SD_nCS(SD_nCS),
     .SD_DCLK(SD_DCLK),
     .SD_MOSI(SD_MOSI),
@@ -229,6 +230,10 @@ task automatic make_wav;
         put_byte(8, 51, 8'h14);
     end
 endtask
+
+// 本测试验证 FAT32 碎片链路，用 2x1 小图；放开 32x32 下限（板上默认 32x32..1280x960）
+defparam dut.u_fat32_bmp_loader.MIN_SRC_WIDTH  = 16'd1;
+defparam dut.u_fat32_bmp_loader.MIN_SRC_HEIGHT = 16'd1;
 
 task automatic make_bmp_header;
     begin

@@ -64,8 +64,8 @@
 module image_bilinear_scaler #(
     parameter [15:0] DST_WIDTH     = 16'd640,
     parameter [15:0] DST_HEIGHT    = 16'd480,
-    parameter [15:0] MAX_SRC_WIDTH = 16'd1920,
-    parameter [15:0] MAX_SRC_HEIGHT= 16'd1080,
+    parameter [15:0] MAX_SRC_WIDTH = 16'd1280,
+    parameter [15:0] MAX_SRC_HEIGHT= 16'd960,
     parameter [3:0]  FRAC_BITS     = 4'd10,
     // 输入 FIFO 深度，必须是 2 的幂（指针按位宽自然回绕）。
     // loader 读一个 512 字节扇区 = 171 个像素，期间**无法被暂停**

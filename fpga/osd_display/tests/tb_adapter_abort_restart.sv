@@ -29,6 +29,7 @@ image_storage_adapter #(.SCAN_TARGET_COUNT(4'd6)) dut (
     .write_en(), .write_data(),
     .audio_fifo_wr_en(), .audio_fifo_wr_data(), .audio_fifo_wrusedw(10'd0),
     .audio_fifo_full(1'b0), .audio_fifo_rst(),
+ .bgm_track_sel(1'b0),
     .SD_nCS(), .SD_DCLK(), .SD_MOSI(), .SD_MISO(1'b1)
 );
 

@@ -29,6 +29,9 @@ wire SD_nCS;
 wire SD_DCLK;
 wire SD_MOSI;
 reg SD_MISO = 1'b1;
+reg bgm_track_sel = 1'b0;
+wire bgm_track_now;
+wire [1:0] bgm_track_count;
 
 always #5 clk = ~clk;
 
@@ -57,6 +60,9 @@ image_storage_adapter dut (
     .audio_fifo_wrusedw(audio_fifo_wrusedw),
     .audio_fifo_full(audio_fifo_full),
     .audio_fifo_rst(audio_fifo_rst),
+    .bgm_track_sel(bgm_track_sel),
+    .bgm_track_now(bgm_track_now),
+    .bgm_track_count(bgm_track_count),
     .SD_nCS(SD_nCS),
     .SD_DCLK(SD_DCLK),
     .SD_MOSI(SD_MOSI),
@@ -194,6 +200,12 @@ initial begin
     dut.u_directory_scan.volume_first_fat_lba = 32'd20;
     dut.u_directory_scan.volume_first_data_lba = 32'd100;
     dut.u_directory_scan.volume_sectors_per_cluster = 8'd2;
+    dut.u_directory_scan.bgm_found = 1'b1;
+    dut.u_directory_scan.bgm_first_cluster = 32'd40;
+    dut.u_directory_scan.bgm_size = 32'd4000;
+    dut.u_directory_scan.bgm2_found = 1'b1;
+    dut.u_directory_scan.bgm2_first_cluster = 32'd50;
+    dut.u_directory_scan.bgm2_size = 32'd5000;
     dut.u_directory_scan.done = 1'b1;
     tick();
     dut.u_directory_scan.done = 1'b0;
@@ -204,6 +216,36 @@ initial begin
     expect_value(dut.image_size[1], 32'd2000, "second file size cached");
     expect_value(dut.volume_first_fat_lba, 32'd20, "FAT geometry cached");
     expect_value(dut.volume_first_data_lba, 32'd100, "data geometry cached");
+
+    // 背景音乐：扫描完成默认播曲目 1，曲目数 2
+    expect_value(bgm_track_count, 2'd2, "two BGM tracks found");
+    expect_bit(bgm_track_now, 1'b0, "track 1 plays after scan");
+    expect_value(dut.bgm_first_cluster, 32'd40, "track 1 cluster feeds wav loader");
+    // 切到曲目 2：先 abort + 清 FIFO，等待结束后换簇号并 start
+    bgm_track_sel = 1'b1;
+    tick();
+    expect_bit(dut.audio_abort, 1'b1, "track switch aborts current wav");
+    expect_bit(dut.audio_fifo_clear, 1'b1, "track switch clears audio fifo");
+    expect_bit(dut.bgm_switch_wait, 1'b1, "track switch waits for reader drain");
+    expect_bit(bgm_track_now, 1'b0, "track does not change before wait ends");
+    dut.bgm_switch_cnt = 20'hFFFFE;
+    tick();
+    tick();
+    expect_bit(dut.audio_start, 1'b1, "wav restarts after switch wait");
+    expect_bit(bgm_track_now, 1'b1, "track 2 reported as playing");
+    expect_value(dut.bgm_first_cluster, 32'd50, "track 2 cluster feeds wav loader");
+    expect_value(dut.bgm_file_size, 32'd5000, "track 2 size feeds wav loader");
+    tick();
+    expect_bit(dut.bgm_switch_wait, 1'b0, "no repeated switch once sel == now");
+    expect_bit(dut.audio_abort, 1'b0, "no repeated abort once sel == now");
+    // 目标曲目不存在时不切
+    dut.bgm1_valid = 1'b0;
+    bgm_track_sel = 1'b0;
+    tick();
+    expect_bit(dut.bgm_switch_wait, 1'b0, "missing target track is ignored");
+    expect_bit(bgm_track_now, 1'b1, "playing track kept when target missing");
+    dut.bgm1_valid = 1'b1;
+    bgm_track_sel = 1'b1;
 
     // Load ownership switches the raw SD port only after scanning is idle.
     dut.u_directory_scan.busy = 1'b0;
@@ -270,7 +312,8 @@ module fat32_directory_scan #(
     output reg [31:0] file_first_cluster, output reg [31:0] file_size,
     output reg [31:0] volume_first_fat_lba, output reg [31:0] volume_first_data_lba,
     output reg [7:0] volume_sectors_per_cluster, output reg bgm_found,
-    output reg [31:0] bgm_first_cluster, output reg [31:0] bgm_size
+    output reg [31:0] bgm_first_cluster, output reg [31:0] bgm_size,
+    output reg bgm2_found, output reg [31:0] bgm2_first_cluster, output reg [31:0] bgm2_size
 );
 endmodule
 
@@ -357,6 +400,7 @@ image_storage_adapter #(
     .audio_fifo_wrusedw(audio_fifo_wrusedw),
     .audio_fifo_full(audio_fifo_full),
     .audio_fifo_rst(),
+    .bgm_track_sel(1'b0),
     .SD_nCS(),
     .SD_DCLK(),
     .SD_MOSI(),

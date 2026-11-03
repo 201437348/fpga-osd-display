@@ -1,3 +1,22 @@
+// ===========================================================================
+// video_osd_overlay -- 顶栏信息行 / 滚动字幕 / 底部状态栏 + 时钟（video_clk，640x480）
+//
+// 版面：
+//   y   0..23   顶栏（半透明），文字 y 4..19：信息行 40 字符，x 16 起
+//   y 432..455  滚动字幕带（可关），文字 y 436..451，64 字符 x 8px = 512px 一周期
+//   y 456..479  底部状态栏，文字 y 460..475：指示块 x 8..15，状态 x 24 起 10 字符，
+//               时钟 HH:MM:SS x 552 起
+//
+// 文字全部用 osd_font_rom 的 8x16 ASCII（与设置面板同一套 Consolas 字形）。
+// 字库 ROM 在顶层例化、双口：A 口给设置面板，B 口给本模块。四处文字的 y 范围
+// 互不重叠，所以本模块只要一个读口：按当前行选文字源，按下一个像素 xa = x + 1
+// 选字符、出 ROM 地址，ROM 同步读晚一拍后正好对齐当前像素，输出仍是 rgb_in 的
+// 纯组合函数，de/vs 不需要重新对齐。（旧版每处文字各带一份 8x8 LUT 字库，
+// 单独综合约 1170 LUT；改成共用 BRAM 字库后只剩选字逻辑。）
+//
+// 唯一的副作用：行首消隐期间 x 停在 0，第 0 个像素取到的是第 1 个像素的字。
+// 只有滚动字幕从 x = 0 开始，所以字幕第 0 列直接不画。
+// ===========================================================================
 module video_osd_overlay #(
     parameter integer CLK_HZ = 25_000_000   // video_clk，时钟秒分频用
 ) (
@@ -14,19 +33,28 @@ module video_osd_overlay #(
     input  wire [2:0]  target_image_index,
     input  wire [2:0]  current_image_index,
     input  wire [3:0]  image_count,
-    input  wire        menu_active,
-    input  wire [7:0]  brightness_value,
-    input  wire [7:0]  contrast_value,
-    input  wire [1:0]  menu_channel,
-    // 顶栏信息行（osd_info_text 生成）：40 个 ASCII，字符 i 在 [i*8 +: 8]
-    input  wire [319:0] info_text,
-    // 时钟校时（预留给串口屏 RTC）：time_set 单拍有效时装入 时/分/秒（二进制，
+    // 顶栏信息行（osd_info_text 生成）：40 个 ASCII，按 info_addr 组合读回 info_char
+    output wire [5:0]  info_addr,
+    input  wire [7:0]  info_char,
+    // 时钟校时（串口屏 RTC）：time_set 单拍有效时装入 时/分/秒（二进制，
     // 时 0..23、分秒 0..59，超范围忽略），此后本地每秒走时。没有校时源时从上电 00:00:00
     // 开始计，即显示上电运行时间。
     input  wire        time_set,
     input  wire [4:0]  time_h,
     input  wire [5:0]  time_m,
     input  wire [5:0]  time_s,
+    // 串口屏：滚动字幕开关 + 可写字幕。两个电平来自控制域，模块内各打 2FF；
+    // 字幕 RAM 写口直接挂在控制域时钟上（64 x 8，读口在 video_clk）。
+    // ticker_custom = 0 显示内置默认字幕，= 1 显示 RAM 里的屏幕字幕。
+    input  wire        ticker_enable,
+    input  wire        ticker_custom,
+    input  wire        ticker_wr_clk,
+    input  wire        ticker_wr_en,
+    input  wire [5:0]  ticker_wr_addr,
+    input  wire [7:0]  ticker_wr_data,
+    // 字库读口（osd_font_rom 的 B 口，同步读 1 拍）
+    output wire [10:0] font_addr,
+    input  wire [15:0] font_q,
     output wire [23:0] rgb_out
 );
 
@@ -38,6 +66,7 @@ localparam [9:0] TITLE_Y        = 10'd4;
 localparam [9:0] TITLE_CHARS    = 10'd40;
 localparam [9:0] STATUS_X       = 10'd24;
 localparam [9:0] STATUS_Y       = 10'd460;
+localparam [9:0] STATUS_CHARS   = 10'd10;
 localparam [9:0] TICKER_BAR_Y      = 10'd432;
 localparam [9:0] TICKER_BAR_HEIGHT = 10'd24;
 localparam [9:0] TICKER_TEXT_Y     = 10'd436;
@@ -65,46 +94,6 @@ function [23:0] bar_blend;
     end
 endfunction
 
-// ---------------------------------------------------------------------------
-// 亮度/对比度参数菜单（第13课）
-//
-// 版面（640x480，取上条与滚动条之间的空白带 y 24..431）：
-//   x 448..631, y 24..59 一块深色面板，两行：
-//     亮度行 y 26..39   对比度行 y 44..57
-//   每行 = 字母标签 + 3 位十进制数值 + 8 段进度条
-//     标签 x 452..459（'B' / 'C'）
-//     数值 x 464..487（3 位 x 8px，百位为 0 时显示空格）
-//     条   x 492 起，段距 16、段宽 14，共 492..617
-//   第 i 段点亮的条件是 value > i*32，于是：
-//     value=0 -> 全灭    value=32 -> 1 段    value=128 -> 4 段    value=255 -> 8 段
-//   （不能写成 value >= (i+1)*32：第 8 段要求 value>=256，永远点不亮。）
-//
-// **为什么必须同时显示数字**：8 段条每段覆盖 32 级，而步长是 1/4/16/32，
-// 所以步长 1、4、16 时**条根本不会动**，看起来就像"按了没反应"。
-// 数字读数能反映每一级变化，也能一眼看出"已经到顶 255 / 到底 0"。
-//
-// 这一层画在亮度/对比度调节之后，所以菜单本身始终是全亮的，不会被调暗。
-// ---------------------------------------------------------------------------
-localparam [9:0] MENU_PANEL_X0 = 10'd16;
-localparam [9:0] MENU_PANEL_X1 = 10'd200;
-localparam [9:0] MENU_PANEL_Y0 = 10'd24;
-localparam [9:0] MENU_PANEL_Y1 = 10'd60;
-localparam [9:0] MENU_LABEL_X  = 10'd20;
-localparam [9:0] MENU_DIGIT_X  = 10'd32;
-localparam [9:0] MENU_BAR_X    = 10'd60;
-localparam [9:0] MENU_BAR_W    = 10'd128;   // 8 段 x 16
-localparam [9:0] MENU_SEG_W    = 10'd14;
-localparam [9:0] MENU_ROW0_Y   = 10'd26;    // 亮度行
-localparam [9:0] MENU_ROW1_Y   = 10'd44;    // 对比度行
-localparam [9:0] MENU_GLYPH_H  = 10'd14;    // 7 行 x 2px
-
-localparam [23:0] MENU_PANEL_RGB = 24'h0B1526;
-localparam [23:0] MENU_SEG_ON    = 24'h54E3E3;
-localparam [23:0] MENU_SEG_ON_DIM= 24'h2E6E6E;   // 非当前通道的已填充段（暗一档）
-localparam [23:0] MENU_SEG_OFF   = 24'h10213A;
-localparam [23:0] MENU_LABEL_HL  = 24'hFFD166;
-localparam [23:0] MENU_LABEL_DIM = 24'hA7C7FF;
-
 reg [9:0] x;
 reg [9:0] y;
 reg       de_d;
@@ -113,70 +102,25 @@ reg [23:0] rgb_out_r;
 reg [1:0] ticker_frame_divider;
 reg [8:0] ticker_scroll_offset;
 
-wire [9:0] title_x_offset;
-wire [9:0] title_y_offset;
-wire [9:0] status_x_offset;
-wire [9:0] status_y_offset;
-wire [5:0] title_char_index;
-wire [3:0] status_char_index;
-wire [2:0] title_row;
-wire [2:0] status_row;
-wire [7:0] title_glyph;
-wire [7:0] status_glyph;
-wire       title_pixel;
-wire       status_pixel;
-wire       title_active;
-wire       status_active;
-wire       indicator_active;
-wire [23:0] status_rgb;
-wire        ticker_active;
-wire        ticker_text_active;
-wire [10:0] ticker_x_sum;
-wire [9:0] ticker_period_x;
-wire [9:0] ticker_y_offset;
-wire [5:0] ticker_char_index;
-wire [2:0] ticker_column;
-wire [2:0] ticker_row;
-wire [7:0] ticker_glyph;
-wire       ticker_pixel;
+// ---- 串口屏字幕：开关同步 + 64 字节字幕 RAM ----
+reg  [1:0] ticker_en_sync;
+reg  [1:0] ticker_custom_sync;
+reg  [7:0] ticker_ram [0:63];
 
-wire        menu_panel_active;
-wire        menu_row0_active;
-wire        menu_row1_active;
-wire [9:0]  menu_row0_yoff;
-wire [9:0]  menu_row1_yoff;
-wire [9:0]  menu_label_xoff;
-wire        menu_label_col;
-wire [7:0]  menu_label_b_glyph;
-wire [7:0]  menu_label_c_glyph;
-wire        menu_label_b_pixel;
-wire        menu_label_c_pixel;
-wire [9:0]  menu_digit_xoff;
-wire        menu_digit_col;
-wire [1:0]  menu_digit_sel;
-wire [2:0]  menu_digit_bit;
-wire [7:0]  menu_b_rem;
-wire [7:0]  menu_c_rem;
-wire [7:0]  menu_digit_b0;
-wire [7:0]  menu_digit_b1;
-wire [7:0]  menu_digit_b2;
-wire [7:0]  menu_digit_c0;
-wire [7:0]  menu_digit_c1;
-wire [7:0]  menu_digit_c2;
-wire [7:0]  menu_digit_b_glyph;
-wire [7:0]  menu_digit_c_glyph;
-wire        menu_digit_b_pixel;
-wire        menu_digit_c_pixel;
-wire [9:0]  menu_seg_x;
-wire        menu_seg_col;
-wire [2:0]  menu_seg_index;
-wire [7:0]  menu_seg_thresh;
-wire        menu_seg_b_area;
-wire        menu_seg_c_area;
-wire        menu_seg_b_on;
-wire        menu_seg_c_on;
-wire        menu_hl_b;
-wire        menu_hl_c;
+always @(posedge video_clk or posedge rst) begin
+    if (rst) begin
+        ticker_en_sync     <= 2'b11;
+        ticker_custom_sync <= 2'b00;
+    end else begin
+        ticker_en_sync     <= {ticker_en_sync[0], ticker_enable};
+        ticker_custom_sync <= {ticker_custom_sync[0], ticker_custom};
+    end
+end
+
+always @(posedge ticker_wr_clk) begin
+    if (ticker_wr_en)
+        ticker_ram[ticker_wr_addr] <= ticker_wr_data;
+end
 
 // ---- 时钟：秒分频 + 时分秒计数 ----
 reg [24:0] sec_div;
@@ -214,122 +158,91 @@ always @(posedge video_clk or posedge rst) begin
     end
 end
 
-wire [9:0] clock_x_offset = x - CLOCK_X;
-wire       clock_active   = (y >= STATUS_Y) && (y < (STATUS_Y + 10'd16)) &&
-                            (x >= CLOCK_X) && (clock_x_offset < 10'd64);
-wire [7:0] clock_char     = clock_digit(clock_x_offset[5:3], clk_h, clk_m, clk_s);
-wire [7:0] clock_glyph    = glyph_row(clock_char, status_row);
-wire       clock_pixel    = clock_active && clock_glyph[7 - clock_x_offset[2:0]];
+// ---------------------------------------------------------------------------
+// 当前行的文字源（y 在整行内不变）
+// ---------------------------------------------------------------------------
+wire ticker_active = ticker_en_sync[1] && (y >= TICKER_BAR_Y) &&
+                     (y < (TICKER_BAR_Y + TICKER_BAR_HEIGHT));
+wire title_line    = (y >= TITLE_Y) && (y < (TITLE_Y + 10'd16));
+wire ticker_line   = ticker_en_sync[1] && (y >= TICKER_TEXT_Y) && (y < (TICKER_TEXT_Y + 10'd16));
+wire status_line   = (y >= STATUS_Y) && (y < (STATUS_Y + 10'd16));
+// TITLE_Y = 4 与 TICKER_TEXT_Y = 436 模 16 同余，两行共用一个减法
+wire [9:0] row_tt  = y - TITLE_Y;
+wire [9:0] row_st  = y - STATUS_Y;
+wire [3:0] font_row = status_line ? row_st[3:0] : row_tt[3:0];
 
-assign title_x_offset = x - TITLE_X;
-assign title_y_offset = y - TITLE_Y;
-assign status_x_offset = x - STATUS_X;
-assign status_y_offset = y - STATUS_Y;
-assign title_char_index = title_x_offset[8:3];
-assign status_char_index = status_x_offset[6:3];
-assign title_row = title_y_offset[3:1];
-assign status_row = status_y_offset[3:1];
+// ---------------------------------------------------------------------------
+// 按下一个像素 xa 选字符
+// ---------------------------------------------------------------------------
+wire [9:0] xa = x + 10'd1;
 
-assign title_active = (y >= TITLE_Y) && (y < (TITLE_Y + 10'd16)) &&
-                      (x >= TITLE_X) && (x < (TITLE_X + TITLE_CHARS * 10'd8));
-assign status_active = (y >= STATUS_Y) && (y < (STATUS_Y + 10'd16)) &&
-                       (x >= STATUS_X) && (x < (STATUS_X + 10'd80));
-assign indicator_active = (y >= (STATUS_Y + 10'd4)) &&
-                          (y < (STATUS_Y + 10'd12)) &&
-                          (x >= 10'd8) && (x < 10'd16);
-assign ticker_active = (y >= TICKER_BAR_Y) &&
-                       (y < (TICKER_BAR_Y + TICKER_BAR_HEIGHT));
-assign ticker_text_active = (y >= TICKER_TEXT_Y) &&
-                            (y < (TICKER_TEXT_Y + 10'd16));
-assign ticker_x_sum = {1'b0, x} + {2'b00, ticker_scroll_offset};
-assign ticker_period_x = (ticker_x_sum >= 11'd880) ? ticker_x_sum - 11'd880 :
-                         (ticker_x_sum >= 11'd440) ? ticker_x_sum - 11'd440 :
-                                                       ticker_x_sum[9:0];
-assign ticker_y_offset = y - TICKER_TEXT_Y;
-assign ticker_char_index = ticker_period_x[8:3];
-assign ticker_column = ticker_period_x[2:0];
-assign ticker_row = ticker_y_offset[3:1];
+wire [9:0] title_dx  = xa - TITLE_X;
+wire [9:0] status_dx = xa - STATUS_X;
+wire [9:0] clock_dx  = xa - CLOCK_X;
+wire       title_col_ok  = (xa >= TITLE_X)  && (title_dx  < TITLE_CHARS * 10'd8);
+wire       status_col_ok = (xa >= STATUS_X) && (status_dx < STATUS_CHARS * 10'd8);
+wire       clock_col_ok  = (xa >= CLOCK_X)  && (clock_dx  < 10'd64);
 
-// ---- 参数菜单解码 ----
-assign menu_panel_active = menu_active &&
-                           (y >= MENU_PANEL_Y0) && (y < MENU_PANEL_Y1) &&
-                           (x >= MENU_PANEL_X0) && (x < MENU_PANEL_X1);
+// 字幕：64 字符 x 8px = 512px 一个周期，回绕只需截位
+wire [10:0] ticker_x_sum = {1'b0, xa} + {2'b00, ticker_scroll_offset};
+wire [5:0]  ticker_idx   = ticker_x_sum[8:3];
+wire [7:0]  ticker_code  = ticker_custom_sync[1] ? ticker_ram[ticker_idx] : ticker_char(ticker_idx);
 
-assign menu_row0_yoff = y - MENU_ROW0_Y;
-assign menu_row1_yoff = y - MENU_ROW1_Y;
-assign menu_row0_active = menu_panel_active && (y >= MENU_ROW0_Y) &&
-                          (y < (MENU_ROW0_Y + MENU_GLYPH_H));
-assign menu_row1_active = menu_panel_active && (y >= MENU_ROW1_Y) &&
-                          (y < (MENU_ROW1_Y + MENU_GLYPH_H));
+assign info_addr = title_dx[8:3];
 
-assign menu_label_xoff = x - MENU_LABEL_X;
-assign menu_label_col  = (x >= MENU_LABEL_X) && (x < (MENU_LABEL_X + 10'd8));
-assign menu_label_b_glyph = glyph_row(8'h42, menu_row0_yoff[3:1]); // B
-assign menu_label_c_glyph = glyph_row(8'h43, menu_row1_yoff[3:1]); // C
-assign menu_label_b_pixel = menu_row0_active && menu_label_col &&
-                            menu_label_b_glyph[7 - menu_label_xoff[2:0]];
-assign menu_label_c_pixel = menu_row1_active && menu_label_col &&
-                            menu_label_c_glyph[7 - menu_label_xoff[2:0]];
+wire [7:0] status_code = status_char(status_dx[6:3], display_valid, display_test_pattern,
+                                     storage_ready, manager_state, load_in_progress,
+                                     target_image_index, current_image_index, image_count);
+wire [7:0] clock_code  = clock_digit(clock_dx[5:3], clk_h, clk_m, clk_s);
 
-// ---- 3 位十进制读数 ----
-assign menu_b_rem    = digit_rem(brightness_value);
-assign menu_c_rem    = digit_rem(contrast_value);
-assign menu_digit_b0 = digit_hundreds(brightness_value);
-assign menu_digit_b1 = digit_tens(menu_b_rem);
-assign menu_digit_b2 = digit_units(menu_b_rem);
-assign menu_digit_c0 = digit_hundreds(contrast_value);
-assign menu_digit_c1 = digit_tens(menu_c_rem);
-assign menu_digit_c2 = digit_units(menu_c_rem);
+localparam [2:0] SRC_NONE = 3'd0, SRC_TITLE = 3'd1, SRC_TICKER = 3'd2,
+                 SRC_STATUS = 3'd3, SRC_CLOCK = 3'd4;
 
-assign menu_digit_xoff = x - MENU_DIGIT_X;
-assign menu_digit_col  = (x >= MENU_DIGIT_X) && (menu_digit_xoff < 10'd24);
-assign menu_digit_sel  = menu_digit_xoff[4:3];   // /8 -> 0/1/2
-assign menu_digit_bit  = menu_digit_xoff[2:0];
-assign menu_digit_b_glyph = glyph_row(
-    pick_digit(menu_digit_sel, menu_digit_b0, menu_digit_b1, menu_digit_b2),
-    menu_row0_yoff[3:1]);
-assign menu_digit_c_glyph = glyph_row(
-    pick_digit(menu_digit_sel, menu_digit_c0, menu_digit_c1, menu_digit_c2),
-    menu_row1_yoff[3:1]);
-assign menu_digit_b_pixel = menu_row0_active && menu_digit_col &&
-                            menu_digit_b_glyph[7 - menu_digit_bit];
-assign menu_digit_c_pixel = menu_row1_active && menu_digit_col &&
-                            menu_digit_c_glyph[7 - menu_digit_bit];
+reg  [7:0] code;
+reg  [2:0] col;
+reg  [2:0] src;
+always @* begin
+    code = 8'h20;
+    col  = 3'd0;
+    src  = SRC_NONE;
+    if (title_line) begin
+        if (title_col_ok) begin
+            code = info_char; col = title_dx[2:0]; src = SRC_TITLE;
+        end
+    end else if (ticker_line) begin
+        code = ticker_code; col = ticker_x_sum[2:0]; src = SRC_TICKER;
+    end else if (status_line) begin
+        if (status_col_ok) begin
+            code = status_code; col = status_dx[2:0]; src = SRC_STATUS;
+        end else if (clock_col_ok) begin
+            code = clock_code; col = clock_dx[2:0]; src = SRC_CLOCK;
+        end
+    end
+end
 
-assign menu_seg_x      = x - MENU_BAR_X;
-assign menu_seg_col    = (x >= MENU_BAR_X) && (menu_seg_x < MENU_BAR_W);
-assign menu_seg_index  = menu_seg_x[6:4];                  // /16 -> 段号 0..7
-assign menu_seg_thresh = {menu_seg_index, 5'b00000};       // 段号 x 32
-assign menu_seg_b_area = menu_row0_active && menu_seg_col &&
-                         (menu_seg_x[3:0] < MENU_SEG_W);
-assign menu_seg_c_area = menu_row1_active && menu_seg_col &&
-                         (menu_seg_x[3:0] < MENU_SEG_W);
-assign menu_seg_b_on   = menu_seg_b_area && (brightness_value > menu_seg_thresh);
-assign menu_seg_c_on   = menu_seg_c_area && (contrast_value   > menu_seg_thresh);
+// 字库只有 0x20..0x7F 的 ASCII（gid 0..31 是汉字），其余码一律按空格画
+wire [6:0] gid = ((code < 8'h20) || code[7]) ? 7'h20 : code[6:0];
+assign font_addr = {gid, font_row};
 
-// 高亮当前正在调的通道（10 = 两个一起，两行都高亮）
-assign menu_hl_b = (menu_channel != 2'b01);
-assign menu_hl_c = (menu_channel != 2'b00);
+reg [2:0] col_q;
+reg [2:0] src_q;
+always @(posedge video_clk) begin
+    col_q <= col;
+    src_q <= src;
+end
+wire       glyph_on    = font_q[4'd15 - {1'b0, col_q}];
+wire       title_pixel  = (src_q == SRC_TITLE)  && glyph_on;
+wire       ticker_pixel = (src_q == SRC_TICKER) && glyph_on && (x != 10'd0);
+wire       status_pixel = (src_q == SRC_STATUS) && glyph_on;
+wire       clock_pixel  = (src_q == SRC_CLOCK)  && glyph_on;
 
-assign title_glyph = glyph_row(info_text[title_char_index * 8 +: 8], title_row);
-assign status_glyph = glyph_row(status_char(status_char_index,
-                                             display_valid,
-                                             display_test_pattern,
-                                             storage_ready,
-                                             manager_state,
-                                             load_in_progress,
-                                             target_image_index,
-                                             current_image_index,
-                                             image_count), status_row);
-assign ticker_glyph = glyph_row(ticker_char(ticker_char_index), ticker_row);
-assign title_pixel = title_active && title_glyph[7 - title_x_offset[2:0]];
-assign status_pixel = status_active && status_glyph[7 - status_x_offset[2:0]];
-assign ticker_pixel = ticker_text_active && ticker_glyph[7 - ticker_column];
-assign status_rgb = display_test_pattern ? FALLBACK_RGB :
-                    !storage_ready ? WAIT_RGB :
-                    load_in_progress ? LOAD_RGB :
-                    ((manager_state == 3'd1) || (manager_state == 3'd6) ||
-                     !display_valid) ? SCAN_RGB : READY_RGB;
+wire indicator_active = (y >= (STATUS_Y + 10'd4)) && (y < (STATUS_Y + 10'd12)) &&
+                        (x >= 10'd8) && (x < 10'd16);
+wire [23:0] status_rgb = display_test_pattern ? FALLBACK_RGB :
+                         !storage_ready ? WAIT_RGB :
+                         load_in_progress ? LOAD_RGB :
+                         ((manager_state == 3'd1) || (manager_state == 3'd6) ||
+                          !display_valid) ? SCAN_RGB : READY_RGB;
 assign rgb_out = rgb_out_r;
 
 function [7:0] ticker_char;
@@ -500,386 +413,6 @@ function [7:0] status_char;
     end
 endfunction
 
-// ---------------------------------------------------------------------------
-// 0..255 -> 三位十进制字符码
-//   纯比较/减法实现，刻意不用除法也不用乘法（DSP 已经 25/29，很紧）。
-//   百位为 0 时输出空格，读起来是 " 64" 而不是 "064"。
-// ---------------------------------------------------------------------------
-function [7:0] digit_rem;          // 去掉百位后的余数，0..99
-    input [7:0] v;
-    begin
-        digit_rem = (v >= 8'd200) ? (v - 8'd200) :
-                    (v >= 8'd100) ? (v - 8'd100) : v;
-    end
-endfunction
-
-function [7:0] digit_hundreds;
-    input [7:0] v;
-    begin
-        digit_hundreds = (v >= 8'd200) ? 8'h32 :          // '2'
-                         (v >= 8'd100) ? 8'h31 : 8'h20;   // '1' / 空格
-    end
-endfunction
-
-function [7:0] digit_tens;
-    input [7:0] v;                 // 0..99
-    begin
-        digit_tens = (v >= 8'd90) ? 8'h39 :
-                     (v >= 8'd80) ? 8'h38 :
-                     (v >= 8'd70) ? 8'h37 :
-                     (v >= 8'd60) ? 8'h36 :
-                     (v >= 8'd50) ? 8'h35 :
-                     (v >= 8'd40) ? 8'h34 :
-                     (v >= 8'd30) ? 8'h33 :
-                     (v >= 8'd20) ? 8'h32 :
-                     (v >= 8'd10) ? 8'h31 : 8'h30;
-    end
-endfunction
-
-function [7:0] digit_units;
-    input [7:0] v;                 // 0..99
-    begin
-        digit_units = (v >= 8'd90) ? (8'h30 + (v - 8'd90)) :
-                      (v >= 8'd80) ? (8'h30 + (v - 8'd80)) :
-                      (v >= 8'd70) ? (8'h30 + (v - 8'd70)) :
-                      (v >= 8'd60) ? (8'h30 + (v - 8'd60)) :
-                      (v >= 8'd50) ? (8'h30 + (v - 8'd50)) :
-                      (v >= 8'd40) ? (8'h30 + (v - 8'd40)) :
-                      (v >= 8'd30) ? (8'h30 + (v - 8'd30)) :
-                      (v >= 8'd20) ? (8'h30 + (v - 8'd20)) :
-                      (v >= 8'd10) ? (8'h30 + (v - 8'd10)) :
-                                     (8'h30 + v);
-    end
-endfunction
-
-function [7:0] pick_digit;
-    input [1:0] sel;
-    input [7:0] d0;
-    input [7:0] d1;
-    input [7:0] d2;
-    begin
-        pick_digit = (sel == 2'd0) ? d0 : (sel == 2'd1) ? d1 : d2;
-    end
-endfunction
-
-function [7:0] glyph_row;
-    input [7:0] char_code;
-    input [2:0] row;
-    begin
-        glyph_row = 8'h00;
-        case (char_code)
-            8'h30: case (row) // 0
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000110;
-                3'd3: glyph_row = 8'b01001010;
-                3'd4: glyph_row = 8'b01010010;
-                3'd5: glyph_row = 8'b01100010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h31: case (row) // 1
-                3'd0: glyph_row = 8'b00010000;
-                3'd1: glyph_row = 8'b00110000;
-                3'd2: glyph_row = 8'b00010000;
-                3'd3: glyph_row = 8'b00010000;
-                3'd4: glyph_row = 8'b00010000;
-                3'd5: glyph_row = 8'b00010000;
-                3'd6: glyph_row = 8'b00111000;
-            endcase
-            8'h32: case (row) // 2
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b00000010;
-                3'd3: glyph_row = 8'b00001100;
-                3'd4: glyph_row = 8'b00110000;
-                3'd5: glyph_row = 8'b01000000;
-                3'd6: glyph_row = 8'b01111110;
-            endcase
-            8'h33: case (row) // 3
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b00000010;
-                3'd3: glyph_row = 8'b00011100;
-                3'd4: glyph_row = 8'b00000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h34: case (row) // 4
-                3'd0: glyph_row = 8'b00000100;
-                3'd1: glyph_row = 8'b00001100;
-                3'd2: glyph_row = 8'b00010100;
-                3'd3: glyph_row = 8'b00100100;
-                3'd4: glyph_row = 8'b01111110;
-                3'd5: glyph_row = 8'b00000100;
-                3'd6: glyph_row = 8'b00000100;
-            endcase
-            8'h35: case (row) // 5
-                3'd0: glyph_row = 8'b01111110;
-                3'd1: glyph_row = 8'b01000000;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b00000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h36: case (row) // 6
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000000;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h37: case (row) // 7
-                3'd0: glyph_row = 8'b01111110;
-                3'd1: glyph_row = 8'b00000010;
-                3'd2: glyph_row = 8'b00000100;
-                3'd3: glyph_row = 8'b00001000;
-                3'd4: glyph_row = 8'b00010000;
-                3'd5: glyph_row = 8'b00010000;
-                3'd6: glyph_row = 8'b00010000;
-            endcase
-            8'h38: case (row) // 8
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b00111100;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h39: case (row) // 9
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b00111110;
-                3'd4: glyph_row = 8'b00000010;
-                3'd5: glyph_row = 8'b00000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h41: case (row) // A
-                3'd0: glyph_row = 8'b00011000;
-                3'd1: glyph_row = 8'b00100100;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01000010;
-                3'd4: glyph_row = 8'b01111110;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h42: case (row) // B
-                3'd0: glyph_row = 8'b01111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b01111100;
-            endcase
-            8'h43: case (row) // C
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01000000;
-                3'd4: glyph_row = 8'b01000000;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h44: case (row) // D
-                3'd0: glyph_row = 8'b01111000;
-                3'd1: glyph_row = 8'b01000100;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01000010;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000100;
-                3'd6: glyph_row = 8'b01111000;
-            endcase
-            8'h45: case (row) // E
-                3'd0: glyph_row = 8'b01111110;
-                3'd1: glyph_row = 8'b01000000;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b01000000;
-                3'd5: glyph_row = 8'b01000000;
-                3'd6: glyph_row = 8'b01111110;
-            endcase
-            8'h46: case (row) // F
-                3'd0: glyph_row = 8'b01111110;
-                3'd1: glyph_row = 8'b01000000;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b01000000;
-                3'd5: glyph_row = 8'b01000000;
-                3'd6: glyph_row = 8'b01000000;
-            endcase
-            8'h47: case (row) // G
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01001110;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h48: case (row) // H
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01111110;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h49: case (row) // I
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b00010000;
-                3'd2: glyph_row = 8'b00010000;
-                3'd3: glyph_row = 8'b00010000;
-                3'd4: glyph_row = 8'b00010000;
-                3'd5: glyph_row = 8'b00010000;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h4B: case (row) // K
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b01000100;
-                3'd2: glyph_row = 8'b01001000;
-                3'd3: glyph_row = 8'b01110000;
-                3'd4: glyph_row = 8'b01001000;
-                3'd5: glyph_row = 8'b01000100;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h4C: case (row) // L
-                3'd0: glyph_row = 8'b01000000;
-                3'd1: glyph_row = 8'b01000000;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b01000000;
-                3'd4: glyph_row = 8'b01000000;
-                3'd5: glyph_row = 8'b01000000;
-                3'd6: glyph_row = 8'b01111110;
-            endcase
-            8'h4D: case (row) // M
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b01100110;
-                3'd2: glyph_row = 8'b01011010;
-                3'd3: glyph_row = 8'b01000010;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h4E: case (row) // N
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b01100010;
-                3'd2: glyph_row = 8'b01010010;
-                3'd3: glyph_row = 8'b01001010;
-                3'd4: glyph_row = 8'b01000110;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h4F: case (row) // O
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01000010;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h50: case (row) // P
-                3'd0: glyph_row = 8'b01111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b01000000;
-                3'd5: glyph_row = 8'b01000000;
-                3'd6: glyph_row = 8'b01000000;
-            endcase
-            8'h52: case (row) // R
-                3'd0: glyph_row = 8'b01111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01111100;
-                3'd4: glyph_row = 8'b01001000;
-                3'd5: glyph_row = 8'b01000100;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h53: case (row) // S
-                3'd0: glyph_row = 8'b00111100;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000000;
-                3'd3: glyph_row = 8'b00111100;
-                3'd4: glyph_row = 8'b00000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h54: case (row) // T
-                3'd0: glyph_row = 8'b01111110;
-                3'd1: glyph_row = 8'b00010000;
-                3'd2: glyph_row = 8'b00010000;
-                3'd3: glyph_row = 8'b00010000;
-                3'd4: glyph_row = 8'b00010000;
-                3'd5: glyph_row = 8'b00010000;
-                3'd6: glyph_row = 8'b00010000;
-            endcase
-            8'h55: case (row) // U
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01000010;
-                3'd4: glyph_row = 8'b01000010;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b00111100;
-            endcase
-            8'h57: case (row) // W
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b01000010;
-                3'd2: glyph_row = 8'b01000010;
-                3'd3: glyph_row = 8'b01011010;
-                3'd4: glyph_row = 8'b01011010;
-                3'd5: glyph_row = 8'b01100110;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h59: case (row) // Y
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b00100100;
-                3'd2: glyph_row = 8'b00011000;
-                3'd3: glyph_row = 8'b00010000;
-                3'd4: glyph_row = 8'b00010000;
-                3'd5: glyph_row = 8'b00010000;
-                3'd6: glyph_row = 8'b00010000;
-            endcase
-            8'h58: case (row) // X
-                3'd0: glyph_row = 8'b01000010;
-                3'd1: glyph_row = 8'b00100100;
-                3'd2: glyph_row = 8'b00011000;
-                3'd3: glyph_row = 8'b00011000;
-                3'd4: glyph_row = 8'b00100100;
-                3'd5: glyph_row = 8'b01000010;
-                3'd6: glyph_row = 8'b01000010;
-            endcase
-            8'h2E: case (row) // .
-                3'd5: glyph_row = 8'b00011000;
-                3'd6: glyph_row = 8'b00011000;
-            endcase
-            8'h3A: case (row) // :
-                3'd1: glyph_row = 8'b00011000;
-                3'd2: glyph_row = 8'b00011000;
-                3'd4: glyph_row = 8'b00011000;
-                3'd5: glyph_row = 8'b00011000;
-            endcase
-            8'h2F: case (row) // /
-                3'd0: glyph_row = 8'b00000010;
-                3'd1: glyph_row = 8'b00000100;
-                3'd2: glyph_row = 8'b00001000;
-                3'd3: glyph_row = 8'b00010000;
-                3'd4: glyph_row = 8'b00100000;
-                3'd5: glyph_row = 8'b01000000;
-                3'd6: glyph_row = 8'b00000000;
-            endcase
-            default: glyph_row = 8'h00;
-        endcase
-    end
-endfunction
-
 always @(posedge video_clk or posedge rst) begin
     if (rst) begin
         x                    <= 10'd0;
@@ -895,10 +428,7 @@ always @(posedge video_clk or posedge rst) begin
         if (vs && !vs_d) begin
             if (ticker_frame_divider == 2'd2) begin
                 ticker_frame_divider <= 2'd0;
-                if (ticker_scroll_offset == 9'd439)
-                    ticker_scroll_offset <= 9'd0;
-                else
-                    ticker_scroll_offset <= ticker_scroll_offset + 9'd1;
+                ticker_scroll_offset <= ticker_scroll_offset + 9'd1;   // 512 回绕
             end else begin
                 ticker_frame_divider <= ticker_frame_divider + 2'd1;
             end
@@ -932,23 +462,6 @@ always @* begin
                 rgb_out_r = status_rgb;
             else if (clock_pixel)
                 rgb_out_r = CLOCK_RGB;
-        end
-
-        // 参数菜单画在最上层，常驻于左上角 (x 16..199, y 24..59)，紧贴标题栏下方，
-        // 与上条/滚动条/状态栏都不重叠，不会互相遮挡。
-        if (menu_panel_active) begin
-            if (menu_seg_b_area)
-                rgb_out_r = menu_seg_b_on ? (menu_hl_b ? MENU_SEG_ON : MENU_SEG_ON_DIM)
-                                          : MENU_SEG_OFF;
-            else if (menu_seg_c_area)
-                rgb_out_r = menu_seg_c_on ? (menu_hl_c ? MENU_SEG_ON : MENU_SEG_ON_DIM)
-                                          : MENU_SEG_OFF;
-            else if (menu_label_b_pixel || menu_digit_b_pixel)
-                rgb_out_r = menu_hl_b ? MENU_LABEL_HL : MENU_LABEL_DIM;
-            else if (menu_label_c_pixel || menu_digit_c_pixel)
-                rgb_out_r = menu_hl_c ? MENU_LABEL_HL : MENU_LABEL_DIM;
-            else
-                rgb_out_r = MENU_PANEL_RGB;
         end
     end
 end

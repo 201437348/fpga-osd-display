@@ -56,6 +56,8 @@ image_playback_control #(.CLK_FREQ_HZ(HZ), .AUTO_INTERVAL_SECONDS(3)) u_play (
     .clk(clk), .rst(rst), .key_next(key_next), .key_auto(key_auto),
     .display_valid(display_valid), .image_count(image_count),
     .manager_idle(idle && display_settled),
+    .cmd_next(1'b0), .cmd_prev(1'b0), .cmd_auto_toggle(1'b0),
+    .cmd_period_valid(1'b0), .cmd_period(3'd0), .hold(1'b0),
     .next_request(next_request), .prev_request(prev_request), .auto_request(auto_request),
     .auto_play_enabled(), .auto_period_sec(), .key_down()
 );

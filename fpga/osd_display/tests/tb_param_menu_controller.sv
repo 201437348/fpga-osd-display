@@ -19,22 +19,23 @@ initial begin
  if(c!=144 || b!=255) $fatal(1,"contrast selection");
  sw=4'b0011;repeat(40) @(negedge clk);
  if(b!=255 || c!=128) $fatal(1,"restore");
- if(vol!=8) $fatal(1,"volume default %d",vol);
+ if(vol!=3) $fatal(1,"volume default %d",vol);
+ repeat(5) press(10);if(vol!=8) $fatal(1,"volume up to 8 %d",vol);
  press(10);if(vol!=8) $fatal(1,"volume saturates high");
  press(70);press(70);if(vol!=6) $fatal(1,"volume down %d",vol);
  if(b!=255 || c!=128) $fatal(1,"volume keeps defaults");
  repeat(7) press(70);if(vol!=0) $fatal(1,"volume saturates low %d",vol);
  press(10);if(vol!=1) $fatal(1,"volume up");
  sw=4'b0000;repeat(40) @(negedge clk);press(70);if(vol!=1 || b!=254) $fatal(1,"volume only in 11");
- if(tvol!=8) $fatal(1,"tone default %d",tvol);
- cmd(1,2'b10,0);cmd(1,2'b10,0);if(tvol!=6 || vol!=1) $fatal(1,"tone down %d vol %d",tvol,vol);
- cmd(1,2'b01,0);if(tvol!=7) $fatal(1,"tone up");
+ if(tvol!=3) $fatal(1,"tone default %d",tvol);
+ cmd(1,2'b10,0);cmd(1,2'b10,0);if(tvol!=1 || vol!=1) $fatal(1,"tone down %d vol %d",tvol,vol);
+ cmd(1,2'b01,0);if(tvol!=2) $fatal(1,"tone up");
  cmd(1,2'b00,4'd15);if(tvol!=8) $fatal(1,"tone set clamps");
  cmd(1,2'b01,0);if(tvol!=8) $fatal(1,"tone saturates high");
  cmd(1,2'b00,4'd0);cmd(1,2'b10,0);if(tvol!=0) $fatal(1,"tone saturates low");
  cmd(0,2'b00,4'd5);if(vol!=5 || tvol!=0) $fatal(1,"music set %d",vol);
  cmd(0,2'b01,0);cmd(0,2'b10,0);cmd(0,2'b10,0);if(vol!=4) $fatal(1,"music up/down %d",vol);
- cmd(0,2'b11,0);cmd(1,2'b11,0);if(vol!=8 || tvol!=8) $fatal(1,"restore defaults");
+ cmd(0,2'b11,0);cmd(1,2'b11,0);if(vol!=3 || tvol!=3) $fatal(1,"restore defaults");
  if(b!=254 || c!=128) $fatal(1,"volume cmd must not touch b/c");
  $display("PASS tb_param_menu_controller: short/long, saturation, select, restore, volume, vol_cmd");$finish;
 end

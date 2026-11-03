@@ -1,7 +1,7 @@
 `timescale 1ns/1ps
 
 // 真实 FAT32 -> fat32_bmp_loader -> image_bilinear_scaler(抗锯齿) 全路径加载大图
-//   +W=/+H= 源尺寸（默认 1920x1080，八色竖条，与板上图 3 一致）
+//   +W=/+H= 源尺寸（默认 1280x960 = 支持上限，八色竖条）
 //   +BYTE_GAP=<n>  SD 模型每字节间隔拍数（默认 4），+LAT=<n> 每扇区命令延迟（默认 200）
 //   检查：source_done 且无 source_error，write_en 恰好 307200 个，缩放器无溢出，
 //   逐像素与"竖条按 3x3 帐篷滤波 + 双线性"的期望色比对前若干行（只看 x 方向）。
@@ -46,6 +46,7 @@ image_storage_adapter #(.MIN_SRC_PIXELS(32'd1)) dut (
     .audio_fifo_wr_en(audio_fifo_wr_en), .audio_fifo_wr_data(audio_fifo_wr_data),
     .audio_fifo_wrusedw(audio_fifo_wrusedw), .audio_fifo_full(audio_fifo_full),
     .audio_fifo_rst(audio_fifo_rst),
+    .bgm_track_sel(1'b0),
     .SD_nCS(SD_nCS), .SD_DCLK(SD_DCLK), .SD_MOSI(SD_MOSI), .SD_MISO(SD_MISO)
 );
 
@@ -88,8 +89,8 @@ endfunction
 
 reg [23:0] c;
 initial begin
-    if (!$value$plusargs("W=%d", W)) W = 1920;
-    if (!$value$plusargs("H=%d", H)) H = 1080;
+    if (!$value$plusargs("W=%d", W)) W = 1280;
+    if (!$value$plusargs("H=%d", H)) H = 960;
     stride = ((W * 3) + 3) & ~3;
     fsize  = 54 + stride * H;
     nclus  = (fsize + SPC * 512 - 1) / (SPC * 512);

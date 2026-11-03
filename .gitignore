@@ -23,3 +23,13 @@ log/
 
 # Local brainstorming visualizations
 .superpowers/
+
+# Scratch / generated / packaging dirs (not source)
+_pack/
+_bmp_work/
+_td_rom_probe/
+_td_opt_probe/
+tmp_pinout/
+演示素材/
+__pycache__/
+*.pyc

@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 // 多图顺序加载（同一个 adapter 不复位）：复现"小图之后的 1080p 加载不完"
-//   盘上 4 张：16x16、640x480、1920x1080、800x480（与板上测试卡一致），
+//   盘上 4 张：32x32、640x480、1280x960、800x480（支持范围 32x32..1280x960 的两端），
 //   按 +ORDER 顺序逐张加载，每张检查 source_done + 307200 像素 + 无溢出。
 
 // 真实 FAT32 -> fat32_bmp_loader -> image_bilinear_scaler(抗锯齿) 全路径加载大图
@@ -49,6 +49,7 @@ image_storage_adapter #(.MIN_SRC_PIXELS(32'd1)) dut (
     .audio_fifo_wr_en(audio_fifo_wr_en), .audio_fifo_wr_data(audio_fifo_wr_data),
     .audio_fifo_wrusedw(audio_fifo_wrusedw), .audio_fifo_full(audio_fifo_full),
     .audio_fifo_rst(audio_fifo_rst),
+    .bgm_track_sel(1'b0),
     .SD_nCS(SD_nCS), .SD_DCLK(SD_DCLK), .SD_MOSI(SD_MOSI), .SD_MISO(SD_MISO)
 );
 
@@ -115,9 +116,9 @@ initial begin
     // +ABORT_AT=n：第一张读到 n 个扇区时 abort，3 拍后重新 load_start 同一张
     // （= image_load_manager 预加载被 3 s 自动轮播 pl_preempt 后前台重读）
     if (!$value$plusargs("ABORT_AT=%d", abort_at)) abort_at = 0;
-    FW[0] = 16;   FH[0] = 16;
+    FW[0] = 32;   FH[0] = 32;
     FW[1] = 640;  FH[1] = 480;
-    FW[2] = 1920; FH[2] = 1080;
+    FW[2] = 1280; FH[2] = 960;
     FW[3] = 800;  FH[3] = 480;
 
     pb(450, 8'h0C); p32(454, 1); pb(510, 8'h55); pb(511, 8'hAA);

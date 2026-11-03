@@ -24,7 +24,11 @@ module top(
     output                      sd_ncs,
     output                      sd_dclk,
     output                      sd_mosi,
-    input                       sd_miso
+    input                       sd_miso,
+
+    // 大彩 DC80480A070 串口屏（TTL 3.3 V，115200 8N1），J1-1 / J1-2
+    output                      uart_tx,        // FPGA TX -> 屏 RX
+    input                       uart_rx         // FPGA RX <- 屏 TX
 );
 
 parameter MEM_DATA_BITS = 32;
@@ -111,9 +115,32 @@ wire [9:0]  slide_position;
 wire        transition_busy;
 wire [6:0]  fade_gain;
 // 切图效果：0 = 左右滑动，1 = 淡出到黑再淡入。
-// 以后由串口屏命令选择（经 2FF 同步到 video_clk，控制器在每次切图开始时锁存）；
-// 现在先固定为淡入淡出，方便上板看效果。
-wire        transition_mode_video = 1'b1;
+// 由串口屏播放页开关选择（sd 域电平，2FF 同步到 video_clk，控制器在每次切图开始时锁存）。
+wire        scr_transition_fade;
+reg  [1:0]  transition_mode_sync;
+wire        transition_mode_video = transition_mode_sync[1];
+// 串口屏链路输出（screen_uart_link_m0，sd_card_clk 域）
+wire        scr_cmd_next, scr_cmd_prev, scr_cmd_auto_toggle, scr_cmd_period_valid;
+wire [2:0]  scr_cmd_period;
+wire        scr_bc_cmd_valid, scr_bc_cmd_target;
+wire [7:0]  scr_bc_cmd_value;
+wire        scr_vol_cmd_valid;
+wire        scr_vol_cmd_target;     // 0 = 音乐，1 = 提示音
+wire [3:0]  scr_vol_cmd_value;
+wire        scr_user_mute, scr_visualizer_en, scr_ticker_en, scr_ticker_custom;
+wire        scr_ticker_wr_en;
+wire [5:0]  scr_ticker_wr_addr;
+wire [7:0]  scr_ticker_wr_data;
+wire        scr_screen_off, scr_rtc_valid, scr_time_toggle;
+// 背景音乐双曲目（sd_card_clk 域）：屏幕选曲 -> 存储适配器，实际曲目/曲目数回报给屏幕
+wire        scr_bgm_track_sel;
+wire        bgm_track_now;
+wire [1:0]  bgm_track_count;
+wire [4:0]  scr_time_h;
+wire [5:0]  scr_time_m, scr_time_s;
+wire        scr_name_wr;
+wire [2:0]  scr_name_slot;
+wire [87:0] scr_name_data;
 wire        frame_read_fault;
 wire [3:0]  frame_read_fifo_underflow_count_per_frame;
 reg [1:0]   frame_read_fault_video_sync;
@@ -172,6 +199,8 @@ wire        auto_play_enabled;
 wire [2:0]  auto_period_sec;
 wire [3:0]  cfg_volume;
 wire [3:0]  cfg_tone_volume;
+// 静音 = 串口屏用户静音 或 定时息屏
+wire [3:0]  cfg_volume_out = (scr_user_mute || scr_screen_off) ? 4'd0 : cfg_volume;
 wire        playback_key_down;
 wire        menu_key_down;
 reg         key_any_down_sd;
@@ -369,6 +398,9 @@ image_storage_adapter #(
     .shown_img_height  (loaded_img_height),
     .shown_scale_x100  (loaded_scale_x100),
     .shown_info_pulse  (loaded_info_pulse),
+    .name_wr           (scr_name_wr),
+    .name_slot         (scr_name_slot),
+    .name_data         (scr_name_data),
     .load_diag_state   (load_diag_state),
     .load_diag_sector  (load_diag_sector),
     .load_diag_flags   (load_diag_flags),
@@ -386,6 +418,9 @@ image_storage_adapter #(
     .audio_fifo_wrusedw(audio_fifo_wrusedw),
     .audio_fifo_full   (audio_fifo_full),
     .audio_fifo_rst    (audio_fifo_rst),
+    .bgm_track_sel     (scr_bgm_track_sel),
+    .bgm_track_now     (bgm_track_now),
+    .bgm_track_count   (bgm_track_count),
     .SD_nCS            (sd_ncs),
     .SD_DCLK           (sd_dclk),
     .SD_MOSI           (sd_mosi),
@@ -425,7 +460,7 @@ audio_pcm_player u_audio_pcm_player (
     .clk              (video_clk),
     .rst              (rst_vid),
     .enable           (display_valid),
-    .volume           (cfg_volume),       // sd 域慢变量，模块内两次采样一致才用
+    .volume           (cfg_volume_out),   // sd 域慢变量（已含静音），模块内两次采样一致才用
     .tone_volume      (cfg_tone_volume),  // 同上
     .key_down         (key_any_down_sd),  // sd 域寄存器电平，模块内 2FF
     .no_card          (!osd_storage_ready), // 已同步到 video_clk；模块内再 2FF，持续 3 s 才提醒
@@ -501,6 +536,12 @@ image_playback_control #(
     .display_valid         (display_valid_sd),
     .image_count           (image_count),
     .manager_idle          (playback_manager_idle),
+    .cmd_next              (scr_cmd_next),
+    .cmd_prev              (scr_cmd_prev),
+    .cmd_auto_toggle       (scr_cmd_auto_toggle),
+    .cmd_period_valid      (scr_cmd_period_valid),
+    .cmd_period            (scr_cmd_period),
+    .hold                  (scr_screen_off),
     .next_request          (next_request),
     .prev_request          (prev_request),
     .auto_request          (auto_request),
@@ -543,13 +584,90 @@ param_menu_controller #(
     .cfg_toggle    (cfg_toggle_sd),
     .volume        (cfg_volume),
     .key_down      (menu_key_down),
-    // 音量命令口：后续串口屏解码器接到这里（sd_card_clk 域单拍命令），现在先接 0
-    .vol_cmd_valid (1'b0),
-    .vol_cmd_target(1'b0),
+    // 串口屏命令口（sd_card_clk 域单拍命令）
+    .vol_cmd_valid (scr_vol_cmd_valid),
+    .vol_cmd_target(scr_vol_cmd_target),
     .vol_cmd_op    (2'b00),
-    .vol_cmd_value (4'd0),
-    .tone_volume   (cfg_tone_volume)
+    .vol_cmd_value (scr_vol_cmd_value),
+    .tone_volume   (cfg_tone_volume),
+    .bc_cmd_valid  (scr_bc_cmd_valid),
+    .bc_cmd_target (scr_bc_cmd_target),
+    .bc_cmd_value  (scr_bc_cmd_value)
 );
+
+// ---------------------------------------------------------------------------
+// 串口屏链路（sd_card_clk 域）：屏幕按钮/滑块/文本 -> 单拍命令与电平，
+// 系统状态变化 -> 回写屏幕控件。协议见串口屏工程 FPGA接口文档.md。
+// ---------------------------------------------------------------------------
+screen_uart_link #(
+    .CLK_FREQ_HZ (100_000_000),
+    .BAUD        (115200)
+) screen_uart_link_m0(
+    .clk                 (sd_card_clk),
+    .rst                 (rst_sd),
+    .uart_rx             (uart_rx),
+    .uart_tx             (uart_tx),
+    .brightness          (cfg_brightness),
+    .contrast            (cfg_contrast),
+    .volume              (cfg_volume),
+    .auto_play_enabled   (auto_play_enabled),
+    .auto_period_sec     (auto_period_sec),
+    .display_valid       (display_valid_sd),
+    .current_image_index (current_image_index_sd),
+    .image_count         (image_count),
+    .name_wr             (scr_name_wr),
+    .name_slot           (scr_name_slot),
+    .name_data           (scr_name_data),
+    .bgm_track_now       (bgm_track_now),
+    .bgm_track_count     (bgm_track_count),
+    .bgm_track_sel       (scr_bgm_track_sel),
+    .cmd_next            (scr_cmd_next),
+    .cmd_prev            (scr_cmd_prev),
+    .cmd_auto_toggle     (scr_cmd_auto_toggle),
+    .cmd_period_valid    (scr_cmd_period_valid),
+    .cmd_period          (scr_cmd_period),
+    .bc_cmd_valid        (scr_bc_cmd_valid),
+    .bc_cmd_target       (scr_bc_cmd_target),
+    .bc_cmd_value        (scr_bc_cmd_value),
+    .vol_cmd_valid       (scr_vol_cmd_valid),
+    .vol_cmd_target      (scr_vol_cmd_target),
+    .vol_cmd_value       (scr_vol_cmd_value),
+    .user_mute           (scr_user_mute),
+    .visualizer_en       (scr_visualizer_en),
+    .ticker_en           (scr_ticker_en),
+    .transition_fade     (scr_transition_fade),
+    .ticker_custom       (scr_ticker_custom),
+    .ticker_wr_en        (scr_ticker_wr_en),
+    .ticker_wr_addr      (scr_ticker_wr_addr),
+    .ticker_wr_data      (scr_ticker_wr_data),
+    .screen_off          (scr_screen_off),
+    .rtc_valid           (scr_rtc_valid),
+    .time_toggle         (scr_time_toggle),
+    .time_h              (scr_time_h),
+    .time_m              (scr_time_m),
+    .time_s              (scr_time_s)
+);
+
+// sd 域电平 -> video_clk：切图效果 / 可视化开关 / 息屏各 2FF；
+// RTC 时间：toggle 同步后产生 time_set 单拍，时分秒在 toggle 翻转前已稳定 1 拍以上，
+// 再经 3 拍同步延迟才被采样，按多周期路径处理。
+reg  [1:0]  vis_en_sync;
+reg  [1:0]  screen_off_sync;
+reg  [2:0]  time_toggle_sync;
+wire        osd_time_set = time_toggle_sync[2] ^ time_toggle_sync[1];
+always @(posedge video_clk or posedge rst_vid) begin
+    if (rst_vid) begin
+        transition_mode_sync <= 2'b00;
+        vis_en_sync          <= 2'b11;
+        screen_off_sync      <= 2'b00;
+        time_toggle_sync     <= 3'b000;
+    end else begin
+        transition_mode_sync <= {transition_mode_sync[0], scr_transition_fade};
+        vis_en_sync          <= {vis_en_sync[0], scr_visualizer_en};
+        screen_off_sync      <= {screen_off_sync[0], scr_screen_off};
+        time_toggle_sync     <= {time_toggle_sync[1:0], scr_time_toggle};
+    end
+end
 
 // 按键提示音：三个按键的消抖电平合成一路，寄存后再跨到 video_clk（单比特电平）
 always @(posedge sd_card_clk or posedge rst_sd) begin
@@ -909,7 +1027,8 @@ brightness_contrast_adjust brightness_contrast_adjust_m0(
 );
 
 // 顶栏信息行 "OUT 640X480  IMG wwwwXhhhh  SCALE d.dd"
-wire [319:0] osd_info_text;
+wire [5:0]   osd_info_addr;
+wire [7:0]   osd_info_char;
 
 osd_info_text #(
     .OUT_WIDTH  (640),
@@ -923,7 +1042,20 @@ osd_info_text #(
     .info_width      (shown_img_width),
     .info_height     (shown_img_height),
     .info_scale_x100 (shown_scale_x100),
-    .text_flat       (osd_info_text)
+    .rd_addr         (osd_info_addr),
+    .rd_char         (osd_info_char)
+);
+
+// OSD 字库（1 块 32K BRAM，双口只读）：A 口 = 设置面板，B 口 = 顶栏/字幕/状态栏
+wire [10:0] osd_font_addr_a, osd_font_addr_b;
+wire [15:0] osd_font_q_a, osd_font_q_b;
+
+osd_font_rom osd_font_rom_m0(
+    .clk    (video_clk),
+    .addr_a (osd_font_addr_a),
+    .dout_a (osd_font_q_a),
+    .addr_b (osd_font_addr_b),
+    .dout_b (osd_font_q_b)
 );
 
 video_osd_overlay video_osd_overlay_m0(
@@ -940,16 +1072,22 @@ video_osd_overlay video_osd_overlay_m0(
     .target_image_index   (osd_target_image_index),
     .current_image_index  (osd_current_image_index),
     .image_count          (osd_image_count),
-    .menu_active          (1'b1),  // 参数面板常驻显示
-    .brightness_value     (bc_brightness_committed),
-    .contrast_value       (bc_contrast_committed),
-    .menu_channel         (bc_channel_committed),
-    .info_text            (osd_info_text),
-    // 时钟校时：以后接串口屏 RTC；现在不校时，显示上电运行时间
-    .time_set             (1'b0),
-    .time_h               (5'd0),
-    .time_m               (6'd0),
-    .time_s               (6'd0),
+    .info_addr            (osd_info_addr),
+    .info_char            (osd_info_char),
+    // 时钟校时：串口屏 RTC 每秒一次；屏幕没接时显示上电运行时间
+    .time_set             (osd_time_set),
+    .time_h               (scr_time_h),
+    .time_m               (scr_time_m),
+    .time_s               (scr_time_s),
+    // 滚动字幕：开关 / 自定义内容（RAM 由 sd 域写入）
+    .ticker_enable        (scr_ticker_en),
+    .ticker_custom        (scr_ticker_custom),
+    .ticker_wr_clk        (sd_card_clk),
+    .ticker_wr_en         (scr_ticker_wr_en),
+    .ticker_wr_addr       (scr_ticker_wr_addr),
+    .ticker_wr_data       (scr_ticker_wr_data),
+    .font_addr            (osd_font_addr_b),
+    .font_q               (osd_font_q_b),
     .rgb_out              (vout_data_osd)
 );
 
@@ -1061,10 +1199,32 @@ audio_waveform_overlay #(
     .vs              (vs),
     .de              (de),
     .rgb_in          (vout_data_osd),
-    .enable          (display_valid),
+    .enable          (display_valid && vis_en_sync[1]),
     .audio_valid     (hdmi_audio_valid),
     .audio_left_data (hdmi_audio_left_data),
     .rgb_out         (vout_data_wave)
+);
+
+// ===================== 居中"设置"面板（最上层） =====================
+// 参数一变就弹出 5 s 并高亮变化的行，淡入淡出；纯组合 0 拍（字库提前一像素取）。
+// 音量/静音/曲目/轮播在 sd 域，打包后由面板内部做两拍一致同步。
+wire [23:0] vout_data_panel;
+wire [11:0] osd_panel_status_sd = {cfg_volume, scr_user_mute, bgm_track_now, bgm_track_count,
+                                   auto_play_enabled, auto_period_sec};
+
+osd_settings_panel osd_settings_panel_m0(
+    .video_clk  (video_clk),
+    .rst        (rst_vid),
+    .vs         (vs),
+    .de         (de),
+    .rgb_in     (vout_data_wave),
+    .brightness (bc_brightness_committed),
+    .contrast   (bc_contrast_committed),
+    .channel    (bc_channel_committed),
+    .status_sd  (osd_panel_status_sd),
+    .font_addr  (osd_font_addr_a),
+    .font_q     (osd_font_q_a),
+    .rgb_out    (vout_data_panel)
 );
 
 // ===================== RGB/DE 转 AXIS 视频 =====================
@@ -1073,7 +1233,7 @@ video_rgb_to_axis_640x480 u_video_rgb_to_axis_640x480(
     .I_rst         (rst_vid),
     .I_vs          (vs),
     .I_de          (de),
-    .I_rgb         (vout_data_wave),
+    .I_rgb         (screen_off_sync[1] ? 24'd0 : vout_data_panel),   // 定时息屏：HDMI 输出黑
     .I_video_ready (axis_s_ready),
     .I_marker_enable(1'b0),
     .O_video_user  (axis_s_user),

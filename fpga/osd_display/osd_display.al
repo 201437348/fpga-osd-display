@@ -438,6 +438,22 @@
                     <Attr Name="CompileOrder" Val="58"/>
                 </FileInfo>
             </File>
+            <File Path="rtl/video/osd_font_rom.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="59"/>
+                </FileInfo>
+            </File>
+            <File Path="rtl/video/osd_settings_panel.v">
+                <FileInfo>
+                    <Attr Name="UsedInSyn" Val="true"/>
+                    <Attr Name="UsedInP&R" Val="true"/>
+                    <Attr Name="BelongTo" Val="design_1"/>
+                    <Attr Name="CompileOrder" Val="60"/>
+                </FileInfo>
+            </File>
         </Verilog>
         <ADC_FILE>
             <File Path="constraints/pin.adc">
@@ -533,6 +549,10 @@
     <Runs>
         <Run Name="syn_1" Type="Synthesis" ConstraintSet="constraint_1" Description="" Active="true">
             <Strategy Name="Default_Synthesis_Strategy">
+                <GateProperty>
+                    <map_mode>area_prior</map_mode>
+                    <pack_effort>high</pack_effort>
+                </GateProperty>
                 <RtlProperty>
                     <infer_fsm>off</infer_fsm>
                 </RtlProperty>
@@ -547,6 +567,16 @@
             </UserParams>
         </Run>
     </Runs>
+    <MultiSeed>
+        <Property Enable="false" GenBit="true" EndStep="bitgen" Random="false" Num="4" Init="0" Jobs="2" Save="1" Step="10">
+            <Filter enabled="false">
+                <congestion>100</congestion>
+                <place_swns>0</place_swns>
+                <route_swns>0</route_swns>
+            </Filter>
+        </Property>
+        <Seeds>0 10 20 30 </Seeds>
+    </MultiSeed>
     <Project_Settings>
     </Project_Settings>
 </Project>
